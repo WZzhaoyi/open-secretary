@@ -59,3 +59,7 @@ cd secretary_v2
 cd secretary_v2
 ./venv/bin/python -m pytest tests -q
 ```
+
+## 许可证
+
+本项目采用 GNU General Public License v3.0 许可证。详见 [LICENSE](LICENSE)。
