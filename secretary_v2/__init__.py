@@ -1,0 +1,1 @@
+# Secretary v2 - Pydantic AI + Channel abstraction

@@ -1,0 +1,202 @@
+# Secretary v2 configuration template
+# Copy this file to config.yaml and fill in real values.
+# config.yaml is ignored by git and should not be committed.
+#   cp config.yaml.example config.yaml
+
+# LLM configuration
+llm:
+  provider: anthropic           # anthropic | openai | gemini
+  model: claude-sonnet-4-20250514
+  api_key: YOUR_LLM_API_KEY
+  base_url: ""                  # Optional custom/proxy endpoint
+  max_tokens: 4096
+
+# Agent response language: auto | zh | en
+language: auto
+
+# User-facing command/status UI language: auto | zh | en
+# auto uses Telegram user.language_code when available, then language, then en.
+ui_language: auto
+
+# Channel configuration
+channels:
+  enabled: true
+  default_outgoing: telegram    # cli | telegram | http
+  telegram:
+    bot_token: YOUR_TELEGRAM_BOT_TOKEN
+    chat_id: 'YOUR_TELEGRAM_CHAT_ID'
+  http:
+    enabled: true
+    token: YOUR_WEBHOOK_TOKEN_RANDOM_STRING
+
+# Database
+database:
+  path: secretary_v2.db
+
+# Skill loading
+skills:
+  max_size: 50000
+  max_loaded: 5
+  include_global: true
+  paths: []
+  auto_load: []
+  triggers:
+    smart-search:
+      - search
+      - query
+      - opencli
+
+# Search backend
+search:
+  backend: tavily
+  tavily_api_key: YOUR_TAVILY_API_KEY
+
+# Background sub-agent sidecar
+subagent:
+  default_engine: claude
+  codex:
+    model: ""
+    enable_search: true
+    sandbox: read-only
+    approval_policy: never
+    config_overrides: []
+  claude:
+    model: sonnet
+    effort: high
+    allowed_tools: [WebSearch, WebFetch, Read]
+    allowed_bash: []
+    disallowed_tools: []
+
+# History and compaction
+history:
+  context_tokens: 1000000
+  compress_threshold: 0.75
+  tail_token_budget: 20000
+  max_events: 10
+  auto_persist_compact: true
+  persist_compact_threshold: 0.85
+  persist_compact_min_active_messages: 80
+  persist_compact_cooldown_minutes: 120
+  compact_tool_output_max_chars: 4000
+
+# Scheduled tasks use 5-field cron syntax in the configured timezone.
+schedules:
+  morning_briefing:
+    cron: 0 8 * * *
+    enabled: true
+    prompt: |-
+      Generate today's briefing:
+      1. First use db_query to query events where status='open'; treat them as the active attention list.
+      2. Then use db_query to query events since today at 00:00 as today's activity log; do not rely only on recent events injected into the system prompt.
+      3. Combine those results with the "Tracked Items" section in memory.md to decide whether there is anything important.
+      4. If there is important content, call send_message with a concise summary and write NO_ACTION as the final output. If the message needs the user to respond, also create an event with type='remind' and status='open'; for a pure briefing, status='logged' is acceptable.
+      5. If there is nothing important, do not call tools and write NO_ACTION as the final output.
+    protected: true
+  morning_trend_scan:
+    cron: 30 12 * * 1-5
+    enabled: true
+    prompt: |-
+      Remind the user to review the morning market trend.
+      1. Use db_query to query events where status='open' and check whether there is any trade/opportunity attention currently being held.
+      2. Combine that with the "Tracked Items" section in memory.md to generate a concise reminder.
+      3. Call send_message to deliver the reminder; otherwise the user will not receive it. Then create an event with type='remind' and status='open'.
+      4. Write NO_ACTION as the final output.
+    protected: false
+  pending_response_check:
+    cron: 30 21 * * *
+    enabled: true
+    prompt: |-
+      Check reminders that were proactively sent by scheduled tasks but have not received a user response.
+      1. Use db_query to query events where status='open' and type in ('remind','check','triggered'); this proactive attention list is not limited by history.max_events.
+      2. If there are no open remind/check/triggered events, do not call tools and write NO_ACTION as the final output.
+      3. If open events exist, inspect events after each event.created_at. If there is a type='response' event, or if a user update in type='note' or type='triggered' already covers the reminder topic, use db_execute to update the original open event to status='resolved'.
+      4. For events still not closed-loop, do not include an old reminder if it was merely mentioned again by a later briefing; prefer keeping only the newest open event for the same topic.
+      5. If there are scheduled reminders still awaiting response, merge all unanswered items into one send_message call. Do not create a new status='open' event for this follow-up. Write NO_ACTION as the final output.
+    protected: true
+  review_reminder:
+    cron: 0 19 * * *
+    enabled: true
+    prompt: |-
+      Generate a review reminder.
+      1. Use db_query to query today's events as today's activity log.
+      2. Use db_query to query events where status='open' as the attention list that still needs review or follow-up.
+      3. Combine those results with the "Tracked Items" section in memory.md to generate a concise review reminder.
+      4. Call send_message to deliver the reminder; otherwise the user will not receive it. Then create an event with type='remind' and status='open'.
+      5. Write NO_ACTION as the final output. Any user response counts as completion; later, update the relevant open event to status='resolved'.
+    protected: false
+  stale_check:
+    cron: 0 9 * * 0
+    enabled: true
+    prompt: |-
+      Review long-running topics that have not progressed.
+      1. First use db_query to query events where status='open'; do not rely only on recent events injected into the system prompt.
+      2. Then review the "Tracked Items" section in memory.md. If needed, run additional db_query calls for recent progress on relevant topics.
+      3. Identify topics that have had no progress or update for a long time, and ask whether the user wants to continue, pause, or drop them.
+      4. If there is a match, call send_message and write NO_ACTION as the final output. After sending the follow-up, create an event with type='check' and status='open'.
+      5. If there is no match, do not call tools and write NO_ACTION as the final output.
+    protected: false
+  memory_consolidation:
+    cron: 0 4 * * 0
+    enabled: true
+    prompt: |-
+      Long-term memory consolidation: a weekly silent promote-then-prune maintenance task.
+      1. Call memory_read to inspect the current memory.md, focusing on "User Preferences", "Collaboration Agreements", and "Tracked Items".
+      2. Use db_query to inspect recent event patterns: SELECT id,type,status,content,created_at FROM events WHERE created_at >= datetime('now','-30 days') ORDER BY created_at ASC
+      3. Use db_query to inspect old events that can be pruned: SELECT id,type,status,content,created_at FROM events WHERE created_at < datetime('now','-30 days') AND status != 'open' ORDER BY created_at ASC
+      4. Write only long-term valuable information into memory.md: stable preferences, collaboration agreements, tracked plans/projects/trading rules, and important decisions with their reasons.
+      5. memory.md has a 50 KB injection cap, but the goal is to keep it concise, ideally under 40 KB.
+      6. Keep Markdown token-efficient: preserve the three second-level sections, prefer short bullets, and avoid deep nesting, long paragraphs, repeated headings, template comments, filler, or chat-log style notes.
+      7. Prefer memory_update(section, content, mode='append'). If a section needs reorganization, prepare the complete replacement body and use memory_update(section, content, mode='replace_section').
+      8. For old events whose long-term value has been promoted into memory.md, use db_execute to set status='promoted', for example: UPDATE events SET status='promoted' WHERE id IN (...)
+      9. Do not change status='open' events that still need a user response or active attention.
+      10. Finally, use db_execute to clean old activity-log rows: DELETE FROM events WHERE created_at < datetime('now','-30 days') AND status IN ('logged','resolved','promoted')
+      11. This is silent maintenance: do not call send_message. Whether or not memory.md or events changed, the final output must be exactly NO_ACTION. Do not write a maintenance report, summary, table, or natural-language explanation.
+    protected: true
+  system_review:
+    cron: 30 17 * * 0
+    enabled: true
+    prompt: |-
+      System behavior review: a weekly low-noise health check.
+      Goal: only check whether the secretary system has silently failed or whether attention loops are abnormal. Do not write a generic summary, and do not report that "the system is normal".
+
+      You must run the following five SQL checks:
+      1. Whether scheduled runs were missing in the last 7 days:
+         SELECT date(created_at) AS day, COUNT(*) AS scheduled_runs
+         FROM agent_events
+         WHERE origin='scheduled'
+           AND type='run_started'
+           AND created_at >= datetime('now','-7 days')
+           AND subject NOT LIKE 'System behavior review%'
+         GROUP BY date(created_at)
+         ORDER BY day ASC
+      2. Whether scheduled runs failed in the last 7 days:
+         SELECT created_at, subject, payload_json
+         FROM agent_events
+         WHERE origin='scheduled' AND type='run_failed' AND created_at >= datetime('now','-7 days')
+         ORDER BY created_at DESC
+      3. Whether proactive messages were delivered in the last 7 days:
+         SELECT date(created_at) AS day, COUNT(*) AS sent_count
+         FROM agent_events
+         WHERE type='send_message' AND created_at >= datetime('now','-7 days')
+         GROUP BY date(created_at)
+         ORDER BY day ASC
+      4. Whether there are open items older than 7 days:
+         SELECT id,type,status,content,created_at
+         FROM events
+         WHERE status='open' AND created_at < datetime('now','-7 days')
+         ORDER BY created_at ASC
+      5. Whether any subagent stages failed in the last 30 days:
+         SELECT created_at, run_id, subject, payload_json
+         FROM agent_events
+         WHERE type='subagent_step_finished'
+           AND payload_json LIKE '%"status": "failed"%'
+           AND created_at >= datetime('now','-30 days')
+         ORDER BY created_at DESC
+
+      If anomalies exist, call send_message with a concise system review grouped by "Scheduled Tasks / Message Delivery / Open Items / Subagent", then write NO_ACTION as the final output.
+      If no anomalies exist, do not call any tools and write exactly NO_ACTION as the final output.
+      Do not write to memory.md, do not create events, and do not clean data.
+    protected: true
+
+# Timezone
+timezone: Asia/Shanghai

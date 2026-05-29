@@ -1,0 +1,15 @@
+# Long-Term Memory
+
+> This is a shared note maintained by the user and the secretary agent.
+> It is automatically injected into the system prompt on each run.
+> Create your own copy with `cp memory.md.example memory.md`.
+> `memory.md` is ignored by git.
+
+## User Preferences
+<!-- Stable preferences, long-term facts, recurring rules, and focus areas. -->
+
+## Collaboration Agreements
+<!-- How the agent should work with you: notification timing, tone, output style, and review rhythm. -->
+
+## Tracked Items
+<!-- Plans, projects, positions, opportunities, or topics that need ongoing tracking and periodic review. -->

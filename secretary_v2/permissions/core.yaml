@@ -1,0 +1,128 @@
+version: 1
+
+runtime:
+  ask_supported: false
+  notes:
+    - 当前系统没有交互式 ask/approval 通道；需要确认的高风险动作先按 deny 处理。
+    - 参考 Pi 的 permission gate/safe-shell 思路：策略集中声明，工具执行前统一拦截。
+
+paths:
+  deny_absolute_paths: true
+  deny_parent_traversal: true
+
+  allowed_read_dirs:
+    # "." is secretary_v2/BASE_DIR, not the repository root.
+    - "."
+    - data
+    - logs
+    - permissions
+    - skills
+    - research
+    - subagent_runs
+
+  allowed_write_dirs:
+    # Keep generated subagent artifacts write-owned by SubAgentRunManager.
+    # Logs are runtime-owned and intentionally read-only through agent tools.
+    - data
+
+  allowed_extensions:
+    - .md
+    - .yaml
+    - .yml
+    - .json
+    - .txt
+    - .log
+    - .csv
+    - .example
+
+  protected_files:
+    # Protected from generic agent file_write, not from human editing.
+    # memory.md is a shared user/agent document; agent writes it via memory_update.
+    - config.yaml
+    - memory.md
+    - secretary_v2.db
+    - runtime.py
+    - main.py
+    - guardrails.py
+
+  protected_read_files:
+    - config.yaml
+    - secretary_v2.db
+    - .env
+    - .env.local
+    - .netrc
+    - .npmrc
+    - .pypirc
+
+  deny_dotfiles: true
+  allowed_dotfiles: []
+
+  workspace_exceptions:
+    # Allows memory.md to be read as a top-level shared document.
+    - memory.md
+
+shell:
+  mode: block_critical
+  audit_recommended: true
+
+  hard_deny_commands:
+    - mkfs
+    - dd
+    - shutdown
+    - reboot
+    - halt
+    - init
+    - sudo
+    - su
+    - doas
+
+  rm_forbidden_args:
+    - "/"
+    - "/*"
+    - "/."
+    - "/.."
+
+  pipe_to_interpreters:
+    - sh
+    - bash
+    - zsh
+    - fish
+    - python
+    - python3
+    - node
+    - ruby
+    - perl
+    - php
+
+  deny_patterns:
+    # Remote install / eval patterns.
+    - "\\b(curl|wget)\\b[^\\n]*\\|\\s*(sh|bash|zsh|fish|python|python3|node|ruby|perl|php)\\b"
+    - "\\beval\\s+.*\\b(curl|wget)\\b"
+
+    # Destructive operations against system roots, including inside sh -c strings.
+    - "\\brm\\b[^\\n]*(\\s|=)/(System|Library|bin|sbin|usr|etc|var|private|dev)(/|\\s|$)"
+    - "\\brm\\b[^\\n]*(\\s/(['\"\\s]|$)|\\s/\\*|\\s/\\.\\.?)"
+    - "\\bchmod\\b[^\\n]*(777|a\\+w)[^\\n]*(\\s|=)/(System|Library|bin|sbin|usr|etc|var|private)(/|\\s|$)"
+    - "\\bchown\\b[^\\n]*(\\s|=)/(System|Library|bin|sbin|usr|etc|var|private)(/|\\s|$)"
+
+    # Disk/device mutation.
+    - "\\bdd\\b[^\\n]*\\bof=/dev/(disk|rdisk|sd|nvme)"
+    - "\\bmkfs(\\.|\\s|$)"
+
+    # Credential exfiltration and reverse-shell style footguns.
+    - "\\b(cat|grep|sed|awk)\\b[^\\n]*(\\.env|\\.npmrc|\\.pypirc|\\.netrc|id_rsa|id_ed25519|credentials)[^\\n]*\\|\\s*(curl|wget|nc|netcat|telnet)\\b"
+    - "\\b(nc|netcat)\\b\\s+\\S+\\s+\\d+\\s*<\\s*(\\.env|.*id_rsa|.*id_ed25519|.*credentials)"
+    - ":\\(\\)\\s*\\{\\s*:\\|:\\s*&\\s*\\}\\s*;\\s*:"
+
+  code_danger_patterns:
+    # Documentation for the next layer; current guardrails.py does not scan file writes yet.
+    node:
+      - "fs.rmSync"
+      - "child_process.exec"
+      - "child_process.execSync"
+      - "child_process.spawn"
+    python:
+      - "os.system"
+      - "subprocess.run"
+      - "subprocess.Popen"
+      - "shutil.rmtree"
