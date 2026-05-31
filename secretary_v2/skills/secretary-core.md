@@ -38,21 +38,26 @@ auto_load: true
 `events` 是有时间点的事件流水，不替代长期记忆。若一条信息既是事件又会影响未来判断，
 应同时写 `events`，并用 `memory_update` 维护 `memory.md`。
 
-## memory.md 固定栏目
+## memory.md 栏目规则
 
-- `## 用户偏好`：用户偏好、长期事实、常用规则、关注范围。
-- `## 协作约定`：工作方式、推送时机、输出风格。
-- `## 在追踪的事项`：仍需跟踪、复盘、提醒、推进的计划/项目/主题。
+`memory.md` 的栏目由文件里的实际 Markdown 二级标题决定。agent 不要假设固定标题，
+也不要把中英文标题、近义标题或自造分类当作同一栏目。写入前以当前文件内容为准。
 
 读写规则：
 
 - 用户可以直接编辑 `memory.md`；agent 必须尊重用户手动维护的内容和结构。
 - 查看完整文件：`memory_read()`。
-- 更新长期记忆：优先使用 `memory_update(section, content, mode="append")`。
+- 更新长期记忆：优先使用 `memory_update(section, content, mode="append")`，其中
+  `section` 必须是 `memory_read()` 里已经存在的精确二级标题文本，不带 `##`。
+- 如果不确定该写入哪个栏目，先 `memory_read()`，从现有二级标题中选择最合适的一项；
+  不要翻译、归一化或新建相似栏目。
+- 如果 `memory_update` 返回栏目不存在，重新 `memory_read()` 并选择现有标题，不要换一种语言重试。
 - 复杂合并、删除过期追踪项或重排某栏时，先 `memory_read()`，再用
   `memory_update(..., mode="replace_section")`。
 - agent 不要用通用 `file_write("memory.md", ...)` 写长期记忆；即使用户要求重写，也应先
-  `memory_read()`，再用 `memory_update(..., mode="replace_section")` 分栏目更新。
+  `memory_read()`，再用 `memory_update(..., mode="replace_section")` 按现有栏目更新。
+- 只有当用户明确要求新增栏目或整理整个文件结构时，才可以建议新增标题；新增前应说明原因，
+  并避免制造与现有栏目含义重复的标题。
 
 ## 何时写入 memory.md
 

@@ -440,7 +440,8 @@ def test_default_schedule_prompts_follow_memory_events_design():
     assert "status='open'" in pending_prompt
     assert schedules["memory_consolidation"].cron == "0 4 * * 0"
     assert "memory_read" in consolidation_prompt
-    assert "memory_update" in consolidation_prompt
+    assert "secretary-core" in consolidation_prompt
+    assert "memory.md rules" in consolidation_prompt
     assert "50KB" in consolidation_prompt or "50 KB" in consolidation_prompt
     assert "40KB" in consolidation_prompt or "40 KB" in consolidation_prompt
     assert (
@@ -714,17 +715,17 @@ async def test_auto_loaded_core_skill_injected_into_system_prompt(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_memory_update_appends_to_canonical_section(tmp_path, monkeypatch):
-    """memory_update should read/write memory.md internally and map legacy section names."""
+async def test_memory_update_appends_to_exact_section_title(tmp_path, monkeypatch):
+    """memory_update should use the exact Markdown H2 title already in memory.md."""
     import runtime
     from runtime import memory_update, SecretaryDeps
 
     memory_file = tmp_path / "memory.md"
     memory_file.write_text(
-        "# Long-Term Memory\n\n"
-        "## User Preferences\n\n"
-        "## Collaboration Agreements\n\n"
-        "## Tracked Items\n",
+        "# 长期记忆\n\n"
+        "## 用户偏好\n\n"
+        "## 协作约定\n\n"
+        "## 在追踪的事项\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
@@ -737,17 +738,18 @@ async def test_memory_update_appends_to_canonical_section(tmp_path, monkeypatch)
 
     result = await memory_update(
         _Ctx(deps),
-        section="进行中的主题",
+        section="在追踪的事项",
         content="中东局势（伊朗、霍尔木兹海峡）",
     )
 
     text = memory_file.read_text(encoding="utf-8")
-    assert "memory.md updated: Tracked Items" in result
+    assert "memory.md updated: 在追踪的事项" in result
     assert "- 中东局势（伊朗、霍尔木兹海峡）" in text
-    assert "## Tracked Items" in text
+    assert "## 在追踪的事项" in text
+    assert "## Tracked Items" not in text
     events = deps.db.get_agent_events()
     assert events[0].type == "memory_update"
-    assert events[0].subject == "Tracked Items"
+    assert events[0].subject == "在追踪的事项"
 
 
 @pytest.mark.asyncio
@@ -773,6 +775,33 @@ async def test_memory_update_accepts_english_section_names(tmp_path, monkeypatch
     assert "memory.md updated: User Preferences" in result
     assert "## User Preferences" in text
     assert "- Prefers concise updates" in text
+
+
+@pytest.mark.asyncio
+async def test_memory_update_rejects_missing_section_title(tmp_path, monkeypatch):
+    import runtime
+    from runtime import memory_update, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text("# 长期记忆\n\n## 用户偏好\n", encoding="utf-8")
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_update(
+        _Ctx(deps),
+        section="Tracked Items",
+        content="Should not create a new section",
+    )
+
+    text = memory_file.read_text(encoding="utf-8")
+    assert "Error: memory section not found: ## Tracked Items" in result
+    assert "Existing sections: ## 用户偏好" in result
+    assert "## Tracked Items" not in text
+    assert deps.db.get_agent_events() == []
 
 
 @pytest.mark.asyncio

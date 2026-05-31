@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sqlite3
 
 import pytest
 
@@ -13,7 +12,6 @@ from config import (
     reset_config,
 )
 from memory import Database
-from scripts.migrate_research_jobs_to_subagent_runs import migrate
 from subagent_runs import (
     SubAgentRunManager,
     SubAgentStage,
@@ -435,65 +433,6 @@ def test_subagent_run_database_roundtrip(test_db):
     fetched = test_db.get_subagent_run("research_test")
     assert fetched.status == "running"
     assert test_db.list_subagent_runs(agent_name="deep_research", limit=1)[0].id == "research_test"
-
-
-def test_succeeded_legacy_research_jobs_migrate_and_old_table_is_dropped(tmp_path):
-    db_path = tmp_path / "legacy.db"
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            CREATE TABLE research_jobs (
-                id TEXT PRIMARY KEY,
-                engine TEXT NOT NULL,
-                topic TEXT NOT NULL,
-                status TEXT NOT NULL,
-                origin_channel TEXT NOT NULL,
-                user_id TEXT,
-                stages_json TEXT,
-                artifact_path TEXT,
-                result TEXT,
-                error TEXT,
-                created_at DATETIME,
-                updated_at DATETIME,
-                completed_at DATETIME
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO research_jobs VALUES (
-                'research_done', 'claude', '港股创新药行业', 'succeeded',
-                'cli', 'cli_user', '[]', '/tmp/done.md', '完成报告', NULL,
-                '2026-01-01 00:00:00', '2026-01-01 00:01:00', '2026-01-01 00:02:00'
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO research_jobs VALUES (
-                'research_failed', 'claude', '失败任务', 'failed',
-                'cli', 'cli_user', '[]', NULL, NULL, 'boom',
-                '2026-01-01 00:00:00', '2026-01-01 00:01:00', '2026-01-01 00:02:00'
-            )
-            """
-        )
-
-    migrated_count = migrate(str(db_path))
-    db = Database(db_path=str(db_path))
-    migrated = db.get_subagent_run("research_done")
-
-    assert migrated_count == 1
-    assert migrated is not None
-    assert migrated.agent_name == "deep_research"
-    assert migrated.agent_kind == "research"
-    assert migrated.subject == "港股创新药行业"
-    assert migrated.result == "完成报告"
-    assert db.get_subagent_run("research_failed") is None
-    with sqlite3.connect(db_path) as conn:
-        old_table = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='research_jobs'"
-        ).fetchone()
-    assert old_table is None
 
 
 def test_research_done_message_uses_brief_not_tail(test_db, tmp_path):

@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -432,36 +432,6 @@ async def db_execute(
 # ==================== File tools ====================
 
 
-MEMORY_SECTIONS = {
-    "User Preferences": "User Preferences",
-    "preferences": "User Preferences",
-    "user preferences": "User Preferences",
-    "profile": "User Preferences",
-    "long-term facts": "User Preferences",
-    "用户偏好": "User Preferences",
-    "偏好": "User Preferences",
-    "用户画像": "User Preferences",
-    "长期事实": "User Preferences",
-    "Collaboration Agreements": "Collaboration Agreements",
-    "agreements": "Collaboration Agreements",
-    "collaboration agreements": "Collaboration Agreements",
-    "协作约定": "Collaboration Agreements",
-    "约定": "Collaboration Agreements",
-    "Tracked Items": "Tracked Items",
-    "tracked items": "Tracked Items",
-    "tracking items": "Tracked Items",
-    "active topics": "Tracked Items",
-    "在追踪的事项": "Tracked Items",
-    "追踪事项": "Tracked Items",
-    "进行中的主题": "Tracked Items",
-}
-
-
-def _normalize_memory_section(section: str) -> Optional[str]:
-    raw = (section or "").strip()
-    return MEMORY_SECTIONS.get(raw) or MEMORY_SECTIONS.get(raw.lower())
-
-
 def _ensure_memory_document(text: str) -> str:
     if text.strip():
         return text
@@ -477,9 +447,28 @@ def _ensure_memory_document(text: str) -> str:
     )
 
 
-def _replace_memory_section(text: str, section: str, body: str) -> str:
-    text = _ensure_memory_document(text)
-    lines = text.splitlines()
+def _memory_section_titles(text: str) -> List[str]:
+    titles = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            titles.append(stripped[3:].strip())
+    return titles
+
+
+def _missing_memory_section_error(section: str, text: str) -> str:
+    titles = _memory_section_titles(text)
+    if titles:
+        available = ", ".join(f"## {title}" for title in titles)
+    else:
+        available = "none"
+    return (
+        f"Error: memory section not found: ## {section}. "
+        f"Existing sections: {available}. Call memory_read before choosing a section title."
+    )
+
+
+def _find_memory_section(lines: List[str], section: str) -> Optional[Tuple[int, int]]:
     header = f"## {section}"
     start = None
     for i, line in enumerate(lines):
@@ -488,44 +477,43 @@ def _replace_memory_section(text: str, section: str, body: str) -> str:
             break
 
     if start is None:
-        suffix = "\n" if text.endswith("\n") else "\n\n"
-        return f"{text}{suffix}{header}\n{body.rstrip()}\n"
+        return None
 
     end = len(lines)
     for j in range(start + 1, len(lines)):
-        if lines[j].startswith("## "):
+        if lines[j].strip().startswith("## "):
             end = j
             break
+    return start, end
 
+
+def _replace_memory_section(text: str, section: str, body: str) -> Optional[str]:
+    text = _ensure_memory_document(text)
+    lines = text.splitlines()
+    bounds = _find_memory_section(lines, section)
+    if bounds is None:
+        return None
+
+    start, end = bounds
+    header = f"## {section}"
     replacement = [header, *body.rstrip().splitlines()]
     new_lines = [*lines[:start], *replacement, *lines[end:]]
     return "\n".join(new_lines).rstrip() + "\n"
 
 
-def _append_memory_section(text: str, section: str, content: str) -> str:
+def _append_memory_section(text: str, section: str, content: str) -> Optional[str]:
     current = _ensure_memory_document(text)
     lines = current.splitlines()
-    header = f"## {section}"
-    start = None
-    for i, line in enumerate(lines):
-        if line.strip() == header:
-            start = i
-            break
+    bounds = _find_memory_section(lines, section)
 
     entry = content.rstrip()
     if entry and not entry.lstrip().startswith(("-", "*", "1.")):
         entry = f"- {entry}"
 
-    if start is None:
-        suffix = "\n" if current.endswith("\n") else "\n\n"
-        return f"{current}{suffix}{header}\n{entry}\n"
+    if bounds is None:
+        return None
 
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if lines[j].startswith("## "):
-            end = j
-            break
-
+    start, end = bounds
     section_lines = lines[start + 1 : end]
     normalized_existing = {line.strip() for line in section_lines if line.strip()}
     if entry.strip() in normalized_existing:
@@ -561,39 +549,40 @@ async def memory_update(
 
     Use this instead of file_write for durable user preferences, collaboration
     agreements, long-term facts, tracking items, trading plans, and topics that
-    should affect future reminders or reviews. Supported sections:
-    User Preferences, Collaboration Agreements, Tracked Items. Chinese legacy
-    section names are also accepted. mode='append' adds one item; mode='replace_section'
-    replaces the whole section body.
+    should affect future reminders or reviews. The section argument is an exact
+    Markdown H2 title from memory.md, without the leading "##". Use memory_read
+    before choosing a section title. mode='append' adds one item;
+    mode='replace_section' replaces the whole section body.
     """
-    canonical = _normalize_memory_section(section)
-    if canonical is None:
-        return (
-            "Error: unknown memory section. Use one of: User Preferences, "
-            "Collaboration Agreements, Tracked Items"
-        )
+    section_title = (section or "").strip()
+    if section_title.startswith("## "):
+        section_title = section_title[3:].strip()
+    if not section_title:
+        return "Error: section must be a non-empty Markdown H2 title"
     if mode not in ("append", "replace_section"):
         return "Error: mode must be 'append' or 'replace_section'"
 
     try:
         current = MEMORY_FILE.read_text(encoding="utf-8") if MEMORY_FILE.exists() else ""
         if mode == "replace_section":
-            updated = _replace_memory_section(current, canonical, content)
+            updated = _replace_memory_section(current, section_title, content)
         else:
-            updated = _append_memory_section(current, canonical, content)
+            updated = _append_memory_section(current, section_title, content)
+        if updated is None:
+            return _missing_memory_section_error(section_title, _ensure_memory_document(current))
         MEMORY_FILE.write_text(updated, encoding="utf-8")
         _record_agent_event(
             ctx.deps.db,
             "memory_update",
             origin=ctx.deps.origin_channel,
             run_id=ctx.deps.run_id or None,
-            subject=canonical,
+            subject=section_title,
             payload={
                 "mode": mode,
                 "content_chars": len(content or ""),
             },
         )
-        return f"memory.md updated: {canonical} ({mode})"
+        return f"memory.md updated: {section_title} ({mode})"
     except Exception as e:
         return f"Error updating memory.md: {e}"
 

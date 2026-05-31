@@ -135,7 +135,7 @@ schedules:
       Generate today's briefing:
       1. First use db_query to query events where status='open'; treat them as the active attention list.
       2. Then use db_query to query events since today at 00:00 as today's activity log; do not rely only on recent events injected into the system prompt.
-      3. Combine those results with the "Tracked Items" section in memory.md to decide whether there is anything important.
+      3. Combine those results with relevant content in memory.md to decide whether there is anything important.
       4. If there is important content, call send_message with a concise summary and write NO_ACTION as the final output. If the message needs the user to respond, also create an event with type='remind' and status='open'; for a pure briefing, status='logged' is acceptable.
       5. If there is nothing important, do not call tools and write NO_ACTION as the final output.
     protected: true
@@ -145,7 +145,7 @@ schedules:
     prompt: |-
       Remind the user to review the morning market trend.
       1. Use db_query to query events where status='open' and check whether there is any trade/opportunity attention currently being held.
-      2. Combine that with the "Tracked Items" section in memory.md to generate a concise reminder.
+      2. Combine that with relevant positions and morning trend information in memory.md to generate a concise reminder.
       3. Call send_message to deliver the reminder; otherwise the user will not receive it. Then create an event with type='remind' and status='open'.
       4. Write NO_ACTION as the final output.
     protected: false
@@ -167,7 +167,7 @@ schedules:
       Generate a review reminder.
       1. Use db_query to query today's events as today's activity log.
       2. Use db_query to query events where status='open' as the attention list that still needs review or follow-up.
-      3. Combine those results with the "Tracked Items" section in memory.md to generate a concise review reminder.
+      3. Combine those results with relevant content in memory.md to generate a concise review reminder.
       4. Call send_message to deliver the reminder; otherwise the user will not receive it. Then create an event with type='remind' and status='open'.
       5. Write NO_ACTION as the final output. Any user response counts as completion; later, update the relevant open event to status='resolved'.
     protected: false
@@ -177,7 +177,7 @@ schedules:
     prompt: |-
       Review long-running topics that have not progressed.
       1. First use db_query to query events where status='open'; do not rely only on recent events injected into the system prompt.
-      2. Then review the "Tracked Items" section in memory.md. If needed, run additional db_query calls for recent progress on relevant topics.
+      2. Then review memory.md for long-running tracked topics. If needed, run additional db_query calls for recent progress on relevant topics.
       3. Identify topics that have had no progress or update for a long time, and ask whether the user wants to continue, pause, or drop them.
       4. If there is a match, call send_message and write NO_ACTION as the final output. After sending the follow-up, create an event with type='check' and status='open'.
       5. If there is no match, do not call tools and write NO_ACTION as the final output.
@@ -187,13 +187,13 @@ schedules:
     enabled: true
     prompt: |-
       Long-term memory consolidation: a weekly silent promote-then-prune maintenance task.
-      1. Call memory_read to inspect the current memory.md, focusing on "User Preferences", "Collaboration Agreements", and "Tracked Items".
+      1. Call memory_read to inspect the current memory.md.
       2. Use db_query to inspect recent event patterns: SELECT id,type,status,content,created_at FROM events WHERE created_at >= datetime('now','-30 days') ORDER BY created_at ASC
       3. Use db_query to inspect old events that can be pruned: SELECT id,type,status,content,created_at FROM events WHERE created_at < datetime('now','-30 days') AND status != 'open' ORDER BY created_at ASC
       4. Write only long-term valuable information into memory.md: stable preferences, collaboration agreements, tracked plans/projects/trading rules, and important decisions with their reasons.
       5. memory.md has a 50 KB injection cap, but the goal is to keep it concise, ideally under 40 KB.
-      6. Keep Markdown token-efficient: preserve the three second-level sections, prefer short bullets, and avoid deep nesting, long paragraphs, repeated headings, template comments, filler, or chat-log style notes.
-      7. Prefer memory_update(section, content, mode='append'). If a section needs reorganization, prepare the complete replacement body and use memory_update(section, content, mode='replace_section').
+      6. Follow the memory.md rules from secretary-core when choosing sections and updating content.
+      7. Keep Markdown token-efficient: preserve the existing structure, prefer short bullets, and avoid deep nesting, long paragraphs, repeated headings, template comments, filler, or chat-log style notes.
       8. For old events whose long-term value has been promoted into memory.md, use db_execute to set status='promoted', for example: UPDATE events SET status='promoted' WHERE id IN (...)
       9. Do not change status='open' events that still need a user response or active attention.
       10. Finally, use db_execute to clean old activity-log rows: DELETE FROM events WHERE created_at < datetime('now','-30 days') AND status IN ('logged','resolved','promoted')

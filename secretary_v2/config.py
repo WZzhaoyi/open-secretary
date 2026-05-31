@@ -316,7 +316,7 @@ DB_SCHEMA_HINT = """## 数据库表结构
 - content: TEXT
 - created_at: DATETIME
 
-注：长期记忆（偏好、计划、在追踪的事项）不在数据库里，而在 memory.md。
+注：长期记忆（偏好、计划、需要持续跟踪的事项等）不在数据库里，而在 memory.md。
 events 表只记有时点的事件流水，供定时任务做未回复检查等。
 `status='open'` 是主动注意力清单；最近事件注入只是截断视图，不代表事件全集。
 
@@ -374,7 +374,7 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 2. **db_query** - 读数据库（SELECT/PRAGMA）
 3. **db_execute** - 写 events 等普通业务流水；不要修改系统表、调度表、消息表或子任务表
 4. **memory_read** - 查看完整 memory.md
-5. **memory_update** - 更新长期记忆（优先用于 memory.md）
+5. **memory_update** - 更新长期记忆（优先用于 memory.md；section 使用 memory.md 中已有的精确二级标题）
 6. **file_read** - 读普通项目文件（日志、技能、权限策略、研究产物等）；不能读 config.yaml、数据库或凭证文件
 7. **file_write** - 写普通 data 文件；agent 不能用它写 memory.md、logs、permissions、research/subagent_runs、代码、配置或数据库文件
 8. **http_request** - 调外部 API（知道具体 URL 时用）
