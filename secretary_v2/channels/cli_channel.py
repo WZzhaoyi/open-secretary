@@ -46,6 +46,7 @@ class CLIChannel(Channel):
             text=self.single_message,
             channel="cli",
             user_id="cli_user",
+            conversation_id="cli_user",
         )
 
         try:
@@ -80,6 +81,7 @@ class CLIChannel(Channel):
                     text=user_input.strip(),
                     channel="cli",
                     user_id="cli_user",
+                    conversation_id="cli_user",
                 )
 
                 # Handle message

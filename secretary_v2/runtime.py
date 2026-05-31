@@ -106,6 +106,9 @@ class SecretaryDeps:
     db: Database
     origin_channel: str = "cli"
     user_id: str = "default"
+    conversation_id: Optional[str] = None
+    reply_to_id: Optional[str] = None
+    thread_id: Optional[str] = None
     run_id: str = ""
     skill_content: str = ""
     current_time: str = field(
@@ -771,11 +774,9 @@ async def send_message(
     if channel_obj is None:
         return f"Error: Channel '{target}' not available"
 
-    # Only forward user_id when it's a real peer address. For scheduled-task
-    # runs, ctx.deps.user_id is the literal "scheduler" (a logical identity,
-    # not a routable chat_id) — passing it to Telegram caused "Chat not found"
-    # errors. In that case, let the channel use its own default recipient.
-    forward_user_id = ctx.deps.user_id
+    # Only forward a routable conversation target. For private chats this may
+    # equal the sender id; for group chats it must be the chat/group id.
+    forward_user_id = ctx.deps.conversation_id or ctx.deps.user_id
     if ctx.deps.origin_channel == "scheduled":
         forward_user_id = None
 
@@ -898,7 +899,11 @@ async def start_research(
             subject=topic,
             engine=engine,
             origin_channel=ctx.deps.origin_channel,
-            user_id=None if ctx.deps.origin_channel == "scheduled" else ctx.deps.user_id,
+            user_id=(
+                None
+                if ctx.deps.origin_channel == "scheduled"
+                else (ctx.deps.conversation_id or ctx.deps.user_id)
+            ),
         )
         chosen = ctx.deps.db.get_subagent_run(job_id)
         engine_text = chosen.engine if chosen else (engine or "auto")
@@ -1144,6 +1149,9 @@ async def run_agent(
     db: Database,
     origin_channel: str = "cli",
     user_id: str = "default",
+    conversation_id: Optional[str] = None,
+    reply_to_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
     skill_content: str = "",
     channels: Optional[Dict[str, Any]] = None,
     scheduler: Optional[Any] = None,
@@ -1162,6 +1170,9 @@ async def run_agent(
         db=db,
         origin_channel=origin_channel,
         user_id=user_id,
+        conversation_id=conversation_id,
+        reply_to_id=reply_to_id,
+        thread_id=thread_id,
         run_id=run_id,
         skill_content=skill_content,
         current_time=datetime.now(_local_tz()).isoformat(),
@@ -1179,6 +1190,9 @@ async def run_agent(
             "user_text_chars": len(user_text or ""),
             "skill_content_loaded": bool(skill_content),
             "user_id": user_id,
+            "conversation_id": conversation_id,
+            "reply_to_id": reply_to_id,
+            "thread_id": thread_id,
         },
     )
 
@@ -1305,7 +1319,7 @@ async def run_agent(
                     "Conversation history was automatically compacted: "
                     f"{outcome.before_messages} -> {outcome.after_messages} messages, "
                     f"{outcome.before_tokens:,} -> {outcome.after_tokens:,} tokens.",
-                    None if origin_channel == "scheduled" else user_id,
+                    None if origin_channel == "scheduled" else (conversation_id or user_id),
                 )
     except Exception as e:
         logger.error(f"[run_agent] auto persist compaction failed: {e}")

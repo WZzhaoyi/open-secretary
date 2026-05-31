@@ -510,6 +510,11 @@ class TelegramChannel(Channel):
         user_message = update.message.text
         user_id = str(update.effective_user.id)
         chat_id = str(update.effective_chat.id)
+        thread_id = (
+            str(update.message.message_thread_id)
+            if getattr(update.message, "message_thread_id", None) is not None
+            else None
+        )
 
         logger.info(f"Received message from {user_id}: {user_message}")
 
@@ -524,9 +529,15 @@ class TelegramChannel(Channel):
             text=user_message,
             channel="telegram",
             user_id=user_id,
+            conversation_id=chat_id,
+            reply_to_id=str(update.message.message_id),
+            thread_id=thread_id,
             metadata={
                 "chat_id": chat_id,
+                "sender_id": user_id,
                 "username": update.effective_user.username,
+                "message_id": update.message.message_id,
+                "chat_type": getattr(update.effective_chat, "type", None),
             },
         )
 

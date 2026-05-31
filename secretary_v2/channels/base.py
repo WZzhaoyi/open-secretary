@@ -8,10 +8,19 @@ from typing import Dict, Any, Optional
 
 @dataclass
 class IncomingMessage:
-    """Incoming message from a channel."""
+    """Incoming message from a channel.
+
+    `user_id` is the sender identity. `conversation_id` is the routable chat /
+    group / DM target where replies should go. In simple CLI and private-chat
+    cases these are often the same value; in group chats they are deliberately
+    different.
+    """
     text: str
-    channel: str  # "telegram" | "cli" | "http" | "scheduled"
+    channel: str  # "telegram" | "feishu" | "cli" | "http" | "scheduled"
     user_id: str
+    conversation_id: Optional[str] = None
+    reply_to_id: Optional[str] = None
+    thread_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
 
 
@@ -32,7 +41,12 @@ class Channel(ABC):
 
     @abstractmethod
     async def send(self, text: str, user_id: Optional[str] = None) -> None:
-        """Send a message to the channel."""
+        """Send a message to a routable target.
+
+        The parameter remains named `user_id` for backward compatibility, but
+        channel implementations should interpret it as a target conversation id
+        when their platform distinguishes sender identity from chat identity.
+        """
         pass
 
     async def send_file(

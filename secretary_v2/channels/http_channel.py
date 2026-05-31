@@ -14,7 +14,7 @@ import asyncio
 import logging
 import uuid
 from collections import deque
-from typing import Awaitable, Callable, Deque, Optional
+from typing import Awaitable, Callable, Deque, Optional, Union
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -24,6 +24,8 @@ import uvicorn
 from .base import Channel, IncomingMessage
 
 logger = logging.getLogger(__name__)
+
+ResponseChannel = Union[Channel, Callable[[], Optional[Channel]]]
 
 
 class WebhookMessage(BaseModel):
@@ -40,7 +42,7 @@ class HTTPChannel(Channel):
         self,
         token: str,
         message_handler: Callable[[IncomingMessage], Awaitable[str]],
-        response_channel: Optional[Channel] = None,
+        response_channel: Optional[ResponseChannel] = None,
         port: int = 11269,
         bind_host: str = "127.0.0.1",
         outbox_capacity: int = 100,
@@ -55,6 +57,11 @@ class HTTPChannel(Channel):
         self._outbox: Deque[dict] = deque(maxlen=outbox_capacity)
         self._webhook_tasks: set[asyncio.Task] = set()
         self._setup_routes()
+
+    def _get_response_channel(self) -> Optional[Channel]:
+        if callable(self.response_channel):
+            return self.response_channel()
+        return self.response_channel
 
     def _setup_routes(self):
         @self.app.get("/health")
@@ -72,6 +79,7 @@ class HTTPChannel(Channel):
                 text=message.message,
                 channel="http",
                 user_id=message.user_id,
+                conversation_id=message.user_id,
             )
             run_id = f"hook_{uuid.uuid4().hex[:12]}"
             task = asyncio.create_task(self._handle_webhook_async(run_id, incoming))
@@ -107,12 +115,13 @@ class HTTPChannel(Channel):
             logger.error(f"Error handling webhook run {run_id}: {e}")
             response = f"Webhook handling failed ({run_id}): {e}"
 
-        if self.response_channel is None:
+        response_channel = self._get_response_channel()
+        if response_channel is None:
             logger.warning("No response channel configured for webhook run %s", run_id)
             return
 
         try:
-            await self.response_channel.send(response, user_id=None)
+            await response_channel.send(response, user_id=None)
         except Exception as e:
             logger.error(f"Error delivering webhook run {run_id}: {e}")
 

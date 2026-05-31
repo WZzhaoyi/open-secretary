@@ -1,17 +1,22 @@
 #!/bin/bash
 # Secretary v2 management script: start | stop | restart | status | logs
 #
-# The background service runs with `--channel telegram`, which starts both
-# Telegram and HTTP channels. The HTTP webhook listens on the stable default
-# port 11269 for external calls and tests.
+# The background service runs with `--channel all`, which starts every
+# configured non-CLI channel (Telegram, Feishu, HTTP). The HTTP webhook listens
+# on the stable default port 11269 for external calls and tests.
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$SCRIPT_DIR/venv/bin/python"
-CHANNEL="telegram"
+CHANNEL="all"
 HTTP_PORT=11269                       # HTTPChannel default port
-PATTERN="main.py --channel $CHANNEL"   # Unique process identifier
+PATTERNS=(
+    "main.py --channel $CHANNEL"
+    "main.py --channel telegram"
+    "main.py --channel feishu"
+    "main.py --channel http"
+)
 LOG_DIR="$SCRIPT_DIR/logs"
 LOG_FILE="$LOG_DIR/secretary_v2.log"
 HEALTH_URL="http://127.0.0.1:$HTTP_PORT/health"
@@ -21,7 +26,15 @@ mkdir -p "$LOG_DIR"
 
 # Current running PID. Empty means the service is not running.
 get_pid() {
-    pgrep -f "$PATTERN" | head -1
+    local pattern
+    for pattern in "${PATTERNS[@]}"; do
+        local pid
+        pid="$(pgrep -f "$pattern" | head -1)"
+        if [ -n "$pid" ]; then
+            echo "$pid"
+            return 0
+        fi
+    done
 }
 
 do_start() {

@@ -956,6 +956,245 @@ async def test_telegram_send_chunks_uses_plain_text_without_parse_mode():
     assert "parse_mode" not in sent[0]
 
 
+# ---- Feishu channel parity ----
+
+
+@pytest.mark.asyncio
+async def test_feishu_send_buffers_when_not_ready():
+    from channels.feishu_channel import FeishuChannel
+
+    async def _noop(_msg):
+        return ""
+
+    chan = FeishuChannel(
+        app_id="cli_x",
+        app_secret="secret",
+        default_chat_id="oc_default",
+        message_handler=_noop,
+    )
+
+    await chan.send("hello", user_id="oc_1")
+    await chan.send("world", user_id="oc_2")
+
+    assert len(chan._outbox) == 2
+    assert chan._outbox[0] == ("hello", "oc_1")
+    assert chan._outbox[1] == ("world", "oc_2")
+
+
+@pytest.mark.asyncio
+async def test_feishu_outbox_capacity_drops_oldest():
+    from channels.feishu_channel import FeishuChannel
+
+    async def _noop(_msg):
+        return ""
+
+    chan = FeishuChannel(
+        app_id="cli_x",
+        app_secret="secret",
+        default_chat_id="oc_default",
+        message_handler=_noop,
+        outbox_capacity=3,
+    )
+    for i in range(5):
+        await chan.send(f"msg-{i}")
+
+    assert len(chan._outbox) == 3
+    assert chan._outbox[0][0] == "msg-2"
+    assert chan._outbox[-1][0] == "msg-4"
+
+
+def test_feishu_plain_text_cleanup_removes_common_markdown():
+    from channels.feishu_channel import _plain_text_for_feishu
+
+    text = "### **午间提醒**\n- `APPLE` 需要复盘\n__重点__：不要追高"
+
+    cleaned = _plain_text_for_feishu(text)
+
+    assert cleaned == "午间提醒\n- APPLE 需要复盘\n重点：不要追高"
+
+
+@pytest.mark.asyncio
+async def test_feishu_resets_lark_ws_module_loop_when_it_is_running():
+    import lark_oapi.ws.client as ws_client
+    from channels.feishu_channel import _ensure_lark_ws_loop_not_running
+
+    original_loop = ws_client.loop
+    running_loop = asyncio.get_running_loop()
+    ws_client.loop = running_loop
+
+    try:
+        _ensure_lark_ws_loop_not_running()
+        assert ws_client.loop is not running_loop
+        assert not ws_client.loop.is_running()
+    finally:
+        ws_client.loop.close()
+        ws_client.loop = original_loop
+
+
+@pytest.mark.asyncio
+async def test_feishu_send_chunks_uses_lark_channel_plain_text():
+    from channels.feishu_channel import FeishuChannel
+
+    async def _noop(_msg):
+        return ""
+
+    sent = []
+
+    class FakeSdkChannel:
+        async def send(self, *args):
+            sent.append(args)
+
+    chan = FeishuChannel(
+        app_id="cli_x",
+        app_secret="secret",
+        default_chat_id="oc_default",
+        message_handler=_noop,
+    )
+    chan._running = True
+    chan._ready = True
+    chan._sdk_channel = FakeSdkChannel()
+
+    await chan._send_chunks_now(["**Title**\n- `item`"], "oc_123")
+
+    assert sent == [
+        (
+            "oc_123",
+            {"text": "Title\n- item"},
+            {"receive_id_type": "chat_id"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_feishu_inbound_message_uses_chat_id_as_routable_user_id():
+    from channels.feishu_channel import FeishuChannel
+
+    seen = []
+
+    async def _handler(msg):
+        seen.append(msg)
+        return "ok"
+
+    class FakeSdkChannel:
+        async def send(self, *args):
+            pass
+
+    class FakeInbound:
+        content_text = "hello"
+        chat_id = "oc_chat"
+        chat_type = "p2p"
+        sender_id = "ou_user"
+        sender_name = "User"
+        message_id = "om_msg"
+        mentioned_bot = False
+
+    chan = FeishuChannel(
+        app_id="cli_x",
+        app_secret="secret",
+        default_chat_id="oc_default",
+        message_handler=_handler,
+    )
+    chan._running = True
+    chan._ready = True
+    chan._sdk_channel = FakeSdkChannel()
+
+    await chan._handle_message(FakeInbound())
+
+    assert seen[0].channel == "feishu"
+    assert seen[0].user_id == "ou_user"
+    assert seen[0].conversation_id == "oc_chat"
+    assert seen[0].metadata["sender_id"] == "ou_user"
+
+
+def test_webhook_response_channel_prefers_configured_default_outgoing():
+    from main import SecretaryApp
+
+    class FakeChannel:
+        pass
+
+    app = SecretaryApp.__new__(SecretaryApp)
+    app._configured_default_outgoing = "feishu"
+    app._last_chat_channel_name = "telegram"
+    app.channels = {
+        "telegram": FakeChannel(),
+        "feishu": FakeChannel(),
+    }
+
+    assert app._resolve_webhook_response_channel() is app.channels["feishu"]
+
+
+def test_webhook_response_channel_respects_http_default_without_chat_fallback():
+    from main import SecretaryApp
+
+    class FakeChannel:
+        pass
+
+    app = SecretaryApp.__new__(SecretaryApp)
+    app._configured_default_outgoing = "http"
+    app._last_chat_channel_name = "telegram"
+    app.channels = {
+        "http": FakeChannel(),
+        "telegram": FakeChannel(),
+        "feishu": FakeChannel(),
+    }
+
+    assert app._resolve_webhook_response_channel() is app.channels["http"]
+
+
+def test_webhook_response_channel_falls_back_to_recent_chat_channel():
+    from main import SecretaryApp
+
+    class FakeChannel:
+        pass
+
+    app = SecretaryApp.__new__(SecretaryApp)
+    app._configured_default_outgoing = "missing"
+    app._last_chat_channel_name = None
+    app.channels = {
+        "telegram": FakeChannel(),
+        "feishu": FakeChannel(),
+    }
+
+    assert app._resolve_webhook_response_channel() is None
+
+    app._remember_chat_channel("telegram")
+    assert app._resolve_webhook_response_channel() is app.channels["telegram"]
+
+    app._remember_chat_channel("feishu")
+    assert app._resolve_webhook_response_channel() is app.channels["feishu"]
+
+
+def test_channel_all_mode_starts_every_configured_non_cli_channel():
+    from main import SecretaryApp
+
+    class FakeChannel:
+        def __init__(self, name):
+            self.name = name
+
+    app = SecretaryApp.__new__(SecretaryApp)
+    app.channel_type = "all"
+    app.channels = {
+        "cli": FakeChannel("cli"),
+        "telegram": FakeChannel("telegram"),
+        "feishu": FakeChannel("feishu"),
+        "http": FakeChannel("http"),
+    }
+
+    assert [channel.name for channel in app._channels_to_start()] == [
+        "telegram",
+        "feishu",
+        "http",
+    ]
+
+
+def test_parse_args_accepts_all_channel(monkeypatch):
+    from main import parse_args
+
+    monkeypatch.setattr("sys.argv", ["main.py", "--channel", "all"])
+
+    assert parse_args().channel == "all"
+
+
 # ---- getUpdates stall watchdog ----
 
 
@@ -1178,8 +1417,8 @@ async def test_send_message_for_scheduled_origin_skips_logical_user_id():
 
 
 @pytest.mark.asyncio
-async def test_send_message_for_telegram_origin_forwards_user_id():
-    """For real user-originated messages, user_id IS the chat_id and must be forwarded."""
+async def test_send_message_for_private_origin_forwards_user_id():
+    """Private chats still use sender id as the routable target."""
     from runtime import send_message, SecretaryDeps
     from memory import Database
 
@@ -1205,3 +1444,32 @@ async def test_send_message_for_telegram_origin_forwards_user_id():
     assert captured["user_id"] == "804416037", (
         "user-originated runs must forward user_id so the reply lands in the right chat"
     )
+
+
+@pytest.mark.asyncio
+async def test_send_message_for_group_origin_prefers_conversation_id():
+    """Group chats must route to chat/group id, not the sender id."""
+    from runtime import send_message, SecretaryDeps
+    from memory import Database
+
+    captured = {"user_id": "<unset>"}
+
+    class FakeChannel:
+        async def send(self, text, user_id=None):
+            captured["user_id"] = user_id
+
+    fake = FakeChannel()
+    deps = SecretaryDeps(
+        db=Database(db_path=":memory:"),
+        origin_channel="telegram",
+        user_id="sender-123",
+        conversation_id="-100987654321",
+        channels={"telegram": fake},
+    )
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    await send_message(_Ctx(deps), "hello")
+    assert captured["user_id"] == "-100987654321"
