@@ -15,6 +15,7 @@ from channels.base import IncomingMessage
 from channels.cli_channel import CLIChannel
 from channels.telegram_channel import TelegramChannel
 from channels.http_channel import HTTPChannel
+from logging_utils import install_secret_redaction_filter
 from skills_loader import get_skills_loader
 from scheduler import Scheduler
 from subagent_runs import SubAgentRunManager, parse_subagent_shortcut
@@ -24,6 +25,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+install_secret_redaction_filter()
 # Quiet down APScheduler: python-telegram-bot's JobQueue owns its own
 # APScheduler instance that restarts on every Telegram channel restart,
 # spamming "Scheduler started/Added job" at INFO. Our own scheduler logs

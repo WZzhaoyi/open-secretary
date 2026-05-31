@@ -115,6 +115,20 @@ def test_ui_i18n_resolves_auto_from_channel_language():
     assert bot_commands("en")[0].description == "Start"
 
 
+def test_log_redaction_masks_telegram_bot_token():
+    from logging_utils import redact_secrets
+
+    text = (
+        "HTTP Request: POST "
+        "https://api.telegram.org/bot123456:ABCdef_1234567890/sendMessage"
+    )
+
+    redacted = redact_secrets(text)
+
+    assert "ABCdef_1234567890" not in redacted
+    assert "bot123456:***67890/sendMessage" in redacted
+
+
 @pytest.fixture
 def fresh_db(tmp_path):
     """Database with a unique file per test, no shared state."""
