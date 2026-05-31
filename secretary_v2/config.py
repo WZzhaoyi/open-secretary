@@ -27,6 +27,20 @@ class TelegramConfig:
 
 
 @dataclass
+class FeishuConfig:
+    app_id: str = ""
+    app_secret: str = ""
+    default_chat_id: str = ""
+    domain: str = "https://open.feishu.cn"
+    transport: str = "ws"
+    encrypt_key: str = ""
+    verification_token: str = ""
+    require_mention: bool = True
+    allow_chat_ids: List[str] = field(default_factory=list)
+    allow_sender_ids: List[str] = field(default_factory=list)
+
+
+@dataclass
 class HTTPConfig:
     enabled: bool = True
     token: str = ""
@@ -37,6 +51,7 @@ class ChannelConfig:
     enabled: bool = True
     default_outgoing: str = "cli"
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    feishu: FeishuConfig = field(default_factory=FeishuConfig)
     http: HTTPConfig = field(default_factory=HTTPConfig)
 
 
@@ -174,11 +189,13 @@ class Config:
         # Parse channel config
         channels_data = config_data.get("channels", {})
         telegram_data = channels_data.get("telegram", {})
+        feishu_data = channels_data.get("feishu", {})
         http_data = channels_data.get("http", {})
         channels = ChannelConfig(
             enabled=channels_data.get("enabled", True),
             default_outgoing=channels_data.get("default_outgoing", "cli"),
             telegram=TelegramConfig(**telegram_data),
+            feishu=FeishuConfig(**feishu_data),
             http=HTTPConfig(**http_data),
         )
 

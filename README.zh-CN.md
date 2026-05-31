@@ -2,11 +2,11 @@
 
 [English](README.md)
 
-个人秘书 agent，支持 CLI、Telegram 和 HTTP webhook。它可以帮你记录长期记忆、管理提醒、跟进未闭环事项，并按需启动后台研究。
+个人秘书 agent，支持 CLI、Telegram、飞书/Lark 和 HTTP webhook。它可以帮你记录长期记忆、管理提醒、跟进未闭环事项，并按需启动后台研究。
 
 ## 主要功能
 
-- 多渠道对话：CLI、Telegram、HTTP webhook。
+- 多渠道对话：CLI、Telegram、飞书/Lark、HTTP webhook。
 - 长期记忆：记录稳定偏好、协作约定和需要持续跟踪的事项。
 - 提醒与跟进：支持定时提醒、复盘提醒、未回复提醒检查和长期停滞事项检查。
 - 后台研究：可用本地 Codex 或 Claude 启动多阶段深度研究；本机 CLI 不可用时可兜底到隔离的内部 agent，并按白名单使用搜索命令，在完成后通知你。
@@ -23,7 +23,7 @@ pip install -r requirements.txt
 
 cd secretary_v2
 cp config.yaml.example config.yaml
-# 编辑 config.yaml，填写模型、Telegram、HTTP token 等配置
+# 编辑 config.yaml，填写模型、Telegram/飞书、HTTP token 等配置
 
 python main.py --channel cli
 ```
@@ -44,6 +44,8 @@ cd secretary_v2
 ./manage.sh logs
 ```
 
+`manage.sh` 会启动 `python main.py --channel all`，运行所有已配置的非 CLI 渠道：Telegram、飞书/Lark 和 HTTP。
+
 ## Telegram 命令
 
 | 命令 | 说明 |
@@ -52,6 +54,8 @@ cd secretary_v2
 | `/skills` | 查看可用技能 |
 | `/compact` | 手动压缩历史 |
 | `/help` | 查看帮助 |
+
+飞书/Lark 使用 `python main.py --channel feishu` 时支持同样的文本命令。使用 `python main.py --channel all` 可同时运行 Telegram、飞书/Lark 和 HTTP。
 
 ## 测试
 

@@ -14,6 +14,7 @@ from runtime import run_agent
 from channels.base import IncomingMessage
 from channels.cli_channel import CLIChannel
 from channels.telegram_channel import TelegramChannel
+from channels.feishu_channel import FeishuChannel
 from channels.http_channel import HTTPChannel
 from logging_utils import install_secret_redaction_filter
 from skills_loader import get_skills_loader
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 RESEARCH_ID_RE = re.compile(r"\bresearch_[0-9a-fA-F]{6,32}\b")
 RESEARCH_LIST_WORDS = ("最近研究任务", "研究任务列表", "列出研究任务", "list research")
+CHAT_CHANNELS = {"telegram", "feishu"}
 
 
 class SecretaryApp:
@@ -42,11 +44,13 @@ class SecretaryApp:
 
     def __init__(self, channel_type: str = "cli", single_message: str = None):
         self.config = get_config()
+        self._configured_default_outgoing = self.config.channels.default_outgoing
+        self._last_chat_channel_name = None
         # In single-channel dev modes, force the scheduler/agent to deliver
         # to the active channel so scheduled-task output is visible during
         # development (otherwise it would be lost trying to reach an
         # unconfigured Telegram).
-        if channel_type in ("cli", "http"):
+        if channel_type in ("cli", "http", "feishu"):
             self.config.channels.default_outgoing = channel_type
 
         self.db = Database()
@@ -78,13 +82,26 @@ class SecretaryApp:
             single_message=self.single_message,
         )
 
-        # Predict which channels will actually run so the Telegram /status
-        # command can surface the truth ("telegram + http") rather than a
-        # hardcoded label.
+        # Predict which channels will actually run so /status can surface the
+        # truth ("telegram + feishu + http") rather than a hardcoded label.
         if self.channel_type == "cli":
             active = ["cli"]
         elif self.channel_type == "http":
             active = ["http"] if self.config.channels.http.enabled else []
+        elif self.channel_type == "feishu":
+            active = []
+            if self.config.channels.feishu.app_id and self.config.channels.feishu.app_secret:
+                active.append("feishu")
+            if self.config.channels.http.enabled:
+                active.append("http")
+        elif self.channel_type == "all":
+            active = []
+            if self.config.channels.telegram.bot_token:
+                active.append("telegram")
+            if self.config.channels.feishu.app_id and self.config.channels.feishu.app_secret:
+                active.append("feishu")
+            if self.config.channels.http.enabled:
+                active.append("http")
         else:
             active = []
             if self.config.channels.telegram.bot_token:
@@ -101,13 +118,49 @@ class SecretaryApp:
                 peer_channel_names=active,
             )
 
+        # Create Feishu channel if configured
+        if self.config.channels.feishu.app_id and self.config.channels.feishu.app_secret:
+            feishu_cfg = self.config.channels.feishu
+            self.channels["feishu"] = FeishuChannel(
+                app_id=feishu_cfg.app_id,
+                app_secret=feishu_cfg.app_secret,
+                default_chat_id=feishu_cfg.default_chat_id,
+                domain=feishu_cfg.domain,
+                transport=feishu_cfg.transport,
+                encrypt_key=feishu_cfg.encrypt_key,
+                verification_token=feishu_cfg.verification_token,
+                require_mention=feishu_cfg.require_mention,
+                allow_chat_ids=feishu_cfg.allow_chat_ids,
+                allow_sender_ids=feishu_cfg.allow_sender_ids,
+                message_handler=self._handle_user_message,
+                peer_channel_names=active,
+            )
+
         # Create HTTP channel if configured
         if self.config.channels.http.enabled:
             self.channels["http"] = HTTPChannel(
                 token=self.config.channels.http.token,
                 message_handler=self._handle_user_message,
-                response_channel=self.channels.get("telegram"),
+                response_channel=self._resolve_webhook_response_channel,
             )
+
+    def _resolve_webhook_response_channel(self):
+        """Resolve webhook replies at send time.
+
+        Prefer the default_outgoing value from config before any run-mode
+        overrides, then fall back to the most recently active chat channel.
+        """
+        channel_obj = self.channels.get(self._configured_default_outgoing)
+        if channel_obj is not None:
+            return channel_obj
+
+        if self._last_chat_channel_name in CHAT_CHANNELS:
+            return self.channels.get(self._last_chat_channel_name)
+        return None
+
+    def _remember_chat_channel(self, channel_name: str) -> None:
+        if channel_name in CHAT_CHANNELS:
+            self._last_chat_channel_name = channel_name
 
     def _get_active_channel(self):
         """Get the active channel based on channel_type."""
@@ -118,6 +171,7 @@ class SecretaryApp:
     async def _handle_user_message(self, message: IncomingMessage) -> str:
         """Handle incoming user message."""
         try:
+            self._remember_chat_channel(message.channel)
             research_shortcut = parse_subagent_shortcut(
                 message.text,
                 id_pattern=RESEARCH_ID_RE,
@@ -155,6 +209,9 @@ class SecretaryApp:
                 db=self.db,
                 origin_channel=message.channel,
                 user_id=message.user_id,
+                conversation_id=message.conversation_id,
+                reply_to_id=message.reply_to_id,
+                thread_id=message.thread_id,
                 skill_content=skill_content,
                 channels=self.channels,
                 scheduler=self.scheduler,
@@ -264,15 +321,26 @@ class SecretaryApp:
         Policy:
         - --channel cli   : only CLI (interactive REPL, dev/single-message mode)
         - --channel http  : only HTTP webhook
-        - --channel telegram (or anything else): Telegram polling + HTTP webhook
-                            concurrently (CLI is excluded because its REPL
-                            blocks stdin)
+        - --channel telegram: Telegram polling + HTTP webhook
+        - --channel feishu  : Feishu WebSocket + HTTP webhook
+        - --channel all     : every configured non-CLI channel
         """
         if self.channel_type == "cli":
             return [self.channels["cli"]]
         if self.channel_type == "http":
             return [self.channels["http"]] if "http" in self.channels else []
-        # production / telegram mode: every non-cli channel that's configured
+        if self.channel_type == "telegram":
+            return [
+                c for name, c in self.channels.items()
+                if name in {"telegram", "http"}
+            ]
+        if self.channel_type == "feishu":
+            return [
+                c for name, c in self.channels.items()
+                if name in {"feishu", "http"}
+            ]
+        if self.channel_type == "all":
+            return [c for name, c in self.channels.items() if name != "cli"]
         return [c for name, c in self.channels.items() if name != "cli"]
 
     async def _startup_self_test(self) -> None:
@@ -375,13 +443,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Secretary v2")
     parser.add_argument(
         "--channel",
-        choices=["cli", "telegram", "http"],
+        choices=["cli", "telegram", "feishu", "http", "all"],
         default="cli",
         help=(
             "Run mode (default: cli for safety). "
             "cli = interactive REPL only (dev). "
             "telegram = Telegram polling + HTTP webhook concurrently (production). "
-            "http = HTTP webhook only."
+            "feishu = Feishu WebSocket + HTTP webhook concurrently. "
+            "http = HTTP webhook only. "
+            "all = every configured non-CLI channel."
         ),
     )
     parser.add_argument(

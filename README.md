@@ -2,11 +2,11 @@
 
 [简体中文](README.zh-CN.md)
 
-A personal secretary agent for CLI, Telegram, and HTTP webhooks. It helps you keep long-term memory, manage reminders, follow up on open loops, and launch background research when needed.
+A personal secretary agent for CLI, Telegram, Feishu/Lark, and HTTP webhooks. It helps you keep long-term memory, manage reminders, follow up on open loops, and launch background research when needed.
 
 ## Key Features
 
-- Multi-channel conversation: CLI, Telegram, and HTTP webhook.
+- Multi-channel conversation: CLI, Telegram, Feishu/Lark, and HTTP webhook.
 - Long-term memory: stores stable preferences, collaboration agreements, and tracked items.
 - Reminders and follow-ups: supports scheduled reminders, review reminders, pending-response checks, and stale-item checks.
 - Background research: can launch multi-stage deep research with local Codex or Claude, with an isolated internal agent fallback for allowlisted search commands, and notify you when it finishes.
@@ -23,7 +23,7 @@ pip install -r requirements.txt
 
 cd secretary_v2
 cp config.yaml.example config.yaml
-# Edit config.yaml with your model, Telegram, and HTTP token settings.
+# Edit config.yaml with your model, Telegram/Feishu, and HTTP token settings.
 
 python main.py --channel cli
 ```
@@ -44,6 +44,8 @@ cd secretary_v2
 ./manage.sh logs
 ```
 
+`manage.sh` starts `python main.py --channel all`, which runs every configured non-CLI channel: Telegram, Feishu/Lark, and HTTP.
+
 ## Telegram Commands
 
 | Command | Description |
@@ -52,6 +54,8 @@ cd secretary_v2
 | `/skills` | List available skills |
 | `/compact` | Compact conversation history |
 | `/help` | Show help |
+
+Feishu/Lark supports the same text commands when using `python main.py --channel feishu`. Use `python main.py --channel all` to run Telegram, Feishu/Lark, and HTTP together.
 
 ## Tests
 

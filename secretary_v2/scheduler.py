@@ -198,6 +198,7 @@ class Scheduler:
             text=prompt,
             channel="scheduled",
             user_id="scheduler",
+            conversation_id=None,
             metadata={
                 "task_id": task_id,
                 "outgoing": self._config.channels.default_outgoing,
