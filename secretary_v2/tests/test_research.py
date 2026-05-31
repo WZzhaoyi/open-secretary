@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from config import (
+    AgentSubagentConfig,
     ClaudeSubagentConfig,
     CodexSubagentConfig,
     SubagentConfig,
@@ -20,7 +21,13 @@ from subagent_runs import (
     load_subagent_definition,
     parse_subagent_shortcut,
 )
-from subagents import SubAgentResult, SubAgentRunner, extract_subagent_text
+from subagents import (
+    SubAgentResult,
+    SubAgentRunner,
+    _bash_patterns_from_tools,
+    _command_allowed_by_patterns,
+    extract_subagent_text,
+)
 
 
 class FakeRunner:
@@ -71,6 +78,17 @@ def test_subagent_command_templates(monkeypatch):
     assert "sonnet" in claude
     assert "--effort" in claude
     assert "high" in claude
+
+    agent = runner.build_command("agent", "研究 AI 产业链")
+    assert agent[:3] == ["internal-agent", "--provider", cfg.llm.provider]
+    assert "--model" in agent
+    assert cfg.llm.model in agent
+    assert "--allowedTools" in agent
+    assert "Bash(opencli gemini *)" in agent[agent.index("--allowedTools") + 1]
+    cfg.llm.effort = "max"
+    agent_with_effort = runner.build_command("agent", "研究 AI 产业链")
+    assert "--effort" in agent_with_effort
+    assert agent_with_effort[agent_with_effort.index("--effort") + 1] == "max"
     reset_config()
 
 
@@ -110,6 +128,150 @@ def test_subagent_command_templates_respect_research_config(monkeypatch):
     assert claude[claude.index("--model") + 1] == "opus"
     assert claude[claude.index("--effort") + 1] == "xhigh"
     reset_config()
+
+
+def test_subagent_choose_engine_falls_back_to_internal_agent(monkeypatch):
+    reset_config()
+    cfg = get_config()
+    cfg.subagent = SubagentConfig(default_engine="claude", fallback_engine="agent")
+    monkeypatch.setattr("subagents.get_config", lambda: cfg)
+    monkeypatch.setattr("subagents.shutil.which", lambda _engine: None)
+
+    runner = SubAgentRunner()
+    assert runner.is_available("claude") is False
+    assert runner.is_available("codex") is False
+    assert runner.is_available("agent") is True
+    assert runner.choose_engine() == "agent"
+    reset_config()
+
+
+def test_subagent_choose_engine_can_disable_internal_fallback(monkeypatch):
+    reset_config()
+    cfg = get_config()
+    cfg.subagent = SubagentConfig(
+        default_engine="claude",
+        fallback_engine="agent",
+        agent=AgentSubagentConfig(enabled=False),
+    )
+    monkeypatch.setattr("subagents.get_config", lambda: cfg)
+    monkeypatch.setattr("subagents.shutil.which", lambda _engine: None)
+
+    runner = SubAgentRunner()
+    with pytest.raises(RuntimeError, match="No subagent engine is available"):
+        runner.choose_engine()
+    reset_config()
+
+
+def test_subagent_explicit_missing_cli_does_not_fall_back(monkeypatch):
+    reset_config()
+    cfg = get_config()
+    cfg.subagent = SubagentConfig(fallback_engine="agent")
+    monkeypatch.setattr("subagents.get_config", lambda: cfg)
+    monkeypatch.setattr("subagents.shutil.which", lambda _engine: None)
+
+    runner = SubAgentRunner()
+    with pytest.raises(RuntimeError, match="codex CLI is not installed"):
+        runner.choose_engine("codex")
+    assert runner.choose_engine("agent") == "agent"
+    reset_config()
+
+
+@pytest.mark.asyncio
+async def test_internal_agent_subagent_run_is_isolated(monkeypatch, tmp_path):
+    reset_config()
+    cfg = get_config()
+    cfg.subagent = SubagentConfig(default_engine="agent", fallback_engine="agent")
+    monkeypatch.setattr("subagents.get_config", lambda: cfg)
+    monkeypatch.setattr("subagents._build_internal_model", lambda: object())
+
+    calls = []
+
+    class FakeAgent:
+        def __init__(self, model, system_prompt):
+            calls.append(("init", model, system_prompt))
+
+        def tool_plain(self, *args, **kwargs):
+            def decorator(func):
+                calls.append(("tool", kwargs.get("name")))
+                return func
+
+            return decorator
+
+        async def run(self, prompt):
+            calls.append(("run", prompt))
+
+            class Result:
+                output = "isolated stage output"
+
+            return Result()
+
+    monkeypatch.setattr("subagents.Agent", FakeAgent)
+
+    result = await SubAgentRunner(base_dir=tmp_path).run(
+        "agent",
+        "stage prompt",
+        timeout=1,
+    )
+
+    assert result.ok
+    assert result.engine == "agent"
+    assert result.command[0] == "internal-agent"
+    assert result.stdout == "isolated stage output"
+    assert calls[0][0] == "init"
+    assert calls[0][2].startswith(cfg.subagent.agent.system_prompt)
+    assert ("tool", "bash") in calls
+    assert calls[-1] == ("run", "stage prompt")
+    reset_config()
+
+
+def test_internal_agent_bash_allowlist_patterns():
+    assert _bash_patterns_from_tools(["WebSearch", "Bash(opencli gemini *)"]) == [
+        "opencli gemini *"
+    ]
+    assert _command_allowed_by_patterns("opencli list -f yaml", ["opencli list*"])
+    assert _command_allowed_by_patterns("opencli gemini search AI", ["opencli gemini *"])
+    assert not _command_allowed_by_patterns("opencli external docker ps", ["opencli gemini *"])
+
+
+@pytest.mark.asyncio
+async def test_internal_agent_bash_denies_unlisted_command(tmp_path):
+    result = await SubAgentRunner(base_dir=tmp_path)._run_internal_bash(
+        command="echo hello",
+        work_dir=tmp_path,
+        timeout=1,
+        allowed_patterns=["opencli *"],
+    )
+
+    assert "PERMISSION_DENIED" in result
+    assert "command_not_allowlisted" in result
+
+
+@pytest.mark.asyncio
+async def test_internal_agent_bash_still_uses_shell_guardrails(tmp_path):
+    result = await SubAgentRunner(base_dir=tmp_path)._run_internal_bash(
+        command="sudo ls",
+        work_dir=tmp_path,
+        timeout=1,
+        allowed_patterns=["sudo *"],
+    )
+
+    assert "PERMISSION_DENIED" in result
+    assert "hard_deny_command" in result
+
+
+@pytest.mark.asyncio
+async def test_internal_agent_bash_respects_disallowed_tools(tmp_path):
+    result = await SubAgentRunner(base_dir=tmp_path)._run_internal_bash(
+        command="opencli external docker ps",
+        work_dir=tmp_path,
+        timeout=1,
+        allowed_patterns=["opencli *"],
+        disallowed_patterns=["opencli external *"],
+    )
+
+    assert "PERMISSION_DENIED" in result
+    assert "command_disallowed" in result
+    assert "subagent.agent.disallowed_tools" in result
 
 
 def test_extract_subagent_text_from_claude_json():

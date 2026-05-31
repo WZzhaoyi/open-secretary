@@ -5,11 +5,19 @@
 
 # LLM configuration
 llm:
-  provider: anthropic           # anthropic | openai | gemini
+  provider: anthropic           # anthropic | openai | deepseek | gemini
   model: claude-sonnet-4-20250514
   api_key: YOUR_LLM_API_KEY
   base_url: ""                  # Optional custom/proxy endpoint
   max_tokens: 4096
+  # Shared by the main agent and the internal fallback subagent.
+  # For DeepSeek V4 thinking mode use model deepseek-v4-pro/deepseek-v4-flash.
+  # OpenAI format: provider deepseek, or provider openai + base_url https://api.deepseek.com.
+  # Anthropic format: provider anthropic + base_url https://api.deepseek.com/anthropic.
+  # thinking enabled|disabled; effort high|max.
+  effort: ""                    # OpenAI/DeepSeek reasoning effort, or Anthropic thinking effort
+  thinking: ""                  # DeepSeek V4: enabled | disabled; empty uses provider default
+  extra_body: {}
 
 # Agent response language: auto | zh | en
 language: auto
@@ -54,6 +62,9 @@ search:
 # Background sub-agent sidecar
 subagent:
   default_engine: claude
+  # Used only when neither local Claude nor local Codex CLI is available.
+  # Set to "" or disable subagent.agent.enabled to fail fast instead.
+  fallback_engine: agent
   codex:
     model: ""
     enable_search: true
@@ -66,6 +77,31 @@ subagent:
     allowed_tools: [WebSearch, WebFetch, Read]
     allowed_bash: []
     disallowed_tools: []
+  agent:
+    enabled: true
+    # Empty means reuse llm.model. Provider/api_key/base_url/max_tokens/effort/
+    # thinking all come from llm, same as the main agent. This internal fallback
+    # is isolated from message channels, scheduler, memory, and main-agent history.
+    model: ""
+    # Mirrors claude -p --allowedTools / --disallowedTools. The internal
+    # fallback currently implements Bash(...) only; matching opencli entries
+    # also inject smart-search and opencli-usage skill docs.
+    allowed_tools:
+      - "Bash(opencli list*)"
+      - "Bash(opencli * -h)"
+      - "Bash(opencli * --help)"
+      - "Bash(opencli * * -h)"
+      - "Bash(opencli * * --help)"
+      - "Bash(opencli grok *)"
+      - "Bash(opencli doubao *)"
+      - "Bash(opencli gemini *)"
+    disallowed_tools: []
+    shell_timeout: 60
+    system_prompt: >-
+      You are a compact, isolated research subagent. Complete the assigned
+      stage using only the prompt content and explicitly allowed tools. Do not
+      claim access to local files, memory, reminders, message channels, or the
+      main secretary agent state. Return only the stage output.
 
 # History and compaction
 history:

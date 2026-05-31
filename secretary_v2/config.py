@@ -15,6 +15,9 @@ class LLMConfig:
     api_key: str = ""
     base_url: str = ""
     max_tokens: int = 4096
+    effort: str = ""
+    thinking: str = ""
+    extra_body: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -93,10 +96,38 @@ class ClaudeSubagentConfig:
 
 
 @dataclass
+class AgentSubagentConfig:
+    enabled: bool = True
+    model: str = ""
+    allowed_tools: List[str] = field(
+        default_factory=lambda: [
+            "Bash(opencli list*)",
+            "Bash(opencli * -h)",
+            "Bash(opencli * --help)",
+            "Bash(opencli * * -h)",
+            "Bash(opencli * * --help)",
+            "Bash(opencli grok *)",
+            "Bash(opencli doubao *)",
+            "Bash(opencli gemini *)",
+        ]
+    )
+    disallowed_tools: List[str] = field(default_factory=list)
+    shell_timeout: int = 60
+    system_prompt: str = (
+        "You are a compact, isolated research subagent. Complete the assigned "
+        "stage using only the prompt content and explicitly allowed tools. Do "
+        "not claim access to local files, memory, reminders, message channels, "
+        "or the main secretary agent state. Return only the stage output."
+    )
+
+
+@dataclass
 class SubagentConfig:
     default_engine: str = "claude"
+    fallback_engine: str = "agent"
     codex: CodexSubagentConfig = field(default_factory=CodexSubagentConfig)
     claude: ClaudeSubagentConfig = field(default_factory=ClaudeSubagentConfig)
+    agent: AgentSubagentConfig = field(default_factory=AgentSubagentConfig)
 
 
 @dataclass
@@ -171,8 +202,10 @@ class Config:
         subagent_data = config_data.get("subagent", {})
         subagent = SubagentConfig(
             default_engine=subagent_data.get("default_engine", "claude"),
+            fallback_engine=subagent_data.get("fallback_engine", "agent"),
             codex=CodexSubagentConfig(**subagent_data.get("codex", {})),
             claude=ClaudeSubagentConfig(**subagent_data.get("claude", {})),
+            agent=AgentSubagentConfig(**subagent_data.get("agent", {})),
         )
 
         # Parse schedules

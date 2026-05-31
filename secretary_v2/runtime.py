@@ -19,12 +19,6 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.models.gemini import GeminiModel
-from pydantic_ai.providers.anthropic import AnthropicProvider
-from pydantic_ai.providers.google_gla import GoogleGLAProvider
-from pydantic_ai.providers.openai import OpenAIProvider
 
 from compaction import build_summarization_processor, maybe_auto_persist_compact
 from config import get_config, SECRETARY_PERSONA, DB_SCHEMA_HINT
@@ -37,6 +31,7 @@ from guardrails import (
     permission_denied,
     truncate_output,
 )
+from llm_models import build_model
 from memory import Database
 
 logger = logging.getLogger(__name__)
@@ -119,34 +114,6 @@ class SecretaryDeps:
     channels: Dict[str, Any] = field(default_factory=dict)
     scheduler: Optional[Any] = None  # main.Scheduler — typed Any to avoid circular import
     subagent_run_manager: Optional[Any] = None
-
-
-def build_model(config):
-    """Build LLM model based on configuration."""
-    provider = config.llm.provider.lower()
-    model_name = config.llm.model
-    api_key = config.llm.api_key or None
-    base_url = config.llm.base_url or None
-
-    if provider == "anthropic":
-        if api_key or base_url:
-            return AnthropicModel(
-                model_name,
-                provider=AnthropicProvider(api_key=api_key, base_url=base_url),
-            )
-        return AnthropicModel(model_name)
-    if provider == "openai":
-        if api_key or base_url:
-            return OpenAIChatModel(
-                model_name,
-                provider=OpenAIProvider(api_key=api_key, base_url=base_url),
-            )
-        return OpenAIChatModel(model_name)
-    if provider == "gemini":
-        if api_key:
-            return GeminiModel(model_name, provider=GoogleGLAProvider(api_key=api_key))
-        return GeminiModel(model_name)
-    raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
 # Module-level agent. history_processors is wired here so every run benefits

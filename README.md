@@ -9,7 +9,7 @@ A personal secretary agent for CLI, Telegram, and HTTP webhooks. It helps you ke
 - Multi-channel conversation: CLI, Telegram, and HTTP webhook.
 - Long-term memory: stores stable preferences, collaboration agreements, and tracked items.
 - Reminders and follow-ups: supports scheduled reminders, review reminders, pending-response checks, and stale-item checks.
-- Background research: can launch multi-stage deep research with local Codex or Claude and notify you when it finishes.
+- Background research: can launch multi-stage deep research with local Codex or Claude, with an isolated internal agent fallback for allowlisted search commands, and notify you when it finishes.
 - DeepSeek API: 99.9% hit rate.
 - Skill extension: supports built-in skills and optional global skills.
 - Multilingual behavior: `language` controls agent replies, and `ui_language` controls command/status text. Both support `auto`, `zh`, and `en`.

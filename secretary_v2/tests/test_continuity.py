@@ -134,19 +134,76 @@ def fake_agent_run(monkeypatch):
 
 def test_build_model_uses_config_api_key(monkeypatch):
     """LLM keys in config.yaml must be honored, not require env variables."""
-    for env_name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+    for env_name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY"):
         monkeypatch.delenv(env_name, raising=False)
 
     anthropic = runtime.build_model(
         _config_for_model("anthropic", "claude-sonnet-4-20250514")
     )
     openai = runtime.build_model(_config_for_model("openai", "gpt-4o-mini"))
-    with pytest.warns(DeprecationWarning):
-        gemini = runtime.build_model(_config_for_model("gemini", "gemini-1.5-pro"))
+    deepseek = runtime.build_model(_config_for_model("deepseek", "deepseek-v4-flash"))
+    gemini = runtime.build_model(_config_for_model("gemini", "gemini-1.5-pro"))
 
     assert anthropic.client.api_key == "test-key"
     assert openai.client.api_key == "test-key"
-    assert gemini.client.headers["X-Goog-Api-Key"] == "test-key"
+    assert deepseek.client.api_key == "test-key"
+    assert gemini.client._api_client.api_key == "test-key"
+
+
+def test_build_model_settings_support_deepseek_v4():
+    from llm_models import build_model_settings
+
+    cfg = _config_for_model("deepseek", "deepseek-v4-pro")
+    cfg.llm.effort = "xhigh"
+    cfg.llm.thinking = "enabled"
+
+    settings = build_model_settings(cfg)
+
+    assert settings["max_tokens"] == cfg.llm.max_tokens
+    assert settings["openai_reasoning_effort"] == "max"
+    assert settings["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
+def test_build_model_settings_support_openai_compatible_effort():
+    from llm_models import build_model_settings
+
+    cfg = _config_for_model("openai", "custom-reasoner")
+    cfg.llm.base_url = "https://example.com/v1"
+    cfg.llm.effort = "high"
+
+    settings = build_model_settings(cfg)
+
+    assert settings["openai_reasoning_effort"] == "high"
+    assert "extra_body" not in settings
+
+
+def test_build_model_settings_support_anthropic_effort():
+    from llm_models import build_model_settings
+
+    cfg = _config_for_model("anthropic", "claude-sonnet-4-20250514")
+    cfg.llm.effort = "high"
+
+    settings = build_model_settings(cfg)
+
+    assert settings["thinking"] == "high"
+    assert "openai_reasoning_effort" not in settings
+
+
+def test_build_model_settings_support_deepseek_v4_anthropic_format():
+    from llm_models import build_model_settings
+
+    cfg = _config_for_model("anthropic", "deepseek-v4-pro")
+    cfg.llm.base_url = "https://api.deepseek.com/anthropic"
+    cfg.llm.effort = "max"
+    cfg.llm.thinking = "enabled"
+
+    settings = build_model_settings(cfg)
+
+    assert "openai_reasoning_effort" not in settings
+    assert settings["extra_body"] == {
+        "output_config": {"effort": "max"},
+        "thinking": {"type": "enabled"},
+    }
 
 
 # ---- Fix #1: message_history continuity ----

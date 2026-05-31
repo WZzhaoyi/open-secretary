@@ -1,11 +1,15 @@
-"""External CLI subagent runner.
+"""Subagent runner for local CLI sidecars and isolated internal fallback.
 
 The runner treats Codex and Claude Code as local sidecars. It never reads or
 copies their auth files; each CLI is responsible for its own login state,
-permissions, skills, and rate limits.
+permissions, skills, and rate limits. When those CLIs are unavailable, it can
+fall back to a compact internal agent with only configured research skills and
+allowlisted bash commands, isolated from the main secretary agent loop, history,
+scheduler, and channels.
 """
 
 import asyncio
+import fnmatch
 import json
 import os
 import shutil
@@ -14,10 +18,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal, Optional
 
-from config import get_config
-from guardrails import BASE_DIR, truncate_output
+from pydantic_ai import Agent
 
-SubAgentEngine = Literal["codex", "claude"]
+from config import get_config
+from guardrails import BASE_DIR, check_shell_command_decision, truncate_output
+from llm_models import build_model
+from skills_loader import get_skills_loader
+
+SubAgentEngine = Literal["codex", "claude", "agent"]
+SUPPORTED_ENGINES = ("codex", "claude", "agent")
+EXTERNAL_CLI_ENGINES = ("codex", "claude")
 
 
 def claude_allowed_tools() -> str:
@@ -40,6 +50,73 @@ def _claude_bash_tools(commands: List[str]) -> List[str]:
             continue
         tools.append(command if command.startswith("Bash(") else f"Bash({command})")
     return tools
+
+
+def _build_internal_model():
+    """Build an isolated fallback subagent model from the main LLM config."""
+    cfg = get_config()
+    agent_cfg = cfg.subagent.agent
+    model_override = agent_cfg.model.strip() or None
+    return build_model(cfg, model_override=model_override)
+
+
+def _command_allowed_by_patterns(command: str, patterns: List[str]) -> bool:
+    command = " ".join((command or "").split())
+    return any(fnmatch.fnmatch(command, pattern.strip()) for pattern in patterns if pattern.strip())
+
+
+def _bash_patterns_from_tools(tools: List[str]) -> List[str]:
+    patterns = []
+    for tool in tools:
+        text = (tool or "").strip()
+        if text.startswith("Bash(") and text.endswith(")"):
+            pattern = text[len("Bash("):-1].strip()
+            if pattern:
+                patterns.append(pattern)
+    return patterns
+
+
+def _opencli_search_enabled(tools: List[str]) -> bool:
+    return any(pattern.startswith("opencli") for pattern in _bash_patterns_from_tools(tools))
+
+
+def _internal_agent_system_prompt() -> str:
+    cfg = get_config()
+    agent_cfg = cfg.subagent.agent
+    sections = [agent_cfg.system_prompt.strip()]
+    allowed_tools = [tool.strip() for tool in agent_cfg.allowed_tools if tool.strip()]
+    disallowed_tools = [tool.strip() for tool in agent_cfg.disallowed_tools if tool.strip()]
+    if allowed_tools:
+        sections.extend(
+            [
+                "## Tool Policy",
+                "This fallback mirrors the configured Claude `-p` tool allowlist where supported.",
+                "Allowed tools:",
+                "\n".join(f"- `{tool}`" for tool in allowed_tools),
+                "Only `Bash(...)` tools are implemented by the internal fallback.",
+                "Commands are still checked by the shared shell hard-deny guardrails before execution.",
+            ]
+        )
+    if disallowed_tools:
+        sections.extend(
+            [
+                "Disallowed tools:",
+                "\n".join(f"- `{tool}`" for tool in disallowed_tools),
+            ]
+        )
+
+    skill_sections = []
+    if _opencli_search_enabled(agent_cfg.allowed_tools):
+        loader = get_skills_loader()
+        max_size = max(1000, int(getattr(cfg.skills, "max_size", 50000) or 50000))
+        for name in ("smart-search", "opencli-usage"):
+            content = loader.get_skill_content(name)
+            if not content:
+                continue
+            skill_sections.append(f"### {name}\n{content[:max_size]}")
+    if skill_sections:
+        sections.extend(["## Research Skills", "\n\n".join(skill_sections)])
+    return "\n\n".join(section for section in sections if section)
 
 
 @dataclass
@@ -143,13 +220,15 @@ def _find_text_in_event(value) -> str:
 
 
 class SubAgentRunner:
-    """Run supported local sub-agent CLIs in a bounded subprocess."""
+    """Run supported subagent engines with bounded execution."""
 
     def __init__(self, base_dir: Optional[Path] = None):
         self.base_dir = Path(base_dir or BASE_DIR).resolve()
 
     def is_available(self, engine: str) -> bool:
-        if engine not in ("codex", "claude"):
+        if engine == "agent":
+            return get_config().subagent.agent.enabled
+        if engine not in EXTERNAL_CLI_ENGINES:
             return False
         return shutil.which(engine) is not None
 
@@ -157,18 +236,27 @@ class SubAgentRunner:
         """Return a supported engine, preferring explicit request then Claude."""
         if requested:
             engine = requested.lower().strip()
-            if engine not in ("codex", "claude"):
-                raise ValueError("engine must be 'codex' or 'claude'")
+            if engine not in SUPPORTED_ENGINES:
+                raise ValueError("engine must be 'codex', 'claude', or 'agent'")
             if not self.is_available(engine):
+                if engine == "agent":
+                    raise RuntimeError("internal agent subagent fallback is disabled")
                 raise RuntimeError(f"{engine} CLI is not installed or not on PATH")
             return engine
 
-        preferred = get_config().subagent.default_engine.lower().strip() or "claude"
+        cfg = get_config().subagent
+        preferred = cfg.default_engine.lower().strip() or "claude"
+        fallback = cfg.fallback_engine.lower().strip()
         order = [preferred, "claude", "codex"]
+        if fallback:
+            order.append(fallback)
         for engine in dict.fromkeys(order):
             if self.is_available(engine):
                 return engine
-        raise RuntimeError("Neither claude nor codex CLI is installed or on PATH")
+        raise RuntimeError(
+            "No subagent engine is available: neither claude nor codex CLI is on PATH, "
+            "and internal agent fallback is disabled"
+        )
 
     def build_command(
         self, engine: str, prompt: str, output_last_message: Optional[str] = None
@@ -212,7 +300,18 @@ class SubAgentRunner:
             if cfg.effort.strip():
                 command.extend(["--effort", cfg.effort.strip()])
             return command
-        raise ValueError("engine must be 'codex' or 'claude'")
+        if engine == "agent":
+            cfg = get_config()
+            model = cfg.subagent.agent.model.strip() or cfg.llm.model
+            command = ["internal-agent", "--provider", cfg.llm.provider, "--model", model]
+            if cfg.llm.effort.strip():
+                command.extend(["--effort", cfg.llm.effort.strip()])
+            if cfg.subagent.agent.allowed_tools:
+                command.extend(["--allowedTools", ",".join(cfg.subagent.agent.allowed_tools)])
+            if cfg.subagent.agent.disallowed_tools:
+                command.extend(["--disallowedTools", ",".join(cfg.subagent.agent.disallowed_tools)])
+            return command
+        raise ValueError("engine must be 'codex', 'claude', or 'agent'")
 
     def resolve_cwd(self, cwd: Optional[str] = None) -> Path:
         if not cwd:
@@ -231,6 +330,9 @@ class SubAgentRunner:
     ) -> SubAgentResult:
         engine = self.choose_engine(engine)
         work_dir = self.resolve_cwd(cwd)
+        if engine == "agent":
+            return await self._run_internal_agent(prompt, work_dir, timeout)
+
         output_path = self._make_output_path() if engine == "codex" else None
         command = self.build_command(engine, prompt, output_last_message=output_path)
 
@@ -268,6 +370,126 @@ class SubAgentRunner:
             stdout=stdout,
             stderr=(stderr_b or b"").decode("utf-8", errors="replace"),
             timed_out=timed_out,
+        )
+
+    async def _run_internal_agent(
+        self,
+        prompt: str,
+        work_dir: Path,
+        timeout: int,
+    ) -> SubAgentResult:
+        cfg = get_config().subagent.agent
+        command = self.build_command("agent", prompt)
+        isolated_agent = Agent(
+            model=_build_internal_model(),
+            system_prompt=_internal_agent_system_prompt(),
+        )
+        allowed_bash = _bash_patterns_from_tools(cfg.allowed_tools)
+        disallowed_bash = _bash_patterns_from_tools(cfg.disallowed_tools)
+        shell_timeout = max(1, int(cfg.shell_timeout or 60))
+
+        if allowed_bash:
+            @isolated_agent.tool_plain(name="bash")
+            async def bash(command: str, timeout: int = shell_timeout) -> str:
+                """Run one configured research/search shell command."""
+                return await self._run_internal_bash(
+                    command=command,
+                    work_dir=work_dir,
+                    timeout=min(max(1, int(timeout or shell_timeout)), shell_timeout),
+                    allowed_patterns=allowed_bash,
+                    disallowed_patterns=disallowed_bash,
+                )
+
+        try:
+            result = await asyncio.wait_for(isolated_agent.run(prompt), timeout)
+            stdout = str(result.output)
+            return SubAgentResult(
+                engine="agent",
+                prompt=prompt,
+                command=command,
+                cwd=str(work_dir),
+                exit_code=0,
+                stdout=stdout,
+                stderr="",
+            )
+        except asyncio.TimeoutError:
+            return SubAgentResult(
+                engine="agent",
+                prompt=prompt,
+                command=command,
+                cwd=str(work_dir),
+                exit_code=-1,
+                stdout="",
+                stderr="internal agent subagent timed out",
+                timed_out=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return SubAgentResult(
+                engine="agent",
+                prompt=prompt,
+                command=command,
+                cwd=str(work_dir),
+                exit_code=1,
+                stdout="",
+                stderr=f"{type(e).__name__}: {e}",
+            )
+
+    async def _run_internal_bash(
+        self,
+        command: str,
+        work_dir: Path,
+        timeout: int,
+        allowed_patterns: List[str],
+        disallowed_patterns: Optional[List[str]] = None,
+    ) -> str:
+        if _command_allowed_by_patterns(command, disallowed_patterns or []):
+            return (
+                "PERMISSION_DENIED\n"
+                "tool: subagent.bash\n"
+                "reason: command_disallowed\n"
+                f"target: {command}\n"
+                "policy: subagent.agent.disallowed_tools"
+            )
+        if not _command_allowed_by_patterns(command, allowed_patterns):
+            return (
+                "PERMISSION_DENIED\n"
+                "tool: subagent.bash\n"
+                "reason: command_not_allowlisted\n"
+                f"target: {command}\n"
+                "policy: subagent.agent.allowed_tools"
+            )
+
+        decision = check_shell_command_decision(command, tool="subagent.bash")
+        if not decision.allowed:
+            return decision.format()
+
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(work_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout)
+            exit_code = proc.returncode if proc.returncode is not None else -1
+        except asyncio.TimeoutError:
+            await self._terminate(proc)
+            stdout_b, stderr_b = await proc.communicate()
+            exit_code = -1
+            return (
+                f"Error: command timed out after {timeout}s\n"
+                f"exit_code: {exit_code}\n"
+                f"stdout:\n{truncate_output((stdout_b or b'').decode('utf-8', errors='replace'))}\n"
+                f"stderr:\n{truncate_output((stderr_b or b'').decode('utf-8', errors='replace'))}"
+            )
+
+        return (
+            f"exit_code: {exit_code}\n"
+            f"stdout:\n{truncate_output((stdout_b or b'').decode('utf-8', errors='replace'))}\n"
+            f"stderr:\n{truncate_output((stderr_b or b'').decode('utf-8', errors='replace'))}"
         )
 
     def _make_output_path(self) -> str:
