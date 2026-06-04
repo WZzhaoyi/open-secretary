@@ -201,6 +201,16 @@ class Database:
                 Event.created_at.desc()
             ).limit(limit).all()
 
+    def get_events_excluding_statuses(
+        self, excluded_statuses: List[str], limit: int = 50
+    ) -> List[Event]:
+        """Get recent events while omitting closed/noisy status buckets."""
+        with self.get_session() as session:
+            query = session.query(Event)
+            if excluded_statuses:
+                query = query.filter(Event.status.notin_(excluded_statuses))
+            return query.order_by(Event.created_at.desc()).limit(limit).all()
+
     def get_events_by_status(self, status: str, limit: int = 200) -> List[Event]:
         """Get events by attention status, newest first."""
         with self.get_session() as session:

@@ -68,7 +68,7 @@ auto_load: true
 
 ## events.status 生命周期
 
-- `logged`：已记录，无需持续关注。默认状态。
+- `logged`：已记录，持续关注，未来出现相关线索时提醒。默认状态。
 - `open`：需要未来主动提醒、检查、追问或复盘。
 - `resolved`：原本需要关注，但用户已回复、完成、取消、放弃或给出结论。
 - `promoted`：事件中的长期价值已通过 `memory_update` 沉淀进 `memory.md`。

@@ -677,6 +677,30 @@ async def test_dynamic_context_keeps_stable_prefix_before_runtime_tail(tmp_path,
     reset_skills_loader()
 
 
+@pytest.mark.asyncio
+async def test_dynamic_context_omits_resolved_events_from_recent_window(monkeypatch):
+    from config import get_config
+    from runtime import dynamic_context, SecretaryDeps
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg.history, "max_events", 1)
+
+    db = Database(db_path=":memory:")
+    db.create_event("note", "logged continuity sentinel", status="logged")
+    db.create_event("note", "resolved closed-loop sentinel", status="resolved")
+    deps = SecretaryDeps(db=db, current_time="2026-05-26T12:34:56+08:00")
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    text = await dynamic_context(_Ctx(deps))
+
+    assert "logged continuity sentinel" in text
+    assert "resolved closed-loop sentinel" not in text
+    assert "shown 1 / configured 1" in text
+
+
 def test_language_policy_supports_auto_and_falls_back_to_auto():
     from runtime import _language_policy
 

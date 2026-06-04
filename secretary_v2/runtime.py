@@ -245,7 +245,9 @@ async def dynamic_context(ctx: RunContext[SecretaryDeps]) -> str:
                 f"{open_text}"
             )
 
-        events = deps.db.get_events(limit=cfg.max_events)
+        events = deps.db.get_events_excluding_statuses(
+            ["resolved"], limit=cfg.max_events + len(open_event_ids)
+        )
         recent_events = [
             event for event in events if event.id not in open_event_ids
         ][:recent_events_limit]
