@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -125,6 +126,55 @@ def test_subagent_command_templates_respect_research_config(monkeypatch):
     assert claude[claude.index("--disallowedTools") + 1] == "Bash(longbridge order *)"
     assert claude[claude.index("--model") + 1] == "opus"
     assert claude[claude.index("--effort") + 1] == "xhigh"
+    reset_config()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+async def test_subagent_external_cli_concurrency_limit(monkeypatch, tmp_path, engine):
+    reset_config()
+    cfg = get_config()
+    cfg.subagent = SubagentConfig(
+        default_engine=engine,
+        codex=CodexSubagentConfig(max_concurrency=1),
+        claude=ClaudeSubagentConfig(max_concurrency=1),
+    )
+    monkeypatch.setattr("subagents.get_config", lambda: cfg)
+    monkeypatch.setattr("subagents.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    active = 0
+    max_active = 0
+
+    class FakeProcess:
+        returncode = 0
+        pid = 12345
+
+        async def communicate(self):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.05)
+            active -= 1
+            if engine == "claude":
+                return (json.dumps({"result": "ok"}).encode(), b"")
+            return (b'{"type":"result","result":"ok"}\n', b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "subagents.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    runner = SubAgentRunner(base_dir=tmp_path)
+    results = await asyncio.gather(
+        runner.run(engine, "first", timeout=1),
+        runner.run(engine, "second", timeout=1),
+    )
+
+    assert all(result.ok for result in results)
+    assert max_active == 1
     reset_config()
 
 
@@ -291,6 +341,18 @@ def test_extract_subagent_text_from_codex_jsonl():
     assert extract_subagent_text("codex", stdout) == "最终报告"
 
 
+def test_parse_subagent_shortcut_supports_resume():
+    pattern = re.compile(r"\bresearch_[0-9a-fA-F]{6,32}\b")
+    assert parse_subagent_shortcut("继续 research_ce4ab3afb8", pattern, ("列出研究任务",)) == (
+        "resume",
+        "research_ce4ab3afb8",
+    )
+    assert parse_subagent_shortcut("retry research_ce4ab3afb8", pattern, ("list research",)) == (
+        "resume",
+        "research_ce4ab3afb8",
+    )
+
+
 def test_summary_text_prefers_clean_result_over_machine_metadata():
     result = SubAgentResult(
         engine="claude",
@@ -412,6 +474,83 @@ async def test_subagent_run_manager_resumes_incomplete_jobs(test_db, tmp_path):
     job = test_db.get_subagent_run("research_resume")
     assert job.status == "succeeded"
     assert (tmp_path / "research_resume.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_subagent_run_manager_resumes_from_first_incomplete_stage(test_db, tmp_path):
+    class RecordingRunner:
+        def __init__(self):
+            self.prompts = []
+
+        def choose_engine(self, requested=None):
+            return requested or "claude"
+
+        async def run(self, engine, prompt, cwd=None, timeout=1800):
+            self.prompts.append(prompt)
+            return SubAgentResult(
+                engine=engine,
+                prompt=prompt,
+                command=[engine],
+                cwd=".",
+                exit_code=0,
+                stdout=json.dumps({"result": f"resumed {len(self.prompts)}"}),
+                stderr="",
+            )
+
+    stages = [
+        SubAgentStage(
+            name="scout",
+            status="succeeded",
+            prompt="old scout prompt",
+            output="old scout output",
+            exit_code=0,
+        ),
+        SubAgentStage(
+            name="bull_case",
+            status="failed",
+            prompt="old bull prompt",
+            output="",
+            exit_code=1,
+            error="rate limit",
+        ),
+    ]
+    test_db.create_subagent_run(
+        run_id="research_resume_failed",
+        agent_name="deep_research",
+        agent_kind="research",
+        engine="claude",
+        input_payload={"topic": "物业股预期差"},
+        subject="物业股预期差",
+        origin_channel="cli",
+        user_id="cli_user",
+    )
+    test_db.update_subagent_run(
+        "research_resume_failed",
+        status="failed",
+        stages_json=json.dumps([stage.__dict__ for stage in stages], ensure_ascii=False),
+        error="claude stage bull_case failed: rate limit",
+    )
+
+    runner = RecordingRunner()
+    manager = SubAgentRunManager(
+        db=test_db,
+        runner=runner,
+        artifact_dir=tmp_path,
+        agent_name="deep_research",
+    )
+
+    assert manager.resume("research_resume_failed")
+    await manager._tasks["research_resume_failed"]
+
+    job = test_db.get_subagent_run("research_resume_failed")
+    assert job.status == "succeeded"
+    saved_stages = json.loads(job.stages_json)
+    assert [stage["name"] for stage in saved_stages] == manager.definition.stages
+    assert saved_stages[0]["output"] == "old scout output"
+    assert len(runner.prompts) == 3
+    assert "阶段：bull_case" in runner.prompts[0]
+    assert "old scout output" in runner.prompts[0]
+    assert (tmp_path / "research_resume_failed.md").exists()
 
 
 def test_subagent_run_database_roundtrip(test_db):

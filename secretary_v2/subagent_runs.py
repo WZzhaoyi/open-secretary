@@ -93,6 +93,7 @@ def parse_subagent_shortcut(
     list_words: tuple[str, ...],
     cancel_words: tuple[str, ...] = ("取消", "停止", "终止", "cancel", "stop"),
     status_words: tuple[str, ...] = ("查看", "查询", "状态", "进度", "status", "progress"),
+    resume_words: tuple[str, ...] = ("继续", "恢复", "重跑", "重试", "resume", "retry", "rerun"),
 ) -> Optional[tuple[str, Optional[str]]]:
     """Parse deterministic subagent run commands before the LLM sees them.
 
@@ -105,6 +106,8 @@ def parse_subagent_shortcut(
 
     if job_id and any(word in normalized for word in cancel_words):
         return ("cancel", job_id)
+    if job_id and any(word in normalized for word in resume_words):
+        return ("resume", job_id)
     if job_id and any(word in normalized for word in status_words):
         return ("status", job_id)
     if any(word in normalized for word in list_words):
@@ -295,6 +298,31 @@ class SubAgentRunManager:
             )
         return resumed
 
+    def resume(self, job_id: str) -> bool:
+        """Resume a persisted job from its first non-succeeded stage."""
+        if job_id in self._tasks:
+            return True
+        job = self.db.get_subagent_run(job_id)
+        if not job or job.agent_name != self.definition.name:
+            return False
+        if job.status == "succeeded":
+            return False
+        self.db.update_subagent_run(
+            job_id,
+            status="pending",
+            error="resume requested; retrying from first incomplete stage",
+            artifact_path=None,
+            result=None,
+        )
+        task = asyncio.create_task(
+            self._run_job(job_id),
+            name=f"subagent:{job_id}:resumed",
+        )
+        self._tasks[job_id] = task
+        task.add_done_callback(lambda t, jid=job_id: self._tasks.pop(jid, None))
+        self.db.create_event("subagent", f"Resume requested for subagent run {job_id}")
+        return True
+
     def cancel(self, job_id: str) -> bool:
         task = self._tasks.get(job_id)
         if task and not task.done():
@@ -352,7 +380,7 @@ class SubAgentRunManager:
         if not job:
             return
 
-        stages: List[SubAgentStage] = []
+        stages = self._load_resumable_stages(job.stages_json)
         self.db.update_subagent_run(job_id, status="running")
         self.db.create_event(
             "subagent",
@@ -360,7 +388,7 @@ class SubAgentRunManager:
         )
 
         try:
-            for stage_name in self.definition.stages:
+            for stage_name in self.definition.stages[len(stages):]:
                 prompt = self._render_stage_prompt(stage_name, job.input_payload, stages)
                 await self._run_stage(job_id, stages, stage_name, prompt)
 
@@ -620,6 +648,33 @@ class SubAgentRunManager:
 
     def _stages_json(self, stages: List[SubAgentStage]) -> str:
         return json.dumps([asdict(s) for s in stages], ensure_ascii=False)
+
+    def _load_resumable_stages(self, stages_json: str) -> List[SubAgentStage]:
+        """Return the contiguous succeeded stage prefix that can be reused."""
+        try:
+            raw_stages = json.loads(stages_json or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw_stages, list):
+            return []
+
+        reusable: List[SubAgentStage] = []
+        for expected_name, raw in zip(self.definition.stages, raw_stages):
+            if not isinstance(raw, dict):
+                break
+            if raw.get("name") != expected_name or raw.get("status") != "succeeded":
+                break
+            reusable.append(
+                SubAgentStage(
+                    name=str(raw.get("name") or ""),
+                    status="succeeded",
+                    prompt=str(raw.get("prompt") or ""),
+                    output=str(raw.get("output") or ""),
+                    exit_code=raw.get("exit_code"),
+                    error=raw.get("error"),
+                )
+            )
+        return reusable
 
     def _stage_digest(self, stages: List[SubAgentStage], max_chars: int = 16000) -> str:
         chunks = []

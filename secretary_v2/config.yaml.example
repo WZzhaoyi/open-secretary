@@ -78,6 +78,7 @@ subagent:
   fallback_engine: agent
   codex:
     model: ""
+    max_concurrency: 1
     enable_search: true
     sandbox: read-only
     approval_policy: never
@@ -85,6 +86,7 @@ subagent:
   claude:
     model: sonnet
     effort: high
+    max_concurrency: 1
     allowed_tools: [WebSearch, WebFetch, Read]
     allowed_bash: []
     disallowed_tools: []

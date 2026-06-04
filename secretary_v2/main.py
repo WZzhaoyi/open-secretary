@@ -188,6 +188,13 @@ class SecretaryApp:
                         if ok
                         else f"Research job `{job_id}` cannot be cancelled or does not exist"
                     )
+                if action == "resume" and job_id:
+                    ok = self.subagent_run_manager.resume(job_id)
+                    return (
+                        f"Research job `{job_id}` resume requested"
+                        if ok
+                        else f"Research job `{job_id}` cannot be resumed or does not exist"
+                    )
                 if action == "list":
                     return self.subagent_run_manager.list_text()
 

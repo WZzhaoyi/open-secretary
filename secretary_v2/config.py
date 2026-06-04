@@ -97,12 +97,14 @@ class CodexSubagentConfig:
     sandbox: str = "read-only"
     approval_policy: str = "never"
     config_overrides: List[str] = field(default_factory=list)
+    max_concurrency: int = 1
 
 
 @dataclass
 class ClaudeSubagentConfig:
     model: str = "sonnet"
     effort: str = "high"
+    max_concurrency: int = 1
     allowed_tools: List[str] = field(
         default_factory=lambda: ["WebSearch", "WebFetch", "Read"]
     )
@@ -381,7 +383,7 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 9. **web_search** - 搜索互联网（不知道去哪里找信息时用）
 10. **send_message** - 主动发消息给用户（通知、提醒）
 11. **schedule_task** - 管理定时任务
-12. **start_research / get_research_status / cancel_research** - 启动、查询、取消后台深度研究
+12. **start_research / get_research_status / cancel_research / resume_research** - 启动、查询、取消、续跑后台深度研究
 
 ### 工具选择
 - 看到「可用技能索引」里有相关技能 → 先用 load_skill(name) 读取完整说明
@@ -389,6 +391,7 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 - 不知道去哪里找信息 → web_search
 - 交易机会、行业分析、需要多轮搜索/反证/报告的主题 → start_research，后台完成后再通知用户
 - 用户询问 `research_xxx` 的状态/进度或最近研究任务 → get_research_status，绝不要因此启动新研究
+- 用户要求继续、恢复、重试或重跑已有 `research_xxx` → resume_research，绝不要启动新研究
 
 ### 定时任务
 - 定时任务触发时，prompt 会送入 agent 循环

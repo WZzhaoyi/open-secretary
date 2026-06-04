@@ -935,6 +935,19 @@ async def cancel_research(ctx: RunContext[SecretaryDeps], job_id: str) -> str:
     )
 
 
+@agent.tool
+async def resume_research(ctx: RunContext[SecretaryDeps], job_id: str) -> str:
+    """Resume a failed, cancelled, pending, or running research job from its first incomplete stage."""
+    manager = ctx.deps.subagent_run_manager
+    if manager is None:
+        return "Error: subagent run manager is not available"
+    return (
+        f"Research job `{job_id}` resume requested"
+        if manager.resume(job_id)
+        else f"Research job `{job_id}` cannot be resumed or does not exist"
+    )
+
+
 # ==================== Shell tool ====================
 
 # Shell is needed for skills like futuapi/longbridge that drive CLIs and helper

@@ -11,6 +11,7 @@ scheduler, and channels.
 import asyncio
 import fnmatch
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -24,6 +25,8 @@ from config import get_config
 from guardrails import BASE_DIR, check_shell_command_decision, truncate_output
 from llm_models import build_model
 from skills_loader import get_skills_loader
+
+logger = logging.getLogger(__name__)
 
 SubAgentEngine = Literal["codex", "claude", "agent"]
 SUPPORTED_ENGINES = ("codex", "claude", "agent")
@@ -224,6 +227,23 @@ class SubAgentRunner:
 
     def __init__(self, base_dir: Optional[Path] = None):
         self.base_dir = Path(base_dir or BASE_DIR).resolve()
+        self._engine_semaphores = {
+            engine: asyncio.Semaphore(self._engine_max_concurrency(engine))
+            for engine in EXTERNAL_CLI_ENGINES
+        }
+
+    def _engine_max_concurrency(self, engine: str) -> int:
+        cfg = get_config().subagent
+        if engine == "codex":
+            value = cfg.codex.max_concurrency
+        elif engine == "claude":
+            value = cfg.claude.max_concurrency
+        else:
+            return 1
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 1
 
     def is_available(self, engine: str) -> bool:
         if engine == "agent":
@@ -335,7 +355,29 @@ class SubAgentRunner:
 
         output_path = self._make_output_path() if engine == "codex" else None
         command = self.build_command(engine, prompt, output_last_message=output_path)
+        semaphore = self._engine_semaphores[engine]
+        if semaphore.locked():
+            logger.info("Waiting for %s subagent CLI concurrency slot", engine)
+        async with semaphore:
+            return await self._run_external_cli(
+                engine=engine,
+                prompt=prompt,
+                command=command,
+                work_dir=work_dir,
+                output_path=output_path,
+                timeout=timeout,
+            )
 
+    async def _run_external_cli(
+        self,
+        *,
+        engine: str,
+        prompt: str,
+        command: List[str],
+        work_dir: Path,
+        output_path: Optional[str],
+        timeout: int,
+    ) -> SubAgentResult:
         proc = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(work_dir),
