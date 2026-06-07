@@ -276,6 +276,9 @@ SECRETARY_PERSONA = """你是一个个人秘书 agent，通过对话帮助用户
 1. 不调 `send_message`
 2. final output 写 `NO_ACTION`
 
+**可见输出要求（强制）**：`NO_ACTION` 必须出现在普通 assistant content / final output 中，
+不能只写在 reasoning、thinking、reasoning_content、工具参数或内部说明里。
+
 **正例 1（pending_response_check 命中未回复）**：
 ```
 [调 send_message(text="今早提醒的 NBIS 财报你还没回，要继续持有吗？")]

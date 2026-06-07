@@ -1,8 +1,8 @@
 """Secretary v2 memory module - SQLAlchemy based."""
 
-import uuid
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -17,7 +17,12 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sqlalchemy.pool import StaticPool
 
 import tiktoken
-from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelResponse,
+    ThinkingPart,
+)
 
 from config import get_config
 
@@ -45,6 +50,54 @@ def _estimate_msg_tokens(msgs: List[ModelMessage]) -> int:
             elif content is not None:
                 total += len(_token_encoding.encode(str(content)))
     return total
+
+
+def _response_has_actionable_part(msg: ModelResponse) -> bool:
+    """True when a response can be replayed as assistant content/tool_calls."""
+    for part in msg.parts:
+        kind = getattr(part, "part_kind", "")
+        if kind == "text" and bool(getattr(part, "content", None)):
+            return True
+        if kind == "tool-call":
+            return True
+    return False
+
+
+def _strip_thinking_from_response(msg: ModelResponse) -> Optional[ModelResponse]:
+    """Remove thinking parts and drop responses that would be invalid history."""
+    parts = [part for part in msg.parts if not isinstance(part, ThinkingPart)]
+    if not parts:
+        return None
+    cleaned = msg if len(parts) == len(msg.parts) else replace(msg, parts=parts)
+    if not _response_has_actionable_part(cleaned):
+        return None
+    return cleaned
+
+
+def sanitize_pydantic_messages_for_history(
+    messages: List[ModelMessage],
+) -> List[ModelMessage]:
+    """Return only model messages safe to persist and replay as history.
+
+    DeepSeek/OpenAI-compatible chat history cannot contain an assistant message
+    that has reasoning/thinking but no visible content or tool_calls. We also
+    avoid persisting thinking parts in otherwise valid responses so historical
+    replay stays provider-portable and cannot regress into content=None turns.
+    """
+    sanitized: List[ModelMessage] = []
+    for msg in messages:
+        if isinstance(msg, ModelResponse):
+            cleaned = _strip_thinking_from_response(msg)
+            if cleaned is None:
+                logger.warning(
+                    "Skipping non-actionable model response with parts=%s",
+                    [getattr(part, "part_kind", type(part).__name__) for part in msg.parts],
+                )
+                continue
+            sanitized.append(cleaned)
+        else:
+            sanitized.append(msg)
+    return sanitized
 
 
 class Event(Base):
@@ -265,6 +318,7 @@ class Database:
         can reconstruct the conversation. The pydantic_ai_msg BLOB column holds
         the canonical serialized form; content holds a short text preview for humans.
         """
+        messages = sanitize_pydantic_messages_for_history(messages)
         if not messages:
             return
         with self.get_session() as session:
@@ -324,6 +378,13 @@ class Database:
                     except Exception as e:
                         logger.warning(f"Failed to deserialize message id={row.id}: {e}")
                         continue
+                    msgs = sanitize_pydantic_messages_for_history(msgs)
+                    if not msgs:
+                        logger.warning(
+                            "Skipping non-actionable serialized message id=%s",
+                            row.id,
+                        )
+                        continue
                     cost = _estimate_msg_tokens(msgs)
                     if selected and total + cost > token_budget:
                         should_stop = True
@@ -340,6 +401,44 @@ class Database:
         for msgs in selected:
             result.extend(msgs)
         return result
+
+    def archive_invalid_pydantic_messages(self) -> int:
+        """Sanitize active history blobs and archive rows that cannot be replayed.
+
+        Rows that become empty after sanitization have their BLOB nulled so
+        load_pydantic_messages skips them while the human-readable audit preview
+        remains in `content`. Rows that only needed thinking parts removed are
+        rewritten with the sanitized blob.
+        """
+        changed = 0
+        with self.get_session() as session:
+            rows = (
+                session.query(Message)
+                .filter(Message.pydantic_ai_msg.isnot(None))
+                .order_by(Message.id.asc())
+                .all()
+            )
+            for row in rows:
+                try:
+                    msgs = ModelMessagesTypeAdapter.validate_json(row.pydantic_ai_msg)
+                except Exception as e:
+                    logger.warning(f"Archiving unreadable message id={row.id}: {e}")
+                    row.pydantic_ai_msg = None
+                    changed += 1
+                    continue
+
+                sanitized = sanitize_pydantic_messages_for_history(msgs)
+                if not sanitized:
+                    row.pydantic_ai_msg = None
+                    changed += 1
+                    continue
+
+                new_blob = bytes(ModelMessagesTypeAdapter.dump_json(sanitized))
+                if new_blob != row.pydantic_ai_msg:
+                    row.pydantic_ai_msg = new_blob
+                    changed += 1
+            session.commit()
+        return changed
 
     def archive_pydantic_messages_before(self, keep_ids: List[int]) -> int:
         """Mark older pydantic_ai_msg rows as archived so they aren't reloaded.

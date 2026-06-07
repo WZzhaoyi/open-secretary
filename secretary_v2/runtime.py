@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessage, ModelResponse, ThinkingPart
 
 from compaction import build_summarization_processor, maybe_auto_persist_compact
 from config import get_config, SECRETARY_PERSONA, DB_SCHEMA_HINT
@@ -32,7 +33,7 @@ from guardrails import (
     truncate_output,
 )
 from llm_models import build_model
-from memory import Database
+from memory import Database, sanitize_pydantic_messages_for_history
 
 logger = logging.getLogger(__name__)
 
@@ -1148,6 +1149,27 @@ def _is_transient_llm_error(exc: BaseException) -> bool:
     return any(s in msg for s in ("connection error", "timeout", "temporar", "503", "502", "504"))
 
 
+def _last_thinking_only_response_text(messages: Optional[List[ModelMessage]]) -> Optional[str]:
+    """Return thinking text when the latest model response has no actionable output."""
+    if not messages:
+        return None
+    for msg in reversed(messages):
+        if not isinstance(msg, ModelResponse):
+            continue
+        if msg.parts and all(isinstance(part, ThinkingPart) for part in msg.parts):
+            return "\n".join(part.content for part in msg.parts if part.content)
+        return None
+    return None
+
+
+def _result_new_messages(result: Any) -> Optional[List[ModelMessage]]:
+    try:
+        return list(result.new_messages())
+    except Exception as e:
+        logger.error(f"[run_agent] failed to read new messages: {e}")
+        return None
+
+
 async def run_agent(
     user_text: str,
     db: Database,
@@ -1203,45 +1225,98 @@ async def run_agent(
     history = db.load_pydantic_messages()
     logger.debug(f"[run_agent] loaded {len(history)} prior messages from DB")
 
-    last_exc: Optional[BaseException] = None
-    for attempt in range(1, _LLM_MAX_ATTEMPTS + 1):
-        try:
-            result = await agent.run(
-                user_text,
-                deps=deps,
-                message_history=history,
-            )
-            break
-        except Exception as e:
-            last_exc = e
-            if attempt >= _LLM_MAX_ATTEMPTS or not _is_transient_llm_error(e):
-                logger.error(
-                    f"Agent run failed (attempt {attempt}/{_LLM_MAX_ATTEMPTS}, "
-                    f"transient={_is_transient_llm_error(e)}): {e}"
+    async def _call_model(
+        prompt: str,
+        message_history: List[ModelMessage],
+    ) -> Any:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, _LLM_MAX_ATTEMPTS + 1):
+            try:
+                return await agent.run(
+                    prompt,
+                    deps=deps,
+                    message_history=message_history,
                 )
-                _record_agent_event(
-                    db,
-                    "run_failed",
-                    origin=origin_channel,
-                    run_id=run_id,
-                    subject=type(e).__name__,
-                    payload={
-                        "attempt": attempt,
-                        "max_attempts": _LLM_MAX_ATTEMPTS,
-                        "transient": _is_transient_llm_error(e),
-                        "error": str(e),
-                    },
+            except Exception as e:
+                last_exc = e
+                if attempt >= _LLM_MAX_ATTEMPTS or not _is_transient_llm_error(e):
+                    logger.error(
+                        f"Agent run failed (attempt {attempt}/{_LLM_MAX_ATTEMPTS}, "
+                        f"transient={_is_transient_llm_error(e)}): {e}"
+                    )
+                    _record_agent_event(
+                        db,
+                        "run_failed",
+                        origin=origin_channel,
+                        run_id=run_id,
+                        subject=type(e).__name__,
+                        payload={
+                            "attempt": attempt,
+                            "max_attempts": _LLM_MAX_ATTEMPTS,
+                            "transient": _is_transient_llm_error(e),
+                            "error": str(e),
+                        },
+                    )
+                    raise
+                backoff = _LLM_BACKOFF_BASE_SEC * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Agent run transient failure (attempt {attempt}/{_LLM_MAX_ATTEMPTS}): "
+                    f"{type(e).__name__}: {e}; retrying in {backoff}s"
                 )
-                raise
-            backoff = _LLM_BACKOFF_BASE_SEC * (2 ** (attempt - 1))
-            logger.warning(
-                f"Agent run transient failure (attempt {attempt}/{_LLM_MAX_ATTEMPTS}): "
-                f"{type(e).__name__}: {e}; retrying in {backoff}s"
-            )
-            await asyncio.sleep(backoff)
-    else:
-        # Unreachable due to break/raise above, but keeps type checker happy.
+                await asyncio.sleep(backoff)
+        # Unreachable due to return/raise above, but keeps type checker happy.
         raise last_exc  # type: ignore[misc]
+
+    result = await _call_model(user_text, history)
+    new_msgs = _result_new_messages(result)
+    persist_msgs = new_msgs
+    response_override: Optional[str] = None
+
+    thinking_only_text = _last_thinking_only_response_text(new_msgs)
+    if thinking_only_text:
+        if "NO_ACTION" in thinking_only_text.strip().upper():
+            response_override = "NO_ACTION"
+            persist_msgs = []
+        else:
+            logger.warning(
+                "[run_agent] model returned only thinking; requesting visible text"
+            )
+            retry_history = [
+                *history,
+                *sanitize_pydantic_messages_for_history(new_msgs or []),
+            ]
+            retry_prompt = (
+                "Your previous turn produced only reasoning_content/thinking, "
+                "which is not a valid final assistant message. Return one visible "
+                "assistant message in normal content now. Do not put the answer "
+                "only in reasoning/thinking. Do not repeat side-effecting tools "
+                "unless strictly necessary."
+            )
+            result = await _call_model(retry_prompt, retry_history)
+            retry_msgs = _result_new_messages(result)
+            retry_thinking_only = _last_thinking_only_response_text(retry_msgs)
+            if retry_thinking_only:
+                if "NO_ACTION" in retry_thinking_only.strip().upper():
+                    response_override = "NO_ACTION"
+                    persist_msgs = []
+                else:
+                    error = RuntimeError(
+                        "Model returned only reasoning/thinking after visible-output retry"
+                    )
+                    _record_agent_event(
+                        db,
+                        "run_failed",
+                        origin=origin_channel,
+                        run_id=run_id,
+                        subject=type(error).__name__,
+                        payload={"error": str(error), "thinking_only": True},
+                    )
+                    raise error
+            else:
+                persist_msgs = [
+                    *sanitize_pydantic_messages_for_history(new_msgs or []),
+                    *(retry_msgs or []),
+                ]
 
     usage_payload: Dict[str, Any] = {}
     try:
@@ -1263,7 +1338,7 @@ async def run_agent(
     except Exception as e:
         logger.debug(f"[run_agent] usage unavailable: {e}")
 
-    response = str(result.output)
+    response = response_override or str(result.output)
     _record_agent_event(
         db,
         "run_finished",
@@ -1304,9 +1379,9 @@ async def run_agent(
         return response
 
     try:
-        new_msgs = result.new_messages()
-        db.save_pydantic_messages(new_msgs)
-        logger.debug(f"[run_agent] persisted {len(new_msgs)} new messages")
+        if persist_msgs:
+            db.save_pydantic_messages(persist_msgs)
+            logger.debug(f"[run_agent] persisted {len(persist_msgs)} new messages")
     except Exception as e:
         logger.error(f"[run_agent] failed to persist messages: {e}")
 

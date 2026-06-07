@@ -14,10 +14,12 @@ import pytest
 
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     SystemPromptPart,
     TextPart,
+    ThinkingPart,
     ToolReturnPart,
     UserPromptPart,
 )
@@ -65,6 +67,27 @@ class FakeRunResult:
         if self._usage_error:
             raise self._usage_error
         return FakeUsage()
+
+
+class FakeThinkingOnlyRunResult(FakeRunResult):
+    def __init__(self, user_text: str, thinking: str, output: str = "stale output"):
+        super().__init__(user_text, output)
+        self._thinking = thinking
+
+    def new_messages(self):
+        return [
+            ModelRequest(parts=[UserPromptPart(content=self._user_text)]),
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content=self._thinking,
+                        id="reasoning_content",
+                        provider_name="deepseek",
+                    )
+                ],
+                provider_name="deepseek",
+            ),
+        ]
 
 
 def _config_for_model(provider: str, model: str, api_key: str = "test-key") -> Config:
@@ -259,6 +282,147 @@ async def test_no_action_skips_persistence(fresh_db, monkeypatch):
     assert after == before, "NO_ACTION must not pollute the persisted conversation"
     event_types = {event.type for event in fresh_db.get_agent_events()}
     assert {"run_started", "run_finished", "scheduled_no_action"} <= event_types
+
+
+def test_save_pydantic_messages_skips_thinking_only_response(fresh_db):
+    """Thinking-only assistant responses must never be persisted as history."""
+    fresh_db.save_pydantic_messages(
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content="Final output: NO_ACTION",
+                        id="reasoning_content",
+                        provider_name="deepseek",
+                    )
+                ],
+                provider_name="deepseek",
+            )
+        ]
+    )
+
+    assert fresh_db.load_pydantic_messages() == []
+    assert fresh_db.get_messages(limit=10) == []
+
+
+def test_save_pydantic_messages_strips_thinking_from_valid_response(fresh_db):
+    """Visible text/tool-call history is kept, but reasoning content is dropped."""
+    fresh_db.save_pydantic_messages(
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content="internal reasoning",
+                        id="reasoning_content",
+                        provider_name="deepseek",
+                    ),
+                    TextPart(content="visible"),
+                ],
+                provider_name="deepseek",
+            )
+        ]
+    )
+
+    loaded = fresh_db.load_pydantic_messages()
+    assert len(loaded) == 1
+    assert [part.part_kind for part in loaded[0].parts] == ["text"]
+    assert loaded[0].parts[0].content == "visible"
+
+
+def test_load_pydantic_messages_skips_legacy_thinking_only_blob(fresh_db):
+    """Legacy bad blobs should not be replayed into future model requests."""
+    bad = ModelResponse(
+        parts=[
+            ThinkingPart(
+                content="Done. Final output: NO_ACTION.",
+                id="reasoning_content",
+                provider_name="deepseek",
+            )
+        ],
+        provider_name="deepseek",
+    )
+    blob = bytes(ModelMessagesTypeAdapter.dump_json([bad]))
+    fresh_db.save_message(
+        "response",
+        "Done. Final output: NO_ACTION.",
+        pydantic_ai_msg=blob,
+    )
+
+    assert fresh_db.load_pydantic_messages() == []
+
+
+def test_archive_invalid_pydantic_messages_nulls_bad_blob(fresh_db):
+    """The DB maintenance path archives invalid active history blobs."""
+    bad = ModelResponse(
+        parts=[
+            ThinkingPart(
+                content="Done. Final output: NO_ACTION.",
+                id="reasoning_content",
+                provider_name="deepseek",
+            )
+        ],
+        provider_name="deepseek",
+    )
+    blob = bytes(ModelMessagesTypeAdapter.dump_json([bad]))
+    row = fresh_db.save_message(
+        "response",
+        "Done. Final output: NO_ACTION.",
+        pydantic_ai_msg=blob,
+    )
+
+    assert fresh_db.archive_invalid_pydantic_messages() == 1
+    stored = fresh_db.get_messages(limit=1)[0]
+    assert stored.id == row.id
+    assert stored.content == "Done. Final output: NO_ACTION."
+    assert stored.pydantic_ai_msg is None
+
+
+@pytest.mark.asyncio
+async def test_run_agent_treats_thinking_only_no_action_as_no_action(fresh_db, monkeypatch):
+    """A NO_ACTION hidden in reasoning must not be replaced by recovered stale text."""
+    async def fake_run(user_text, *args, **kwargs):
+        return FakeThinkingOnlyRunResult(
+            user_text,
+            "Done. Final output: NO_ACTION.",
+            output="已记录。周末持仓不变。",
+        )
+
+    monkeypatch.setattr(runtime.agent, "run", fake_run)
+
+    reply = await run_agent("scheduled trigger", db=fresh_db, origin_channel="scheduled")
+
+    assert reply == "NO_ACTION"
+    assert fresh_db.load_pydantic_messages() == []
+    event_types = {event.type for event in fresh_db.get_agent_events()}
+    assert "scheduled_no_action" in event_types
+
+
+@pytest.mark.asyncio
+async def test_run_agent_retries_non_no_action_thinking_only_response(fresh_db, monkeypatch):
+    """Non-NO_ACTION thinking-only output gets one visible-content retry."""
+    calls = {"n": 0}
+
+    async def fake_run(user_text, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeThinkingOnlyRunResult(
+                user_text,
+                "Work completed, but this is only reasoning.",
+                output="stale recovered text",
+            )
+        return FakeRunResult(user_text, "visible result")
+
+    monkeypatch.setattr(runtime.agent, "run", fake_run)
+
+    reply = await run_agent("do work", db=fresh_db)
+
+    assert calls["n"] == 2
+    assert reply == "visible result"
+    loaded = fresh_db.load_pydantic_messages()
+    assert loaded
+    for msg in loaded:
+        if isinstance(msg, ModelResponse):
+            assert all(part.part_kind != "thinking" for part in msg.parts)
 
 
 # ---- Fix #2: shell tool ----

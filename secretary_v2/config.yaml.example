@@ -199,7 +199,7 @@ schedules:
       8. For old events whose long-term value has been promoted into memory.md, use db_execute to set status='promoted', for example: UPDATE events SET status='promoted' WHERE id IN (...)
       9. Do not change status='open' events that still need a user response or active attention.
       10. Finally, use db_execute to clean old activity-log rows: DELETE FROM events WHERE created_at < datetime('now','-30 days') AND status IN ('logged','resolved','promoted')
-      11. This is silent maintenance: do not call send_message. Whether or not memory.md or events changed, the final output must be exactly NO_ACTION. Do not write a maintenance report, summary, table, or natural-language explanation.
+      11. This is silent maintenance: do not call send_message. Whether or not memory.md or events changed, the final visible assistant message must be exactly: NO_ACTION. Do not put NO_ACTION only in reasoning/thinking/reasoning_content. Do not write a maintenance report, summary, table, or natural-language explanation.
     protected: true
   system_review:
     cron: 30 17 * * 0
