@@ -76,6 +76,9 @@ subagent:
   # Used only when neither local Claude nor local Codex CLI is available.
   # Set to "" or disable subagent.agent.enabled to fail fast instead.
   fallback_engine: agent
+  # Max background subagent runs allowed to start concurrently (across all
+  # kinds). Enforced when the agent starts/resumes a run; default 1.
+  max_concurrent: 1
   codex:
     model: ""
     max_concurrency: 1

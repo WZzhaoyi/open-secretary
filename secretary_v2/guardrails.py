@@ -133,7 +133,7 @@ def _path_alternative(normalized: str, for_write: bool) -> Optional[str]:
     if normalized == "memory.md":
         return "memory_read"
     if normalized.startswith(("research/", "subagent_runs/")) and for_write:
-        return "start_research / subagent artifact manager"
+        return "start_subagent / subagent artifact manager"
     if normalized == "config.yaml":
         return "ask the user for the specific setting; config.yaml is not readable by agent tools"
     if normalized == "secretary_v2.db":

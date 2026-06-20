@@ -117,7 +117,7 @@ class SecretaryDeps:
     )
     channels: Dict[str, Any] = field(default_factory=dict)
     scheduler: Optional[Any] = None  # main.Scheduler — typed Any to avoid circular import
-    subagent_run_manager: Optional[Any] = None
+    subagent_registry: Optional[Any] = None  # subagent_runs.SubAgentRegistry
 
 
 # Module-level agent. history_processors is wired here so every run benefits
@@ -301,6 +301,28 @@ async def dynamic_context(ctx: RunContext[SecretaryDeps]) -> str:
             stable_parts.append("## 自动加载技能\n" + "\n\n".join(auto_skill_parts))
     except Exception as e:
         logger.warning(f"Failed to build skill index: {e}")
+
+    registry = getattr(deps, "subagent_registry", None)
+    if registry is not None:
+        try:
+            catalog = registry.agent_catalog()
+        except Exception as e:
+            logger.warning(f"Failed to build subagent catalog: {e}")
+            catalog = []
+        if catalog:
+            catalog_lines = []
+            for agent_def in catalog:
+                req = ", ".join(agent_def["required_inputs"]) or "无"
+                catalog_lines.append(
+                    f"- `{agent_def['name']}` (kind: {agent_def['kind']}) — "
+                    f"{agent_def['description']} | 必填输入: {req}"
+                )
+            stable_parts.append(
+                "## 可用后台子任务 (subagents)\n"
+                "用 `start_subagent(agent_name, inputs)` 启动后台任务；inputs 必须包含对应的必填输入。"
+                "查询/取消/续跑用 `get_subagent_status` / `cancel_subagent` / `resume_subagent`，按 run id 操作。\n"
+                + "\n".join(catalog_lines)
+            )
 
     if deps.skill_content:
         runtime_parts.append(f"## 已加载技能\n{deps.skill_content}")
@@ -865,30 +887,42 @@ async def schedule_task(
     return f"Error: unknown action '{action}'. Valid actions: list, create, update, delete"
 
 
-# ==================== Research tools ====================
+# ==================== Subagent tools ====================
 
 
 @agent.tool
-async def start_research(
+async def start_subagent(
     ctx: RunContext[SecretaryDeps],
-    topic: str,
+    agent_name: str,
+    inputs: Dict[str, str],
     engine: Optional[str] = None,
 ) -> str:
-    """Start a non-blocking deep research job using local codex or claude.
+    """Start a non-blocking background subagent run using local codex or claude.
 
-    Use this for trading opportunities, industry analysis, or broad questions
-    that need multi-step web research outside the main conversation loop.
-    `engine` may be "codex" or "claude"; omit it to use the best available CLI.
-    Only call this when the user is asking to start a new research job. Never
-    call it for status/progress/cancel/list requests about an existing job id.
+    `agent_name` selects the workflow — see "可用后台子任务 (subagents)" in
+    context for available agents and each one's required `inputs` keys (e.g.
+    deep_research needs {"topic": "..."}). `engine` may be "codex" or "claude";
+    omit it to use the best available CLI. The run executes in the background
+    and the user is notified on completion.
+
+    Only call this to START a new run. Never call it for status/progress/cancel/
+    resume/list requests about an existing run id — use the other subagent tools.
     """
-    manager = ctx.deps.subagent_run_manager
-    if manager is None:
-        return "Error: subagent run manager is not available"
+    registry = ctx.deps.subagent_registry
+    if registry is None:
+        return "Error: subagent registry is not available"
+    payload = {str(k): str(v) for k, v in (inputs or {}).items()}
+    payload.setdefault("language", get_config().language)
+    subject = (
+        payload.get("subject")
+        or payload.get("topic")
+        or next((v for k, v in payload.items() if k != "language"), "")
+    )
     try:
-        job_id = manager.start(
-            input_payload={"topic": topic, "language": get_config().language},
-            subject=topic,
+        job_id = registry.start(
+            agent_name,
+            input_payload=payload,
+            subject=subject,
             engine=engine,
             origin_channel=ctx.deps.origin_channel,
             user_id=(
@@ -897,57 +931,59 @@ async def start_research(
                 else (ctx.deps.conversation_id or ctx.deps.user_id)
             ),
         )
-        chosen = ctx.deps.db.get_subagent_run(job_id)
-        engine_text = chosen.engine if chosen else (engine or "auto")
-        stages = getattr(getattr(manager, "definition", None), "stages", [])
-        stage_text = "/".join(stages) if stages else "multiple stages"
-        return (
-            f"Started research job `{job_id}` with engine `{engine_text}`.\n"
-            f"It will run in the background through {stage_text}; "
-            "I will notify you when it finishes."
-        )
+    except (ValueError, RuntimeError) as e:
+        return f"Error starting subagent: {e}"
     except Exception as e:
-        return f"Error starting research: {type(e).__name__}: {e}"
-
-
-@agent.tool
-async def get_research_status(ctx: RunContext[SecretaryDeps], job_id: Optional[str] = None) -> str:
-    """Get one research job status, or list recent jobs when job_id is omitted.
-
-    Use this for questions like "check research_xxx status" or "list recent research jobs".
-    Do not start a new job unless the user explicitly asks for a new research.
-    """
-    manager = ctx.deps.subagent_run_manager
-    if manager is None:
-        return "Error: subagent run manager is not available"
-    if job_id:
-        return manager.status_text(job_id)
-    return manager.list_text()
-
-
-@agent.tool
-async def cancel_research(ctx: RunContext[SecretaryDeps], job_id: str) -> str:
-    """Cancel a running background research job."""
-    manager = ctx.deps.subagent_run_manager
-    if manager is None:
-        return "Error: subagent run manager is not available"
+        return f"Error starting subagent: {type(e).__name__}: {e}"
+    run = ctx.deps.db.get_subagent_run(job_id)
+    engine_text = run.engine if run else (engine or "auto")
     return (
-        f"Research job `{job_id}` cancellation requested"
-        if manager.cancel(job_id)
-        else f"Research job `{job_id}` cannot be cancelled or does not exist"
+        f"Started subagent `{agent_name}` run `{job_id}` with engine `{engine_text}`. "
+        "It will run in the background; I will notify you when it finishes."
     )
 
 
 @agent.tool
-async def resume_research(ctx: RunContext[SecretaryDeps], job_id: str) -> str:
-    """Resume a failed, cancelled, pending, or running research job from its first incomplete stage."""
-    manager = ctx.deps.subagent_run_manager
-    if manager is None:
-        return "Error: subagent run manager is not available"
+async def get_subagent_status(
+    ctx: RunContext[SecretaryDeps], job_id: Optional[str] = None
+) -> str:
+    """Get one subagent run status, or list recent runs when job_id is omitted.
+
+    Use this for questions like "check run_xxx status" or "list recent background
+    tasks". Works across all subagent kinds. Do not start a new run unless the
+    user explicitly asks for one.
+    """
+    registry = ctx.deps.subagent_registry
+    if registry is None:
+        return "Error: subagent registry is not available"
+    if job_id:
+        return registry.status_text(job_id)
+    return registry.list_text()
+
+
+@agent.tool
+async def cancel_subagent(ctx: RunContext[SecretaryDeps], job_id: str) -> str:
+    """Cancel a running background subagent run by id (any kind)."""
+    registry = ctx.deps.subagent_registry
+    if registry is None:
+        return "Error: subagent registry is not available"
     return (
-        f"Research job `{job_id}` resume requested"
-        if manager.resume(job_id)
-        else f"Research job `{job_id}` cannot be resumed or does not exist"
+        f"Subagent run `{job_id}` cancellation requested"
+        if registry.cancel(job_id)
+        else f"Subagent run `{job_id}` cannot be cancelled or does not exist"
+    )
+
+
+@agent.tool
+async def resume_subagent(ctx: RunContext[SecretaryDeps], job_id: str) -> str:
+    """Resume a failed/cancelled/pending subagent run from its first incomplete stage (any kind)."""
+    registry = ctx.deps.subagent_registry
+    if registry is None:
+        return "Error: subagent registry is not available"
+    return (
+        f"Subagent run `{job_id}` resume requested"
+        if registry.resume(job_id)
+        else f"Subagent run `{job_id}` cannot be resumed or does not exist"
     )
 
 
@@ -1181,7 +1217,7 @@ async def run_agent(
     skill_content: str = "",
     channels: Optional[Dict[str, Any]] = None,
     scheduler: Optional[Any] = None,
-    subagent_run_manager: Optional[Any] = None,
+    subagent_registry: Optional[Any] = None,
 ) -> str:
     """Run the agent, threading prior conversation in via message_history.
 
@@ -1204,7 +1240,7 @@ async def run_agent(
         current_time=datetime.now(_local_tz()).isoformat(),
         channels=channels or {},
         scheduler=scheduler,
-        subagent_run_manager=subagent_run_manager,
+        subagent_registry=subagent_registry,
     )
     _record_agent_event(
         db,

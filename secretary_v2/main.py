@@ -3,7 +3,6 @@
 import argparse
 import asyncio
 import logging
-import re
 import sys
 from pathlib import Path
 from typing import Dict, Any
@@ -19,7 +18,12 @@ from channels.http_channel import HTTPChannel
 from logging_utils import install_secret_redaction_filter
 from skills_loader import get_skills_loader
 from scheduler import Scheduler
-from subagent_runs import SubAgentRunManager, parse_subagent_shortcut
+from subagent_runs import (
+    SubAgentRegistry,
+    parse_subagent_shortcut,
+    SUBAGENT_ID_RE,
+    SUBAGENT_LIST_WORDS,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -34,8 +38,6 @@ install_secret_redaction_filter()
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-RESEARCH_ID_RE = re.compile(r"\bresearch_[0-9a-fA-F]{6,32}\b")
-RESEARCH_LIST_WORDS = ("最近研究任务", "研究任务列表", "列出研究任务", "list research")
 CHAT_CHANNELS = {"telegram", "feishu"}
 # Where manage.sh redirects stdout/stderr (see manage.sh LOG_FILE). Surfaced in
 # failure alerts so the user lands on the right file, not a stale /tmp guess.
@@ -69,10 +71,10 @@ class SecretaryApp:
             db=self.db,
             task_handler=self._handle_scheduled_message,
         )
-        self.subagent_run_manager = SubAgentRunManager(
+        self.subagent_registry = SubAgentRegistry(
             db=self.db,
-            notifier=self._send_research_notification,
-            agent_name="deep_research",
+            notifier=self._send_subagent_notification,
+            max_concurrent=self.config.subagent.max_concurrent,
         )
 
         self._init_channels()
@@ -199,31 +201,31 @@ class SecretaryApp:
         """Handle incoming user message."""
         try:
             self._remember_chat_channel(message.channel)
-            research_shortcut = parse_subagent_shortcut(
+            subagent_shortcut = parse_subagent_shortcut(
                 message.text,
-                id_pattern=RESEARCH_ID_RE,
-                list_words=RESEARCH_LIST_WORDS,
+                id_pattern=SUBAGENT_ID_RE,
+                list_words=SUBAGENT_LIST_WORDS,
             )
-            if research_shortcut:
-                action, job_id = research_shortcut
+            if subagent_shortcut:
+                action, job_id = subagent_shortcut
                 if action == "status" and job_id:
-                    return self.subagent_run_manager.status_text(job_id)
+                    return self.subagent_registry.status_text(job_id)
                 if action == "cancel" and job_id:
-                    ok = self.subagent_run_manager.cancel(job_id)
+                    ok = self.subagent_registry.cancel(job_id)
                     return (
-                        f"Research job `{job_id}` cancellation requested"
+                        f"Subagent run `{job_id}` cancellation requested"
                         if ok
-                        else f"Research job `{job_id}` cannot be cancelled or does not exist"
+                        else f"Subagent run `{job_id}` cannot be cancelled or does not exist"
                     )
                 if action == "resume" and job_id:
-                    ok = self.subagent_run_manager.resume(job_id)
+                    ok = self.subagent_registry.resume(job_id)
                     return (
-                        f"Research job `{job_id}` resume requested"
+                        f"Subagent run `{job_id}` resume requested"
                         if ok
-                        else f"Research job `{job_id}` cannot be resumed or does not exist"
+                        else f"Subagent run `{job_id}` cannot be resumed or does not exist"
                     )
                 if action == "list":
-                    return self.subagent_run_manager.list_text()
+                    return self.subagent_registry.list_text()
 
             skill_content = self._collect_skill_content(message.text)
 
@@ -238,7 +240,7 @@ class SecretaryApp:
                 skill_content=skill_content,
                 channels=self.channels,
                 scheduler=self.scheduler,
-                subagent_run_manager=self.subagent_run_manager,
+                subagent_registry=self.subagent_registry,
             )
             return response
 
@@ -277,7 +279,7 @@ class SecretaryApp:
                 skill_content=self._collect_skill_content(message.text),
                 channels=self.channels,
                 scheduler=self.scheduler,
-                subagent_run_manager=self.subagent_run_manager,
+                subagent_registry=self.subagent_registry,
             )
         except Exception as e:
             task_id = message.metadata.get("task_id", "?") if message.metadata else "?"
@@ -311,21 +313,21 @@ class SecretaryApp:
         except Exception as e2:
             logger.error(f"Failed to deliver failure alert for {task_id}: {e2}")
 
-    async def _send_research_notification(
+    async def _send_subagent_notification(
         self,
         origin_channel: str,
         text: str,
         user_id: str = None,
         artifact_path: str = None,
     ) -> None:
-        """Deliver research completion/failure notifications outside agent.run."""
+        """Deliver subagent completion/failure notifications outside agent.run."""
         target_name = origin_channel
         if target_name in ("scheduled", "self_test") or target_name not in self.channels:
             target_name = self.config.channels.default_outgoing
         channel_obj = self.channels.get(target_name)
         if channel_obj is None:
             logger.error(
-                f"Cannot send research notification: channel '{target_name}' unavailable"
+                f"Cannot send subagent notification: channel '{target_name}' unavailable"
             )
             return
         try:
@@ -396,7 +398,7 @@ class SecretaryApp:
                     user_id="self_test",
                     channels={},
                     scheduler=None,
-                    subagent_run_manager=None,
+                    subagent_registry=None,
                 ),
                 timeout=60.0,
             )
@@ -417,11 +419,11 @@ class SecretaryApp:
             # (doubles cost/latency); the real message is its own smoke test.
             if self.single_message is None:
                 await self._startup_self_test()
-            resumed_research = self.subagent_run_manager.resume_incomplete()
-            if resumed_research:
+            resumed_runs = self.subagent_registry.resume_incomplete()
+            if resumed_runs:
                 logger.info(
-                    "Resumed incomplete research jobs: %s",
-                    ", ".join(resumed_research),
+                    "Resumed incomplete subagent runs: %s",
+                    ", ".join(resumed_runs),
                 )
 
             channels = self._channels_to_start()
@@ -460,7 +462,7 @@ class SecretaryApp:
         except KeyboardInterrupt:
             logger.info("Received interrupt signal")
         finally:
-            await self.subagent_run_manager.stop()
+            await self.subagent_registry.stop()
             await self.scheduler.stop()
             for channel in self.channels.values():
                 try:

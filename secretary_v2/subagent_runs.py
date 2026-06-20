@@ -20,6 +20,26 @@ logger = logging.getLogger(__name__)
 
 NotifyFn = Callable[..., Awaitable[None]]
 
+# All new subagent runs share one prefix; the run's kind lives in the DB row
+# (agent_name/agent_kind), not in the id. This keeps id-based lifecycle ops
+# (status/cancel/resume) kind-agnostic. `research_` is matched only so jobs
+# created before prefix unification stay addressable — it is a legacy id
+# prefix, not a reference to any specific subagent type.
+DEFAULT_ID_PREFIX = "run"
+SUBAGENT_ID_RE = re.compile(r"\b(?:run|research)_[0-9a-fA-F]{6,32}\b")
+SUBAGENT_LIST_WORDS = (
+    "后台任务列表",
+    "子任务列表",
+    "列出后台任务",
+    "列出子任务",
+    "list subagents",
+    "list runs",
+    "最近研究任务",
+    "研究任务列表",
+    "列出研究任务",
+    "list research",
+)
+
 
 def _truncate_head(text: str, max_chars: int) -> str:
     text = (text or "").strip()
@@ -129,7 +149,8 @@ class SubAgentStage:
 class SubAgentDefinition:
     name: str
     kind: str
-    id_prefix: str
+    description: str
+    required_inputs: List[str]
     artifact_dir: Optional[str]
     main_stage: Optional[str]
     default_engine: Optional[str]
@@ -186,10 +207,16 @@ def load_subagent_definition(name: str, base_dir: Optional[Path] = None) -> SubA
         raise FileNotFoundError(
             f"Subagent definition missing prompt templates {missing}: {root}"
         )
+    required_inputs = [
+        str(x).strip()
+        for x in (data.get("required_inputs") or [])
+        if str(x).strip()
+    ]
     return SubAgentDefinition(
         name=str(data.get("name") or name),
         kind=str(data.get("kind") or ""),
-        id_prefix=str(data.get("id_prefix") or data.get("name") or name),
+        description=str(data.get("description") or ""),
+        required_inputs=required_inputs,
         artifact_dir=data.get("artifact_dir"),
         main_stage=data.get("main_stage"),
         default_engine=data.get("default_engine"),
@@ -198,6 +225,31 @@ def load_subagent_definition(name: str, base_dir: Optional[Path] = None) -> SubA
         prompt_templates=prompt_templates,
         root_dir=root,
     )
+
+
+def discover_definitions(
+    base_dir: Optional[Path] = None,
+) -> Dict[str, SubAgentDefinition]:
+    """Discover every subagent_defs/<name>/AGENT.md definition.
+
+    Convention-based discovery (à la OpenCode's agent directory): the directory
+    name is the identifier, no central registry list. A malformed definition is
+    skipped with a warning rather than failing all discovery.
+    """
+    root = Path(base_dir or (BASE_DIR / "subagent_defs"))
+    definitions: Dict[str, SubAgentDefinition] = {}
+    if not root.exists():
+        return definitions
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not (child / "AGENT.md").exists():
+            continue
+        try:
+            definition = load_subagent_definition(child.name, base_dir=root)
+        except Exception as e:
+            logger.warning("Skipping subagent definition %s: %s", child.name, e)
+            continue
+        definitions[definition.name] = definition
+    return definitions
 
 
 def _render_template(template: str, values: Dict[str, str]) -> str:
@@ -241,11 +293,21 @@ class SubAgentRunManager:
     ) -> str:
         if not input_payload:
             raise ValueError("input_payload is required")
+        missing = [
+            key
+            for key in self.definition.required_inputs
+            if not str(input_payload.get(key, "")).strip()
+        ]
+        if missing:
+            raise ValueError(
+                f"missing required inputs for '{self.definition.name}': "
+                f"{', '.join(missing)}"
+            )
         subject_text = (subject or self._subject_from_payload(input_payload)).strip()
         if not subject_text:
             raise ValueError("subject is required")
         chosen = self.runner.choose_engine(engine)
-        job_id = f"{self.definition.id_prefix}_{uuid.uuid4().hex[:10]}"
+        job_id = f"{DEFAULT_ID_PREFIX}_{uuid.uuid4().hex[:10]}"
         self.db.create_subagent_run(
             run_id=job_id,
             agent_name=self.definition.name,
@@ -709,3 +771,131 @@ class SubAgentRunManager:
         values.update({key: str(value) for key, value in input_payload.items()})
         values.update({stage.name: truncate_output(stage.output or "", 6000) for stage in stages})
         return _render_template(template, values)
+
+
+class SubAgentRegistry:
+    """Route subagent lifecycle across all discovered kinds.
+
+    Each kind keeps its own per-definition ``SubAgentRunManager`` (stages,
+    artifact dir, in-memory tasks). The registry only dispatches:
+
+    - ``start`` routes by ``agent_name``.
+    - everything else routes by run id: the owning manager is found via the DB
+      row's ``agent_name``. Because run ids share one prefix, id-based ops are
+      kind-agnostic — adding a new subagent type is just a new definition file.
+
+    Concurrency: ``max_concurrent`` is enforced strictly on ``start`` (the path
+    the model drives, where runaway spawning matters). ``resume`` is also
+    capped. ``resume_incomplete`` is crash recovery for already-persisted jobs;
+    it respects remaining capacity between managers but a single manager may
+    replay its own incomplete batch, so recovery can briefly exceed the live
+    cap. That trade-off keeps v1 free of a job queue.
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        notifier: Optional[NotifyFn] = None,
+        runner: Optional[SubAgentRunner] = None,
+        max_concurrent: int = 1,
+        base_dir: Optional[Path] = None,
+    ):
+        self.db = db
+        self.max_concurrent = max(int(max_concurrent), 1)
+        definitions = discover_definitions(base_dir)
+        if not definitions:
+            raise ValueError("No subagent definitions discovered under subagent_defs/")
+        shared_runner = runner or SubAgentRunner()
+        self._managers: Dict[str, SubAgentRunManager] = {
+            name: SubAgentRunManager(
+                db=db,
+                runner=shared_runner,
+                notifier=notifier,
+                definition=definition,
+            )
+            for name, definition in definitions.items()
+        }
+
+    def agent_catalog(self) -> List[Dict[str, object]]:
+        """Routing hints for the model: name, kind, description, required inputs."""
+        return [
+            {
+                "name": m.definition.name,
+                "kind": m.definition.kind,
+                "description": m.definition.description,
+                "required_inputs": list(m.definition.required_inputs),
+            }
+            for m in self._managers.values()
+        ]
+
+    def _active_count(self) -> int:
+        return sum(len(m._tasks) for m in self._managers.values())
+
+    def start(self, agent_name: str, input_payload: Dict[str, str], **kwargs) -> str:
+        manager = self._managers.get(agent_name)
+        if manager is None:
+            available = ", ".join(sorted(self._managers))
+            raise ValueError(
+                f"Unknown subagent '{agent_name}'. Available: {available}"
+            )
+        if self._active_count() >= self.max_concurrent:
+            raise RuntimeError(
+                f"Subagent concurrency limit reached ({self.max_concurrent}); "
+                "wait for a running job to finish."
+            )
+        return manager.start(input_payload=input_payload, **kwargs)
+
+    def _owner(self, job_id: str) -> Optional[SubAgentRunManager]:
+        run = self.db.get_subagent_run(job_id)
+        if not run:
+            return None
+        return self._managers.get(run.agent_name)
+
+    def status_text(self, job_id: str) -> str:
+        manager = self._owner(job_id)
+        return (
+            manager.status_text(job_id)
+            if manager
+            else f"Subagent run `{job_id}` not found"
+        )
+
+    def cancel(self, job_id: str) -> bool:
+        manager = self._owner(job_id)
+        return bool(manager and manager.cancel(job_id))
+
+    def resume(self, job_id: str) -> bool:
+        manager = self._owner(job_id)
+        if not manager:
+            return False
+        # Already-running jobs resume in place without consuming new capacity.
+        if job_id not in manager._tasks and self._active_count() >= self.max_concurrent:
+            return False
+        return manager.resume(job_id)
+
+    def list_text(self, limit: int = 10) -> str:
+        runs = self.db.list_subagent_runs(limit=limit)
+        if not runs:
+            return "No subagent runs"
+        lines = []
+        for run in runs:
+            manager = self._managers.get(run.agent_name)
+            if manager:
+                lines.append(manager._format_job(run, compact=True))
+            else:
+                lines.append(
+                    f"- `{run.id}` {run.status} {run.engine}: "
+                    f"{truncate_output(run.subject or '', 80)}"
+                )
+        return "\n".join(lines)
+
+    def resume_incomplete(self, limit: int = 20) -> List[str]:
+        resumed: List[str] = []
+        for manager in self._managers.values():
+            if self._active_count() >= self.max_concurrent:
+                break
+            resumed.extend(manager.resume_incomplete(limit=limit))
+        return resumed
+
+    async def stop(self) -> None:
+        for manager in self._managers.values():
+            await manager.stop()

@@ -1,7 +1,8 @@
 ---
 name: deep_research
 kind: research
-id_prefix: research
+description: 多阶段深度网络研究（scout/正方/反方/报告），用于交易机会、行业分析或需要多轮搜索与反证的宽泛问题
+required_inputs: [topic]
 artifact_dir: research
 main_stage: report
 default_engine: claude

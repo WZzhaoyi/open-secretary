@@ -142,6 +142,7 @@ class AgentSubagentConfig:
 class SubagentConfig:
     default_engine: str = "claude"
     fallback_engine: str = "agent"
+    max_concurrent: int = 1
     codex: CodexSubagentConfig = field(default_factory=CodexSubagentConfig)
     claude: ClaudeSubagentConfig = field(default_factory=ClaudeSubagentConfig)
     agent: AgentSubagentConfig = field(default_factory=AgentSubagentConfig)
@@ -222,6 +223,7 @@ class Config:
         subagent = SubagentConfig(
             default_engine=subagent_data.get("default_engine", "claude"),
             fallback_engine=subagent_data.get("fallback_engine", "agent"),
+            max_concurrent=int(subagent_data.get("max_concurrent", 1)),
             codex=CodexSubagentConfig(**subagent_data.get("codex", {})),
             claude=ClaudeSubagentConfig(**subagent_data.get("claude", {})),
             agent=AgentSubagentConfig(**subagent_data.get("agent", {})),
@@ -386,15 +388,15 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 9. **web_search** - 搜索互联网（不知道去哪里找信息时用）
 10. **send_message** - 主动发消息给用户（通知、提醒）
 11. **schedule_task** - 管理定时任务
-12. **start_research / get_research_status / cancel_research / resume_research** - 启动、查询、取消、续跑后台深度研究
+12. **start_subagent / get_subagent_status / cancel_subagent / resume_subagent** - 启动、查询、取消、续跑后台子任务（可用类型见「可用后台子任务」，如 deep_research 深度研究）
 
 ### 工具选择
 - 看到「可用技能索引」里有相关技能 → 先用 load_skill(name) 读取完整说明
 - 知道具体 URL/API → http_request
 - 不知道去哪里找信息 → web_search
-- 交易机会、行业分析、需要多轮搜索/反证/报告的主题 → start_research，后台完成后再通知用户
-- 用户询问 `research_xxx` 的状态/进度或最近研究任务 → get_research_status，绝不要因此启动新研究
-- 用户要求继续、恢复、重试或重跑已有 `research_xxx` → resume_research，绝不要启动新研究
+- 交易机会、行业分析、需要多轮搜索/反证/报告的主题 → start_subagent(agent_name="deep_research", inputs={"topic": ...})，后台完成后再通知用户
+- 用户询问某个 run id（如 run_xxx）的状态/进度或最近后台任务 → get_subagent_status，绝不要因此启动新任务
+- 用户要求继续、恢复、重试或重跑已有 run → resume_subagent，绝不要启动新任务
 
 ### 定时任务
 - 定时任务触发时，prompt 会送入 agent 循环

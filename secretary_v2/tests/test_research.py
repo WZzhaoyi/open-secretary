@@ -14,9 +14,12 @@ from config import (
 )
 from memory import Database
 from subagent_runs import (
+    DEFAULT_ID_PREFIX,
+    SubAgentRegistry,
     SubAgentRunManager,
     SubAgentStage,
     _completion_summary,
+    discover_definitions,
     load_subagent_definition,
     parse_subagent_shortcut,
 )
@@ -371,7 +374,8 @@ def test_deep_research_definition_loads_stage_prompts():
 
     assert definition.name == "deep_research"
     assert definition.kind == "research"
-    assert definition.id_prefix == "research"
+    assert definition.required_inputs == ["topic"]
+    assert "深度网络研究" in definition.description
     assert definition.artifact_dir == "research"
     assert definition.main_stage == "report"
     assert definition.default_engine == "claude"
@@ -730,3 +734,75 @@ def test_research_prompts_use_bull_and_bear_cases(test_db, tmp_path):
     assert "正方证据最多 5 条" in report_prompt
     assert "来源表最多 10 条" in report_prompt
     assert "事实核验与压力测试" in report_prompt
+
+
+def test_discover_definitions_finds_deep_research():
+    definitions = discover_definitions()
+    assert "deep_research" in definitions
+    assert definitions["deep_research"].required_inputs == ["topic"]
+    assert definitions["deep_research"].kind == "research"
+
+
+def test_start_validates_required_inputs(test_db, tmp_path):
+    manager = SubAgentRunManager(
+        db=test_db, runner=FakeRunner(), artifact_dir=tmp_path, agent_name="deep_research"
+    )
+    with pytest.raises(ValueError, match="missing required inputs"):
+        manager.start(input_payload={"language": "zh"}, subject="x")
+
+
+@pytest.mark.asyncio
+async def test_unified_run_id_prefix(test_db, tmp_path):
+    manager = SubAgentRunManager(
+        db=test_db, runner=FakeRunner(), artifact_dir=tmp_path, agent_name="deep_research"
+    )
+    job_id = manager.start(input_payload={"topic": "robots"}, subject="robots")
+    assert job_id.startswith(f"{DEFAULT_ID_PREFIX}_")
+    await manager._tasks[job_id]
+
+
+def _registry(test_db, tmp_path, max_concurrent=2):
+    registry = SubAgentRegistry(
+        db=test_db, runner=FakeRunner(), max_concurrent=max_concurrent
+    )
+    # Keep artifacts out of the repo tree during tests.
+    for manager in registry._managers.values():
+        manager.artifact_dir = tmp_path
+    return registry
+
+
+def test_registry_rejects_unknown_agent(test_db, tmp_path):
+    registry = _registry(test_db, tmp_path)
+    with pytest.raises(ValueError, match="Unknown subagent"):
+        registry.start("does_not_exist", {"topic": "x"})
+
+
+@pytest.mark.asyncio
+async def test_registry_enforces_max_concurrent(test_db, tmp_path):
+    registry = _registry(test_db, tmp_path, max_concurrent=1)
+    job_id = registry.start("deep_research", {"topic": "A"}, subject="A", engine="claude")
+    with pytest.raises(RuntimeError, match="concurrency limit"):
+        registry.start("deep_research", {"topic": "B"}, subject="B", engine="claude")
+    await registry._managers["deep_research"]._tasks[job_id]
+
+
+@pytest.mark.asyncio
+async def test_registry_routes_lifecycle_by_id(test_db, tmp_path):
+    registry = _registry(test_db, tmp_path, max_concurrent=2)
+    job_id = registry.start(
+        "deep_research", {"topic": "robots"}, subject="robots", engine="codex"
+    )
+    await registry._managers["deep_research"]._tasks[job_id]
+
+    assert f"`{job_id}`" in registry.status_text(job_id)
+    assert job_id in registry.list_text()
+    assert "not found" in registry.status_text("run_doesnotexist")
+
+
+def test_registry_agent_catalog_exposes_routing_hints(test_db, tmp_path):
+    registry = _registry(test_db, tmp_path)
+    catalog = registry.agent_catalog()
+    entry = next(a for a in catalog if a["name"] == "deep_research")
+    assert entry["kind"] == "research"
+    assert entry["required_inputs"] == ["topic"]
+    assert entry["description"]
