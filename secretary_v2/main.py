@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 RESEARCH_ID_RE = re.compile(r"\bresearch_[0-9a-fA-F]{6,32}\b")
 RESEARCH_LIST_WORDS = ("最近研究任务", "研究任务列表", "列出研究任务", "list research")
 CHAT_CHANNELS = {"telegram", "feishu"}
+# Where manage.sh redirects stdout/stderr (see manage.sh LOG_FILE). Surfaced in
+# failure alerts so the user lands on the right file, not a stale /tmp guess.
+LOG_PATH = Path(__file__).resolve().parent / "logs" / "secretary_v2.log"
 
 
 class SecretaryApp:
@@ -168,6 +171,30 @@ class SecretaryApp:
             return self.channels[self.channel_type]
         return self.channels.get("cli")
 
+    def _collect_skill_content(self, text: str) -> str:
+        """Resolve scenario-skill content triggered by message text.
+
+        Used for both user and scheduled runs: scheduled scenarios like
+        signal_review / review reminders depend on the same keyword-triggered
+        scenario skills (review-maintenance, trading-discipline, ...) as user
+        chat. The always-on secretary-core is auto-loaded in runtime, so
+        include_auto stays False here.
+        """
+        if not text:
+            return ""
+        triggered_skills = self.skills_loader.get_triggered_skills(
+            text,
+            include_auto=False,
+        )
+        if not triggered_skills:
+            return ""
+        skill_contents = []
+        for skill_name in triggered_skills:
+            content = self.skills_loader.get_skill_content(skill_name)
+            if content:
+                skill_contents.append(content)
+        return "\n\n".join(skill_contents)
+
     async def _handle_user_message(self, message: IncomingMessage) -> str:
         """Handle incoming user message."""
         try:
@@ -198,18 +225,7 @@ class SecretaryApp:
                 if action == "list":
                     return self.subagent_run_manager.list_text()
 
-            triggered_skills = self.skills_loader.get_triggered_skills(
-                message.text,
-                include_auto=False,
-            )
-            skill_content = ""
-            if triggered_skills:
-                skill_contents = []
-                for skill_name in triggered_skills:
-                    content = self.skills_loader.get_skill_content(skill_name)
-                    if content:
-                        skill_contents.append(content)
-                skill_content = "\n\n".join(skill_contents)
+            skill_content = self._collect_skill_content(message.text)
 
             response = await run_agent(
                 user_text=message.text,
@@ -226,9 +242,9 @@ class SecretaryApp:
             )
             return response
 
-        except Exception as e:
-            logger.error(f"Error handling message: {e}")
-            return f"Sorry, an error occurred while processing the message: {e}"
+        except Exception:
+            logger.exception("Error handling user message")
+            return "Sorry, an error occurred while processing the message. Please try again; details are in the logs."
 
     async def _handle_scheduled_message(self, message: IncomingMessage) -> str:
         """Handle scheduled task message.
@@ -258,13 +274,14 @@ class SecretaryApp:
                 db=self.db,
                 origin_channel="scheduled",
                 user_id="scheduler",
+                skill_content=self._collect_skill_content(message.text),
                 channels=self.channels,
                 scheduler=self.scheduler,
                 subagent_run_manager=self.subagent_run_manager,
             )
         except Exception as e:
             task_id = message.metadata.get("task_id", "?") if message.metadata else "?"
-            logger.error(f"Error handling scheduled message ({task_id}): {e}")
+            logger.exception(f"Error handling scheduled message ({task_id})")
             await self._send_failure_alert(task_id, e)
             return None
 
@@ -288,7 +305,7 @@ class SecretaryApp:
             await channel_obj.send(
                 f"⚠️ Scheduled task `{task_id}` failed\n"
                 f"{type(exc).__name__}: {exc}\n"
-                "See logs at /private/tmp/secretary_v2.log",
+                f"See logs at {LOG_PATH}",
                 user_id=None,
             )
         except Exception as e2:
@@ -395,7 +412,11 @@ class SecretaryApp:
         """Run the application: start scheduler + all selected channels concurrently."""
         try:
             await self.scheduler.start()
-            await self._startup_self_test()
+            # The self-test guards long-lived channels before users hit them.
+            # A one-shot `--send` run isn't worth a second synthetic agent.run()
+            # (doubles cost/latency); the real message is its own smoke test.
+            if self.single_message is None:
+                await self._startup_self_test()
             resumed_research = self.subagent_run_manager.resume_incomplete()
             if resumed_research:
                 logger.info(
@@ -428,7 +449,10 @@ class SecretaryApp:
             for t in done:
                 exc = t.exception()
                 if exc:
-                    logger.error(f"Channel task {t.get_name()} crashed: {exc}")
+                    logger.error(
+                        f"Channel task {t.get_name()} crashed: {exc}",
+                        exc_info=exc,
+                    )
             for t in pending:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
@@ -465,9 +489,12 @@ def parse_args():
         "--send",
         type=str,
         default=None,
-        help="Single message to send and exit (only meaningful with --channel cli)",
+        help="Single message to send and exit (only valid with --channel cli)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.send is not None and args.channel != "cli":
+        parser.error("--send is only valid with --channel cli")
+    return args
 
 
 def main():
