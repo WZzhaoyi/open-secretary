@@ -600,9 +600,12 @@ def test_default_schedule_prompts_follow_memory_events_design():
     assert "from items" not in stale_prompt.lower()
     assert "get_items" not in stale_prompt
     assert "status='open'" in stale_prompt
-    assert schedules["stale_check"].cron == "0 9 * * 0"
+    # NB: cron schedule times are user preferences living in the gitignored
+    # config.yaml, not part of this design contract — asserting exact values
+    # here breaks whenever a user retimes a task. This test only checks that
+    # scheduled prompts point at memory.md/events instead of the removed
+    # items table.
     assert "status='open'" in pending_prompt
-    assert schedules["memory_consolidation"].cron == "0 4 * * 0"
     assert "memory_read" in consolidation_prompt
     assert "secretary-core" in consolidation_prompt
     assert "memory.md rules" in consolidation_prompt

@@ -22,11 +22,12 @@ NotifyFn = Callable[..., Awaitable[None]]
 
 # All new subagent runs share one prefix; the run's kind lives in the DB row
 # (agent_name/agent_kind), not in the id. This keeps id-based lifecycle ops
-# (status/cancel/resume) kind-agnostic. `research_` is matched only so jobs
-# created before prefix unification stay addressable — it is a legacy id
-# prefix, not a reference to any specific subagent type.
-DEFAULT_ID_PREFIX = "run"
-SUBAGENT_ID_RE = re.compile(r"\b(?:run|research)_[0-9a-fA-F]{6,32}\b")
+# (status/cancel/resume) kind-agnostic. `sub_` is distinct from the internal
+# agent run id prefix (`run_`) so the two namespaces never overlap. `research_`
+# is matched only so jobs created before prefix unification stay addressable —
+# it is a legacy id prefix, not a reference to any specific subagent type.
+DEFAULT_ID_PREFIX = "sub"
+SUBAGENT_ID_RE = re.compile(r"\b(?:sub|research)_[0-9a-fA-F]{6,32}\b")
 SUBAGENT_LIST_WORDS = (
     "后台任务列表",
     "子任务列表",

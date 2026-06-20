@@ -796,7 +796,7 @@ async def test_registry_routes_lifecycle_by_id(test_db, tmp_path):
 
     assert f"`{job_id}`" in registry.status_text(job_id)
     assert job_id in registry.list_text()
-    assert "not found" in registry.status_text("run_doesnotexist")
+    assert "not found" in registry.status_text("sub_doesnotexist")
 
 
 def test_registry_agent_catalog_exposes_routing_hints(test_db, tmp_path):

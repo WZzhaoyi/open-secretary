@@ -395,7 +395,7 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 - 知道具体 URL/API → http_request
 - 不知道去哪里找信息 → web_search
 - 交易机会、行业分析、需要多轮搜索/反证/报告的主题 → start_subagent(agent_name="deep_research", inputs={"topic": ...})，后台完成后再通知用户
-- 用户询问某个 run id（如 run_xxx）的状态/进度或最近后台任务 → get_subagent_status，绝不要因此启动新任务
+- 用户询问某个 run id（如 sub_xxx）的状态/进度或最近后台任务 → get_subagent_status，绝不要因此启动新任务
 - 用户要求继续、恢复、重试或重跑已有 run → resume_subagent，绝不要启动新任务
 
 ### 定时任务

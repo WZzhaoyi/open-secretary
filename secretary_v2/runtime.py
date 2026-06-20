@@ -949,7 +949,7 @@ async def get_subagent_status(
 ) -> str:
     """Get one subagent run status, or list recent runs when job_id is omitted.
 
-    Use this for questions like "check run_xxx status" or "list recent background
+    Use this for questions like "check sub_xxx status" or "list recent background
     tasks". Works across all subagent kinds. Do not start a new run unless the
     user explicitly asks for one.
     """
