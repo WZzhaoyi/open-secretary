@@ -370,9 +370,58 @@ async def load_skill(ctx: RunContext[SecretaryDeps], name: str) -> str:
         if len(encoded) > max_size:
             content = encoded[:max_size].decode("utf-8", errors="replace")
             content += f"\n\n... (truncated to {max_size} bytes)"
-        return f"# Skill: {name}\n\n{content}"
+
+        parts = [f"# Skill: {name}", "", content]
+        resources = loader.get_skill_resources(name)
+        if resources:
+            # Progressive disclosure: list bundled files so the model can pull
+            # only the references it needs via load_skill_file(name, path).
+            parts.append("")
+            parts.append(
+                "Bundled resources (read on demand with "
+                f"`load_skill_file(\"{name}\", <path>)`):"
+            )
+            parts.extend(f"- {rel}" for rel in resources)
+        return "\n".join(parts)
     except Exception as e:
         return f"Error loading skill: {e}"
+
+
+@agent.tool
+async def load_skill_file(ctx: RunContext[SecretaryDeps], name: str, path: str) -> str:
+    """Read one bundled resource file of a directory skill (e.g. references/x.md).
+
+    Paths are relative to the skill's own directory and confined to it. Use the
+    "Bundled resources" list from `load_skill(name)` to see what is available.
+    """
+    try:
+        from skills_loader import get_skills_loader
+
+        loader = get_skills_loader()
+        if name not in loader.get_all_skills():
+            available = ", ".join(sorted(loader.get_all_skills()))
+            return f"Error: skill not found: {name}. Available skills: {available}"
+
+        try:
+            content = loader.get_skill_resource(name, path)
+        except ValueError as e:
+            return f"Error: {e}"
+        if content is None:
+            resources = loader.get_skill_resources(name)
+            listing = ", ".join(resources) if resources else "none"
+            return (
+                f"Error: resource not found in skill '{name}': {path}. "
+                f"Available resources: {listing}"
+            )
+
+        max_size = get_config().skills.max_size
+        encoded = content.encode("utf-8", errors="replace")
+        if len(encoded) > max_size:
+            content = encoded[:max_size].decode("utf-8", errors="replace")
+            content += f"\n\n... (truncated to {max_size} bytes)"
+        return f"# Skill: {name} / {path}\n\n{content}"
+    except Exception as e:
+        return f"Error loading skill file: {e}"
 
 
 # ==================== Database tools ====================

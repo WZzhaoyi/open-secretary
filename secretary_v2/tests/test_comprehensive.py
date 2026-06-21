@@ -132,9 +132,8 @@ class TestSkillsLoader:
         loader = SkillsLoader(skills_dirs=[project_dir, global_dir])
 
         assert set(loader.get_all_skills()) == {"review", "opencli-usage"}
-        assert loader.get_skill_content("opencli-usage") == (
-            "---\nname: opencli-usage\ndescription: 触发词：opencli\ntriggers: [opencli]\n---\nglobal opencli"
-        )
+        # get_skill_content returns the body only (frontmatter stripped).
+        assert loader.get_skill_content("opencli-usage") == "global opencli"
         assert "opencli-usage" in loader.get_triggered_skills("帮我用 opencli 查一下")
         index = loader.get_skill_index()
         assert "opencli-usage [global]" in index
@@ -214,6 +213,98 @@ class TestSkillsLoader:
         assert loader.get_triggered_skills("帮我复盘") == ["review"]
         assert loader.get_triggered_skills("任意消息", include_auto=False) == []
         assert loader.get_auto_loaded_skills() == ["always"]
+
+    def test_get_skill_content_strips_frontmatter(self, tmp_path):
+        """Body is returned without the YAML frontmatter block."""
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        (skills_dir / "core.md").write_text(
+            "---\nname: core\ndescription: d\n---\nthe body\nmore body",
+            encoding="utf-8",
+        )
+
+        loader = SkillsLoader(skills_dirs=[skills_dir])
+
+        assert loader.get_skill_content("core") == "the body\nmore body"
+
+    def test_directory_skill_keyed_by_frontmatter_name(self, tmp_path):
+        """Directory skills are named from frontmatter, not the folder name."""
+        skills_dir = tmp_path / "skills"
+        (skills_dir / "some-folder").mkdir(parents=True)
+        (skills_dir / "some-folder" / "SKILL.md").write_text(
+            "---\nname: real-name\ndescription: d\n---\nbody",
+            encoding="utf-8",
+        )
+
+        loader = SkillsLoader(skills_dirs=[skills_dir])
+
+        assert "real-name" in loader.get_all_skills()
+        assert "some-folder" not in loader.get_all_skills()
+
+    def test_nested_directory_skill_discovered(self, tmp_path):
+        """SKILL.md is found at any depth (recursive `**/SKILL.md`)."""
+        skills_dir = tmp_path / "skills"
+        nested = skills_dir / "category" / "deep-skill"
+        nested.mkdir(parents=True)
+        (nested / "SKILL.md").write_text(
+            "---\nname: deep-skill\ndescription: d\n---\nnested body",
+            encoding="utf-8",
+        )
+
+        loader = SkillsLoader(skills_dirs=[skills_dir])
+
+        assert "deep-skill" in loader.get_all_skills()
+        assert loader.get_skill_content("deep-skill") == "nested body"
+
+    def test_bundled_resources_listed_and_read(self, tmp_path):
+        """Directory skills expose bundled files for on-demand reading."""
+        skills_dir = tmp_path / "skills"
+        skill = skills_dir / "sepa"
+        (skill / "references").mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: sepa\ndescription: d\n---\nmain body",
+            encoding="utf-8",
+        )
+        (skill / "references" / "entry.md").write_text("entry rules", encoding="utf-8")
+        (skill / ".hidden").write_text("ignore me", encoding="utf-8")
+
+        loader = SkillsLoader(skills_dirs=[skills_dir])
+
+        # SKILL.md and dotfiles are excluded from the resource manifest.
+        assert loader.get_skill_resources("sepa") == ["references/entry.md"]
+        assert loader.get_skill_resource("sepa", "references/entry.md") == "entry rules"
+        # Missing resource returns None (not an error).
+        assert loader.get_skill_resource("sepa", "references/missing.md") is None
+
+    def test_resource_read_rejects_path_traversal(self, tmp_path):
+        """Resource reads are confined to the skill directory."""
+        skills_dir = tmp_path / "skills"
+        skill = skills_dir / "sepa"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: sepa\ndescription: d\n---\nbody",
+            encoding="utf-8",
+        )
+        (tmp_path / "secret.txt").write_text("top secret", encoding="utf-8")
+
+        loader = SkillsLoader(skills_dirs=[skills_dir])
+
+        with pytest.raises(ValueError):
+            loader.get_skill_resource("sepa", "../../secret.txt")
+
+    def test_file_skill_has_no_resources(self, tmp_path):
+        """Single-file skills carry no bundled resources."""
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        (skills_dir / "review.md").write_text(
+            "---\nname: review\n---\nbody",
+            encoding="utf-8",
+        )
+
+        loader = SkillsLoader(skills_dirs=[skills_dir])
+
+        assert loader.get_skill_resources("review") == []
+        assert loader.get_skill_resource("review", "anything.md") is None
 
 
 class TestScheduler:
