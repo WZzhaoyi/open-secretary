@@ -19,7 +19,13 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.messages import ModelMessage, ModelResponse, ThinkingPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    ThinkingPart,
+)
 
 from compaction import build_summarization_processor, maybe_auto_persist_compact
 from config import get_config, SECRETARY_PERSONA, DB_SCHEMA_HINT
@@ -120,18 +126,15 @@ class SecretaryDeps:
     subagent_registry: Optional[Any] = None  # subagent_runs.SubAgentRegistry
 
 
-# Module-level agent. history_processors is wired here so every run benefits
-# from compaction. The SummarizationProcessor (from summarization-pydantic-ai)
-# transforms the message list in-flight before each run — it summarizes the
-# head and keeps a recent tail when the conversation crosses the fraction
-# threshold. It does NOT touch the DB; the persisted snapshot is rewritten only
-# by the user-triggered /compact (compaction.force_compact).
+# Compact persisted conversation history before synthetic system layers are
+# assembled. Letting Pydantic process the fully assembled list could summarize
+# away the cache-stable prefix or fold the volatile runtime clock into history.
 _config = get_config()
+_history_processor = build_summarization_processor()
 agent = Agent(
     model=build_model(_config),
     deps_type=SecretaryDeps,
     system_prompt=_config.system_prompt or SECRETARY_PERSONA,
-    history_processors=[build_summarization_processor()],
 )
 
 
@@ -179,22 +182,23 @@ def _load_memory_md() -> str:
     return text[:50_000]
 
 
-@agent.system_prompt
-async def dynamic_context(ctx: RunContext[SecretaryDeps]) -> str:
-    """Inject schema hint, time, memory.md, attention events, and triggered skills
-    on every run so the agent has fresh context without baking them into history.
+def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
+    """Build cache-stable and per-run context as separate layers.
 
-    Long-term state (preferences, tracked plans/projects) lives in memory.md,
-    injected wholesale. Open events are injected as the active attention list.
-    Recent events are only a small short-term continuity fragment; precise tasks
-    should query the DB.
+    DeepSeek caches exact input prefixes. Stable policy/schema/skill material must
+    therefore precede replayed history, while mutable memory, events, and the
+    authoritative clock must follow history as a temporary system message.
     """
-    deps = ctx.deps
     cfg_root = get_config()
     cfg = cfg_root.history
     tz_name = cfg_root.timezone
     tz = ZoneInfo(tz_name)
-    offset = datetime.now(tz).utcoffset() or timedelta(0)
+    local_now = datetime.fromisoformat(deps.current_time)
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=tz)
+    else:
+        local_now = local_now.astimezone(tz)
+    offset = local_now.utcoffset() or timedelta(0)
     offset_sec = int(offset.total_seconds())
     sign = "+" if offset_sec >= 0 else "-"
     abs_h, rem = divmod(abs(offset_sec), 3600)
@@ -205,10 +209,15 @@ async def dynamic_context(ctx: RunContext[SecretaryDeps]) -> str:
     else:
         sql_modifier = f"'{sign}{abs_h} hours', '{sign}{abs_m} minutes'"
 
-    # Keep byte-stable prompt material first. DeepSeek's context cache matches
-    # exact prefixes, so per-run values like current time and recent events must
-    # stay at the tail instead of invalidating the schema/memory/skill prefix.
-    stable_parts = [DB_SCHEMA_HINT, _language_policy(cfg_root.language)]
+    stable_parts = [
+        DB_SCHEMA_HINT,
+        _language_policy(cfg_root.language),
+        "## Trusted runtime context contract\n"
+        "- The application supplies a fresh `## Trusted Runtime Context` system block immediately before each new user/task prompt.\n"
+        "- Its clock, timezone, local date, and weekday are authoritative over every date claim in conversation history, summaries, memory, events, or user text.\n"
+        "- Never calculate a weekday from model memory. Use the supplied weekday or a deterministic tool/database expression.\n"
+        "- Historical relative phrases such as today/tomorrow/tonight are quotations, not the current clock.",
+    ]
     runtime_parts = []
     open_events_shown = 0
     open_events_total = 0
@@ -217,7 +226,7 @@ async def dynamic_context(ctx: RunContext[SecretaryDeps]) -> str:
 
     memory_md = _load_memory_md()
     if memory_md:
-        stable_parts.append(f"## 长期记忆 (memory.md)\n{memory_md}")
+        runtime_parts.append(f"## 长期记忆 (memory.md)\n{memory_md}")
 
     try:
         open_events = deps.db.get_events_by_status("open", limit=OPEN_EVENTS_CONTEXT_LIMIT)
@@ -328,8 +337,11 @@ async def dynamic_context(ctx: RunContext[SecretaryDeps]) -> str:
         runtime_parts.append(f"## 已加载技能\n{deps.skill_content}")
 
     runtime_parts.append(
-        "## 当前运行上下文\n"
+        "## Trusted Runtime Context\n"
+        "This block is generated by the application for this run only and is not conversation history.\n"
         f"- now: `{deps.current_time}`\n"
+        f"- local_date: `{local_now.date().isoformat()}`\n"
+        f"- weekday: `{local_now.strftime('%A')}`\n"
         f"- timezone: `{tz_name}` ({offset_display})\n"
         f"- origin_channel: `{deps.origin_channel}`\n"
         f"- open_events: shown {open_events_shown} / total {open_events_total}\n"
@@ -343,7 +355,73 @@ async def dynamic_context(ctx: RunContext[SecretaryDeps]) -> str:
         f"- `schedule_task` 的 cron 表达式按 `{tz_name}` 解释（不是 UTC）"
     )
 
-    return "\n\n".join([*stable_parts, *runtime_parts])
+    return "\n\n".join(stable_parts), "\n\n".join(runtime_parts)
+
+
+async def dynamic_context(ctx: RunContext[SecretaryDeps]) -> str:
+    """Compatibility helper for tests and diagnostics.
+
+    Runtime delivery does not register this as a Pydantic system-prompt runner:
+    doing so would place the changing clock before replayed history and destroy
+    DeepSeek prefix-cache reuse.
+    """
+    stable, runtime = _build_context_layers(ctx.deps)
+    return f"{stable}\n\n{runtime}"
+
+
+_SUMMARY_MARKER = "Summary of previous conversation:"
+
+
+def _cache_optimized_history(
+    history: List[ModelMessage],
+    stable_context: str,
+    runtime_context: str,
+) -> List[ModelMessage]:
+    """Assemble `stable prefix + history + volatile runtime tail`.
+
+    Old app-managed SystemPromptParts are deliberately removed: legacy history
+    may contain a frozen clock. Compaction summaries are retained as stable
+    historical context. Both synthetic system layers are passed as history, so
+    `result.new_messages()` never persists them back into SQLite.
+    """
+    summaries: List[SystemPromptPart] = []
+    cleaned: List[ModelMessage] = []
+    seen_summaries = set()
+
+    for message in history:
+        if not isinstance(message, ModelRequest):
+            cleaned.append(message)
+            continue
+
+        kept_parts = []
+        for part in message.parts:
+            if not isinstance(part, SystemPromptPart):
+                kept_parts.append(part)
+                continue
+            if _SUMMARY_MARKER in part.content and part.content not in seen_summaries:
+                summaries.append(SystemPromptPart(content=part.content))
+                seen_summaries.add(part.content)
+
+        if kept_parts:
+            cleaned.append(
+                ModelRequest(
+                    parts=kept_parts,
+                    run_id=message.run_id,
+                    conversation_id=message.conversation_id,
+                    metadata=message.metadata,
+                )
+            )
+
+    base_prompt = _config.system_prompt or SECRETARY_PERSONA
+    prefix = ModelRequest(
+        parts=[
+            SystemPromptPart(content=base_prompt),
+            SystemPromptPart(content=stable_context),
+            *summaries,
+        ]
+    )
+    runtime_tail = ModelRequest(parts=[SystemPromptPart(content=runtime_context)])
+    return [prefix, *cleaned, runtime_tail]
 
 
 # ==================== Skill tools ====================
@@ -1307,8 +1385,19 @@ async def run_agent(
         },
     )
 
-    history = db.load_pydantic_messages()
-    logger.debug(f"[run_agent] loaded {len(history)} prior messages from DB")
+    persisted_history = db.load_pydantic_messages()
+    replay_history = await _history_processor(persisted_history)
+    stable_context, runtime_context = _build_context_layers(deps)
+    history = _cache_optimized_history(
+        replay_history,
+        stable_context=stable_context,
+        runtime_context=runtime_context,
+    )
+    logger.debug(
+        "[run_agent] loaded %s persisted messages; assembled %s messages with cache-stable prefix and runtime tail",
+        len(persisted_history),
+        len(history),
+    )
 
     async def _call_model(
         prompt: str,
@@ -1437,9 +1526,8 @@ async def run_agent(
         },
     )
 
-    # Startup self-test: exercise the full agent.run path (including
-    # history_processor dispatch — that's the bug class this guards against)
-    # but never persist. Reaching this line at all means the pipeline works.
+    # Startup self-test exercises history preparation plus the full agent.run
+    # path, but never persists. Reaching this line means the pipeline works.
     if origin_channel == "self_test":
         logger.info(f"[run_agent] self-test ok (output preview: {response[:60]!r})")
         return response

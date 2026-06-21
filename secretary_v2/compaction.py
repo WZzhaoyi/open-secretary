@@ -30,7 +30,6 @@ from pydantic_ai_summarization import (
 )
 from pydantic_ai_summarization.processor import (
     DEFAULT_CONTINUATION_PROMPT,
-    _extract_system_prompts,
 )
 
 from config import get_config
@@ -232,9 +231,10 @@ async def _run_processor_compaction(
         )
 
     summary_part = SystemPromptPart(content=f"{DEFAULT_CONTINUATION_PROMPT}{summary}")
-    summary_message = ModelRequest(
-        parts=[*_extract_system_prompts(messages), summary_part]
-    )
+    # App-managed system/runtime prompts are rebuilt for every run. Persisting
+    # extracted prompts here previously froze old clocks and reintroduced them
+    # after every compaction.
+    summary_message = ModelRequest(parts=[summary_part])
     compacted = [summary_message, *preserved_messages]
     after_tokens = _count_tokens(compacted)
     return CompactOutcome(

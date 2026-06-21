@@ -211,28 +211,46 @@ schedules:
       System behavior review: a weekly low-noise health check.
       Goal: only check whether the secretary system has silently failed or whether attention loops are abnormal. Do not write a generic summary, and do not report that "the system is normal".
 
-      You must run the following five SQL checks:
-      1. Whether scheduled runs were missing in the last 7 days:
-         SELECT date(created_at) AS day, COUNT(*) AS scheduled_runs
-         FROM agent_events
-         WHERE origin='scheduled'
-           AND type='run_started'
-           AND created_at >= datetime('now','-7 days')
-           AND subject NOT LIKE 'System behavior review%'
-         GROUP BY date(created_at)
-         ORDER BY day ASC
+      Time boundary (mandatory): SQLite `now` and agent_events.created_at are UTC. For this
+      Asia/Shanghai installation, `date('now','+8 hours')` is local_today. Never report,
+      infer, or count a date later than local_today. Query results are historical evidence;
+      missing rows do not represent future dates.
+
+      You must run the following five SQL checks exactly as written:
+      1. Scheduled-run counts for each of the 7 local calendar days ending at local_today:
+         WITH RECURSIVE days(day) AS (
+           SELECT date('now','+8 hours','-6 days')
+           UNION ALL
+           SELECT date(day,'+1 day') FROM days WHERE day < date('now','+8 hours')
+         )
+         SELECT days.day, COUNT(a.id) AS scheduled_runs
+         FROM days
+         LEFT JOIN agent_events a
+           ON date(a.created_at,'+8 hours') = days.day
+          AND a.origin='scheduled'
+          AND a.type='run_started'
+          AND a.subject NOT LIKE 'System behavior review%'
+         GROUP BY days.day
+         ORDER BY days.day ASC
       2. Whether scheduled runs failed in the last 7 days:
          SELECT created_at, subject, payload_json
          FROM agent_events
          WHERE origin='scheduled' AND type='run_failed' AND created_at >= datetime('now','-7 days')
          ORDER BY created_at DESC
-      3. Whether proactive messages were delivered in the last 7 days:
-         SELECT date(created_at) AS day, COUNT(*) AS sent_count
-         FROM agent_events
-         WHERE type='send_message' AND created_at >= datetime('now','-7 days')
-         GROUP BY date(created_at)
-         ORDER BY day ASC
-      4. Whether there are open items older than 7 days:
+      3. Proactive-message counts for each of the same 7 local calendar days:
+         WITH RECURSIVE days(day) AS (
+           SELECT date('now','+8 hours','-6 days')
+           UNION ALL
+           SELECT date(day,'+1 day') FROM days WHERE day < date('now','+8 hours')
+         )
+         SELECT days.day, COUNT(a.id) AS sent_count
+         FROM days
+         LEFT JOIN agent_events a
+           ON date(a.created_at,'+8 hours') = days.day
+          AND a.type='send_message'
+         GROUP BY days.day
+         ORDER BY days.day ASC
+      4. Whether there are open items older than 7 days that are not closed-loop:
          SELECT id,type,status,content,created_at
          FROM events
          WHERE status='open' AND created_at < datetime('now','-7 days')
@@ -245,9 +263,17 @@ schedules:
            AND created_at >= datetime('now','-30 days')
          ORDER BY created_at DESC
 
-      If anomalies exist, call send_message with a concise system review grouped by "Scheduled Tasks / Message Delivery / Open Items / Subagent", then write NO_ACTION as the final output.
-      If no anomalies exist, do not call any tools and write exactly NO_ACTION as the final output.
-      Do not write to memory.md, do not create events, and do not clean data.
+      Anomaly rules:
+      - Query 1 always returns exactly 7 rows, from local_today-6 through local_today. Only rows whose scheduled_runs=0 are missing days. Never invent dates outside those returned rows.
+      - If query 2 returns any rows, treat it as an anomaly.
+      - Query 3 always returns exactly 7 rows. Only rows whose sent_count=0 may indicate missing delivery. Do not send a generic warning merely because send_message volume is low.
+      - If query 4 returns any rows, treat it as an anomaly and list at most the 5 oldest items.
+      - If query 5 returns any rows, treat it as an anomaly and list at most the 5 most recent items.
+
+      Output contract:
+      - If anomalies exist, call send_message with a concise system review grouped by "Scheduled Tasks / Message Delivery / Open Items / Subagent", listing only anomalies and suggested actions. Then write NO_ACTION as the final output.
+      - If no anomalies exist, do not call any tools and write exactly NO_ACTION as the final output.
+      - Do not write to memory.md, do not create events, and do not clean data.
     protected: true
 
 # Timezone

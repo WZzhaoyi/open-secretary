@@ -268,6 +268,64 @@ async def test_two_turns_share_history(fresh_db, fake_agent_run):
     assert found_first_prompt, "first turn user prompt should survive in reloaded history"
 
 
+def test_cache_optimized_history_puts_runtime_after_replayed_history():
+    summary = ModelRequest(
+        parts=[
+            SystemPromptPart(content="## 当前时间\n2026-05-03T10:17:14"),
+            SystemPromptPart(
+                content="Summary of previous conversation:\n\nkeep this summary"
+            ),
+        ]
+    )
+    user = ModelRequest(parts=[UserPromptPart(content="historical user turn")])
+    assistant = ModelResponse(parts=[TextPart(content="historical reply")])
+
+    first = runtime._cache_optimized_history(
+        [summary, user, assistant],
+        stable_context="stable-context",
+        runtime_context="now=2026-06-21T17:30:00+08:00",
+    )
+    second = runtime._cache_optimized_history(
+        [summary, user, assistant],
+        stable_context="stable-context",
+        runtime_context="now=2026-06-21T17:31:00+08:00",
+    )
+
+    def provider_content(messages):
+        return [
+            [(part.part_kind, getattr(part, "content", None)) for part in message.parts]
+            for message in messages
+        ]
+
+    assert provider_content(first[:-1]) == provider_content(second[:-1]), (
+        "the full replay prefix must remain cache-identical"
+    )
+    assert "2026-05-03" not in str(first)
+    assert "keep this summary" in str(first[0])
+    assert "historical user turn" in str(first[-3])
+    assert "17:30" in str(first[-1])
+    assert "17:31" in str(second[-1])
+
+
+@pytest.mark.asyncio
+async def test_run_agent_runtime_tail_is_temporary(fresh_db, monkeypatch):
+    captured = {}
+
+    async def _fake_run(user_text, *args, **kwargs):
+        captured["history"] = kwargs["message_history"]
+        return FakeRunResult(user_text, "ok")
+
+    monkeypatch.setattr(runtime.agent, "run", _fake_run)
+    await run_agent("hello", db=fresh_db)
+
+    sent_history = captured["history"]
+    assert "Trusted Runtime Context" in str(sent_history[-1])
+    persisted = fresh_db.load_pydantic_messages()
+    assert persisted
+    assert "Trusted Runtime Context" not in str(persisted)
+    assert "hello" in str(persisted)
+
+
 @pytest.mark.asyncio
 async def test_no_action_skips_persistence(fresh_db, monkeypatch):
     """When the agent returns NO_ACTION, neither user prompt nor reply is persisted."""
@@ -453,11 +511,10 @@ async def test_load_skill_tool_loads_discovered_skill():
 # ---- Fix #3: history_processors wired ----
 
 
-def test_history_processor_wired():
-    """A SummarizationProcessor must be wired into the agent's history_processors."""
-    assert any(
-        isinstance(p, SummarizationProcessor) for p in runtime.agent.history_processors
-    ), f"no SummarizationProcessor in {runtime.agent.history_processors}"
+def test_history_processor_runs_before_synthetic_context_assembly():
+    """Compaction must process persisted history, never synthetic clock layers."""
+    assert isinstance(runtime._history_processor, SummarizationProcessor)
+    assert not runtime.agent.history_processors
 
 
 def test_estimate_tokens_uses_real_tokenizer():
@@ -631,6 +688,10 @@ def test_default_schedule_prompts_follow_memory_events_design():
     assert "agent_events" in system_review_prompt
     assert "origin='scheduled'" in system_review_prompt
     assert "subject NOT LIKE" in system_review_prompt
+    assert "date('now','+8 hours')" in system_review_prompt
+    assert "date later than local_today" in system_review_prompt
+    assert "WITH RECURSIVE days(day)" in system_review_prompt
+    assert "Never invent dates outside those returned rows" in system_review_prompt
     assert "type='run_failed'" in system_review_prompt
     assert "type='send_message'" in system_review_prompt
     assert "status='open'" in system_review_prompt
@@ -677,6 +738,11 @@ async def test_force_compact_archives_and_replaces(fresh_db, fake_agent_run, mon
         "summary" in getattr(p, "content", "").lower() or "摘要" in getattr(p, "content", "")
         for p in parts
     ), f"compacted history should start with a summary, got: {first}"
+    assert all(
+        "## 当前时间" not in getattr(p, "content", "")
+        and "## Trusted Runtime Context" not in getattr(p, "content", "")
+        for p in parts
+    ), "compaction must not persist app-managed clocks"
 
 
 # ---- Fix #4: scheduler restart-survival ----
@@ -793,7 +859,7 @@ async def test_memory_md_missing_is_silent(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dynamic_context_keeps_stable_prefix_before_runtime_tail(tmp_path, monkeypatch):
-    """Stable prompt blocks should precede per-run values for DeepSeek cache reuse."""
+    """Diagnostic context keeps policy before mutable runtime material."""
     from config import get_config
     from runtime import dynamic_context, SecretaryDeps
     from skills_loader import reset_skills_loader
@@ -828,18 +894,18 @@ async def test_dynamic_context_keeps_stable_prefix_before_runtime_tail(tmp_path,
     skill_index_at = text.index("## 可用技能索引")
     auto_skill_at = text.index("## 自动加载技能")
     event_context_at = text.index("## 事件上下文")
-    loaded_skill_at = text.index("## 已加载技能")
-    run_context_at = text.index("## 当前运行上下文")
-    event_at = text.index("运行时事件 sentinel")
-    recent_at = text.index("最近流水 sentinel")
+    loaded_skill_at = text.index("## 已加载技能", event_context_at)
+    run_context_at = text.index("## Trusted Runtime Context", loaded_skill_at)
+    event_at = text.index("运行时事件 sentinel", event_context_at)
+    recent_at = text.index("最近流水 sentinel", event_context_at)
 
-    assert schema_at < language_at < memory_at < skill_index_at < auto_skill_at < event_context_at
+    assert schema_at < language_at < skill_index_at < auto_skill_at < memory_at < event_context_at
     assert event_context_at < event_at < recent_at < loaded_skill_at < run_context_at
     assert "shown 1 / total 1" in text
     assert "Configured language: `en`" in text
     assert "default user-facing language: English" in text
     assert "shown 1 / configured 1" in text
-    assert text.rfind("## 当前运行上下文") > text.rfind("## 已加载技能")
+    assert text.rfind("## Trusted Runtime Context") > text.rfind("## 已加载技能")
 
     reset_skills_loader()
 
