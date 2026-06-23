@@ -16,6 +16,7 @@ from channels.telegram_channel import TelegramChannel
 from channels.feishu_channel import FeishuChannel
 from channels.http_channel import HTTPChannel
 from logging_utils import install_secret_redaction_filter
+from market_calendar import get_market_calendar_service
 from skills_loader import get_skills_loader
 from scheduler import Scheduler
 from subagent_runs import (
@@ -413,6 +414,7 @@ class SecretaryApp:
     async def run(self):
         """Run the application: start scheduler + all selected channels concurrently."""
         try:
+            logger.info(get_market_calendar_service().strategy_summary())
             await self.scheduler.start()
             # The self-test guards long-lived channels before users hit them.
             # A one-shot `--send` run isn't worth a second synthetic agent.run()

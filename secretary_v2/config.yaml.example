@@ -70,6 +70,20 @@ search:
   backend: tavily
   tavily_api_key: YOUR_TAVILY_API_KEY
 
+# Market calendar provider. Longbridge is queried in date windows and cached
+# in memory. pandas_market_calendars is an unpinned dependency so exchange
+# holiday rules can stay current; weekday fallback is last-resort degraded mode.
+market_calendar:
+  enabled: true
+  provider: longbridge
+  fallback_provider: pandas_market_calendars
+  markets: [CN, HK, US]
+  lookbehind_days: 3
+  lookahead_days: 14
+  cache_ttl_minutes: 720
+  timeout_seconds: 10
+  command: longbridge
+
 # Background sub-agent sidecar
 subagent:
   default_engine: claude

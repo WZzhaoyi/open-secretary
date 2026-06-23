@@ -585,6 +585,7 @@ async def test_compaction_prunes_tool_output_before_summary(monkeypatch):
     )
 
     assert outcome.changed
+    assert "TEMPORAL ANCHORING FOR SUMMARY ONLY" in seen["formatted"]
     assert "Tool output truncated for compaction" in seen["formatted"]
     assert "original 80 chars" in seen["formatted"]
 
@@ -934,6 +935,33 @@ async def test_dynamic_context_omits_resolved_events_from_recent_window(monkeypa
     assert "shown 1 / configured 1" in text
 
 
+@pytest.mark.asyncio
+async def test_dynamic_context_marks_event_temporal_metadata(monkeypatch):
+    from config import get_config
+    from runtime import dynamic_context, SecretaryDeps
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg.history, "max_events", 1)
+
+    db = Database(db_path=":memory:")
+    db.create_event("remind", "6/25周三复盘：休市静默", status="open")
+    deps = SecretaryDeps(
+        db=db,
+        current_time="2026-06-23T08:00:00+08:00",
+    )
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    text = await dynamic_context(_Ctx(deps))
+
+    assert "event_date=2026-06-25" in text
+    assert "relative_to_local_today=future" in text
+    assert "weekday=周四" in text
+    assert "weekday_mismatch=周三->周四" in text
+
+
 def test_language_policy_supports_auto_and_falls_back_to_auto():
     from runtime import _language_policy
 
@@ -1094,6 +1122,80 @@ async def test_db_execute_blocks_protected_runtime_tables(fresh_db):
     ]
     assert events
     assert events[0].subject == "db_execute:protected_table"
+
+
+@pytest.mark.asyncio
+async def test_db_execute_rejects_event_weekday_mismatch(fresh_db):
+    """Event writes with explicit date+weekday mismatches fail before persistence."""
+    from runtime import db_execute, SecretaryDeps
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    ctx = _Ctx(
+        SecretaryDeps(
+            db=fresh_db,
+            current_time="2026-06-23T08:00:00+08:00",
+        )
+    )
+
+    result = await db_execute(
+        ctx,
+        (
+            "INSERT INTO events (type, content, status) "
+            "VALUES ('remind', '6/25周三复盘：休市静默', 'open')"
+        ),
+    )
+
+    assert result.startswith("Error: temporal validation failed")
+    assert "2026-06-25 is 周四" in result
+    assert fresh_db.get_events() == []
+
+    events = [
+        event
+        for event in fresh_db.get_agent_events()
+        if event.type == "temporal_validation_failed"
+    ]
+    assert events
+    assert events[0].subject == "db_execute:events"
+
+
+@pytest.mark.asyncio
+async def test_schedule_task_rejects_prompt_weekday_mismatch(fresh_db):
+    """Runtime-created schedule prompts get the same deterministic date guard."""
+    from runtime import schedule_task, SecretaryDeps
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    ctx = _Ctx(
+        SecretaryDeps(
+            db=fresh_db,
+            current_time="2026-06-23T08:00:00+08:00",
+        )
+    )
+
+    result = await schedule_task(
+        ctx,
+        "create",
+        task_id="bad_date",
+        cron="0 8 * * *",
+        prompt="6/25周三复盘：休市静默",
+    )
+
+    assert result.startswith("Error: temporal validation failed")
+    assert "2026-06-25 is 周四" in result
+    assert {task.id for task in fresh_db.get_scheduled_tasks(False)} == set()
+
+    events = [
+        event
+        for event in fresh_db.get_agent_events()
+        if event.type == "temporal_validation_failed"
+    ]
+    assert events
+    assert events[0].subject == "schedule_task:create"
 
 
 @pytest.mark.asyncio

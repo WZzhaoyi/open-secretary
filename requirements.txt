@@ -11,6 +11,8 @@ fastapi>=0.136.1,<0.137.0
 uvicorn>=0.46.0,<0.47.0
 apscheduler>=3.11.2,<4.0.0
 pydantic>=2.13.3,<3.0.0
+# Keep unpinned: trading holiday rules change and should track latest releases.
+pandas_market_calendars
 
 # Test suite
 pytest>=9.0.3,<10.0.0

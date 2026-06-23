@@ -2,6 +2,7 @@
 
 import asyncio
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -11,7 +12,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -39,6 +40,7 @@ from guardrails import (
     truncate_output,
 )
 from llm_models import build_model
+from market_calendar import get_market_calendar_service
 from memory import Database, sanitize_pydantic_messages_for_history
 
 logger = logging.getLogger(__name__)
@@ -143,6 +145,234 @@ agent = Agent(
 MEMORY_FILE = BASE_DIR / "memory.md"
 OPEN_EVENTS_CONTEXT_LIMIT = 200
 
+_WEEKDAY_ZH = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+_WEEKDAY_EN = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+_WEEKDAY_RE = (
+    r"(?:周[一二三四五六日天]|星期[一二三四五六日天]|"
+    r"Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|"
+    r"Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)"
+)
+_RELATIVE_TIME_RE = re.compile(
+    r"\b(today|tomorrow|tonight|yesterday)\b|今天|今日|今晚|明天|明日|明晚|昨天|昨日|昨晚",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class TemporalMention:
+    raw: str
+    event_date: date
+    claimed_weekday: Optional[str] = None
+
+
+def _local_now_from_deps(deps: SecretaryDeps, tz: ZoneInfo) -> datetime:
+    local_now = datetime.fromisoformat(deps.current_time)
+    if local_now.tzinfo is None:
+        return local_now.replace(tzinfo=tz)
+    return local_now.astimezone(tz)
+
+
+def _weekday_zh(day: date) -> str:
+    return _WEEKDAY_ZH[day.weekday()]
+
+
+def _weekday_en(day: date) -> str:
+    return _WEEKDAY_EN[day.weekday()]
+
+
+def _normalize_claimed_weekday(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    raw = value.strip()
+    zh_map = {
+        "周一": "周一",
+        "星期一": "周一",
+        "周二": "周二",
+        "星期二": "周二",
+        "周三": "周三",
+        "星期三": "周三",
+        "周四": "周四",
+        "星期四": "周四",
+        "周五": "周五",
+        "星期五": "周五",
+        "周六": "周六",
+        "星期六": "周六",
+        "周日": "周日",
+        "周天": "周日",
+        "星期日": "周日",
+        "星期天": "周日",
+    }
+    if raw in zh_map:
+        return zh_map[raw]
+    en_map = {
+        "mon": "Monday",
+        "monday": "Monday",
+        "tue": "Tuesday",
+        "tues": "Tuesday",
+        "tuesday": "Tuesday",
+        "wed": "Wednesday",
+        "wednesday": "Wednesday",
+        "thu": "Thursday",
+        "thur": "Thursday",
+        "thurs": "Thursday",
+        "thursday": "Thursday",
+        "fri": "Friday",
+        "friday": "Friday",
+        "sat": "Saturday",
+        "saturday": "Saturday",
+        "sun": "Sunday",
+        "sunday": "Sunday",
+    }
+    return en_map.get(raw.lower(), raw)
+
+
+def _expected_weekday_for_claim(day: date, claim: str) -> str:
+    return _weekday_zh(day) if claim.startswith("周") else _weekday_en(day)
+
+
+def _coerce_date(year: int, month: int, day: int) -> Optional[date]:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _extract_temporal_mentions(text: str, *, default_year: int) -> List[TemporalMention]:
+    """Extract explicit date mentions and nearby weekday claims from user text.
+
+    This intentionally handles only common reminder shapes. It is a deterministic
+    guardrail, not a natural-language date parser.
+    """
+    if not text:
+        return []
+
+    patterns = [
+        re.compile(
+            rf"(?<!\d)(?P<year>20\d{{2}})[-/](?P<month>0?[1-9]|1[0-2])[-/](?P<day>[12]\d|3[01]|0?[1-9])\s*(?P<weekday>{_WEEKDAY_RE})?",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?<![\d/-])(?P<month>0?[1-9]|1[0-2])\s*[/-]\s*(?P<day>[12]\d|3[01]|0?[1-9])\s*(?P<weekday>{_WEEKDAY_RE})?",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?<!\d)(?P<month>0?[1-9]|1[0-2])\s*月\s*(?P<day>[12]\d|3[01]|0?[1-9])\s*[日号]?\s*(?P<weekday>{_WEEKDAY_RE})?",
+            re.IGNORECASE,
+        ),
+    ]
+
+    mentions: List[TemporalMention] = []
+    seen = set()
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            year = int(match.groupdict().get("year") or default_year)
+            month = int(match.group("month"))
+            day_num = int(match.group("day"))
+            event_date = _coerce_date(year, month, day_num)
+            if event_date is None:
+                continue
+            claim = _normalize_claimed_weekday(match.groupdict().get("weekday"))
+            key = (match.start(), match.end(), event_date, claim)
+            if key in seen:
+                continue
+            seen.add(key)
+            mentions.append(
+                TemporalMention(
+                    raw=match.group(0).strip(),
+                    event_date=event_date,
+                    claimed_weekday=claim,
+                )
+            )
+    return mentions
+
+
+def _temporal_validation_errors(text: str, *, default_year: int) -> List[str]:
+    errors = []
+    for mention in _extract_temporal_mentions(text, default_year=default_year):
+        claim = mention.claimed_weekday
+        if not claim:
+            continue
+        expected = _expected_weekday_for_claim(mention.event_date, claim)
+        if claim != expected:
+            errors.append(
+                f"{mention.raw} claims {claim}, but "
+                f"{mention.event_date.isoformat()} is {expected}"
+            )
+    return errors
+
+
+def _temporal_note_for_content(
+    content: str,
+    *,
+    default_year: int,
+    local_today: date,
+) -> str:
+    notes = []
+    mentions = _extract_temporal_mentions(content or "", default_year=default_year)
+    if mentions:
+        first = mentions[0]
+        if first.event_date > local_today:
+            relative = "future"
+        elif first.event_date < local_today:
+            relative = "past"
+        else:
+            relative = "today"
+        notes.extend(
+            [
+                f"event_date={first.event_date.isoformat()}",
+                f"relative_to_local_today={relative}",
+                f"weekday={_weekday_zh(first.event_date)}",
+            ]
+        )
+        if first.claimed_weekday:
+            expected = _expected_weekday_for_claim(first.event_date, first.claimed_weekday)
+            notes.append(f"claimed_weekday={first.claimed_weekday}")
+            if first.claimed_weekday != expected:
+                notes.append(f"weekday_mismatch={first.claimed_weekday}->{expected}")
+    if _RELATIVE_TIME_RE.search(content or ""):
+        notes.append("relative_time_terms=true")
+    return " ".join(notes)
+
+
+def _format_event_context_line(event, *, tz: ZoneInfo, local_today: date) -> str:
+    local_created = _to_local_iso(event.created_at, tz)
+    if event.created_at is not None:
+        created_at = event.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        default_year = created_at.astimezone(tz).year
+    else:
+        default_year = local_today.year
+    temporal_note = _temporal_note_for_content(
+        event.content or "",
+        default_year=default_year,
+        local_today=local_today,
+    )
+    temporal = f" temporal={temporal_note}" if temporal_note else ""
+    return (
+        f"- local_created_at={local_created}: "
+        f"[id={event.id} type={event.type} status={event.status}{temporal}] "
+        f"{(event.content or '')[:160]}"
+    )
+
+
+def _sql_string_literals(sql: str) -> List[str]:
+    literals = []
+    for match in re.finditer(r"'((?:''|[^'])*)'|\"((?:\"\"|[^\"])*)\"", sql):
+        value = match.group(1) if match.group(1) is not None else match.group(2)
+        if value is None:
+            continue
+        literals.append(value.replace("''", "'").replace('""', '"'))
+    return literals
+
 
 def _language_policy(language: str) -> str:
     normalized = (language or "auto").strip().lower()
@@ -193,11 +423,7 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
     cfg = cfg_root.history
     tz_name = cfg_root.timezone
     tz = ZoneInfo(tz_name)
-    local_now = datetime.fromisoformat(deps.current_time)
-    if local_now.tzinfo is None:
-        local_now = local_now.replace(tzinfo=tz)
-    else:
-        local_now = local_now.astimezone(tz)
+    local_now = _local_now_from_deps(deps, tz)
     offset = local_now.utcoffset() or timedelta(0)
     offset_sec = int(offset.total_seconds())
     sign = "+" if offset_sec >= 0 else "-"
@@ -216,7 +442,10 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
         "- The application supplies a fresh `## Trusted Runtime Context` system block immediately before each new user/task prompt.\n"
         "- Its clock, timezone, local date, and weekday are authoritative over every date claim in conversation history, summaries, memory, events, or user text.\n"
         "- Never calculate a weekday from model memory. Use the supplied weekday or a deterministic tool/database expression.\n"
-        "- Historical relative phrases such as today/tomorrow/tonight are quotations, not the current clock.",
+        "- For trading-day, market-open, or closed-market claims, call `market_calendar`; do not infer from old messages or cron weekdays.\n"
+        "- `market_calendar` is factual context only. A non-trading day does not imply `NO_ACTION`;休市 days may still need review reminders, portfolio context, or follow-up.\n"
+        "- Historical relative phrases such as today/tomorrow/tonight are quotations, not the current clock.\n"
+        "- Before writing reminders/events with a date+weekday, rely on deterministic validation; tools reject mismatched weekday claims.",
     ]
     runtime_parts = []
     open_events_shown = 0
@@ -236,9 +465,11 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
         if open_events:
             open_events_shown = len(open_events)
             open_text = "\n".join(
-                f"- {_to_local_iso(event.created_at, tz)}: "
-                f"[id={event.id} type={event.type} status={event.status}] "
-                f"{(event.content or '')[:160]}"
+                _format_event_context_line(
+                    event,
+                    tz=tz,
+                    local_today=local_now.date(),
+                )
                 for event in open_events
             )
             truncated_note = (
@@ -264,9 +495,11 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
         if recent_events:
             recent_events_shown = len(recent_events)
             events_text = "\n".join(
-                f"- {_to_local_iso(event.created_at, tz)}: "
-                f"[id={event.id} type={event.type} status={event.status}] "
-                f"{(event.content or '')[:100]}"
+                _format_event_context_line(
+                    event,
+                    tz=tz,
+                    local_today=local_now.date(),
+                )
                 for event in recent_events
             )
             event_context_parts.append(
@@ -525,6 +758,107 @@ async def db_query(ctx: RunContext[SecretaryDeps], sql: str) -> str:
 
 
 @agent.tool
+async def market_calendar(
+    ctx: RunContext[SecretaryDeps],
+    markets: str = "CN,HK,US",
+    date_text: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> str:
+    """Check trading days using the configured market calendar service.
+
+    `markets` is a comma-separated list such as "CN,HK,US". For a single-day
+    check, pass `date_text` as YYYY-MM-DD. For a range, pass `start` and `end`.
+    This tool returns facts only; do not treat non-trading days as automatic
+    NO_ACTION because closed-market review reminders can still be useful.
+    """
+    try:
+        cfg = get_config()
+        tz = ZoneInfo(cfg.timezone)
+        local_today = _local_now_from_deps(ctx.deps, tz).date()
+        service = get_market_calendar_service()
+        requested_markets = [
+            item.strip()
+            for item in (markets or ",".join(cfg.market_calendar.markets)).split(",")
+            if item.strip()
+        ]
+        if not requested_markets:
+            requested_markets = list(cfg.market_calendar.markets)
+
+        if start or end:
+            start_day = date.fromisoformat(start or end or local_today.isoformat())
+            end_day = date.fromisoformat(end or start or local_today.isoformat())
+            payload = {
+                "query": {
+                    "start": start_day.isoformat(),
+                    "end": end_day.isoformat(),
+                    "markets": requested_markets,
+                },
+                "ranges": [],
+                "cache": service.cache_stats(),
+            }
+            for market in requested_markets:
+                window = service.get_range(market, start_day, end_day)
+                payload["ranges"].append(
+                    {
+                        "market": window.market,
+                        "start": window.start.isoformat(),
+                        "end": window.end.isoformat(),
+                        "trading_days": [
+                            day.isoformat() for day in sorted(window.trading_days)
+                        ],
+                        "half_trading_days": [
+                            day.isoformat()
+                            for day in sorted(window.half_trading_days)
+                        ],
+                        "source": window.source,
+                        "degraded": window.degraded,
+                        "error": window.error,
+                    }
+                )
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+
+        target = date.fromisoformat(date_text) if date_text else local_today
+        payload = {
+            "query": {
+                "date": target.isoformat(),
+                "markets": requested_markets,
+            },
+            "days": [],
+            "cache": service.cache_stats(),
+        }
+        for market in requested_markets:
+            status = service.day_status(market, target)
+            payload["days"].append(
+                {
+                    "market": status.market,
+                    "date": status.date.isoformat(),
+                    "is_trading_day": status.is_trading_day,
+                    "is_half_trading_day": status.is_half_trading_day,
+                    "next_trading_day": (
+                        status.next_trading_day.isoformat()
+                        if status.next_trading_day
+                        else None
+                    ),
+                    "source": status.source,
+                    "degraded": status.degraded,
+                    "error": status.error,
+                }
+            )
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _record_agent_event(
+            ctx.deps.db,
+            "market_calendar_failed",
+            origin=ctx.deps.origin_channel,
+            run_id=ctx.deps.run_id or None,
+            subject="market_calendar",
+            payload={"error": str(e), "markets": markets, "date": date_text},
+        )
+        return f"Error: market_calendar failed: {e}"
+
+
+@agent.tool
 async def db_execute(
     ctx: RunContext[SecretaryDeps], sql: str, params: Optional[List] = None
 ) -> str:
@@ -574,6 +908,30 @@ async def db_execute(
                 message=f"table {table.lower()} is protected; use the dedicated tool or read-only query",
             )
             return _record_permission_denied(ctx.deps, decision)
+    if op in {"INSERT", "UPDATE"} and re.search(r"\bEVENTS\b", redacted_sql):
+        tz = _local_tz()
+        local_now = _local_now_from_deps(ctx.deps, tz)
+        literal_values = _sql_string_literals(sql)
+        literal_values.extend(str(value) for value in (params or []) if value is not None)
+        text_to_validate = "\n".join(literal_values)
+        errors = _temporal_validation_errors(
+            text_to_validate,
+            default_year=local_now.year,
+        )
+        if errors:
+            _record_agent_event(
+                ctx.deps.db,
+                "temporal_validation_failed",
+                origin=ctx.deps.origin_channel,
+                run_id=ctx.deps.run_id or None,
+                subject="db_execute:events",
+                payload={"errors": errors, "sql_preview": sql[:240]},
+            )
+            return (
+                "Error: temporal validation failed for events write: "
+                + "; ".join(errors)
+                + ". Correct the absolute date/weekday before writing."
+            )
     try:
         affected = ctx.deps.db.execute_statement(sql, params or [])
         return f"Statement executed successfully. Rows affected: {affected}"
@@ -970,6 +1328,24 @@ async def schedule_task(
     if action == "create":
         if not task_id or not cron or not prompt:
             return "Error: task_id, cron, and prompt are required for create"
+        errors = _temporal_validation_errors(
+            prompt,
+            default_year=_local_now_from_deps(ctx.deps, _local_tz()).year,
+        )
+        if errors:
+            _record_agent_event(
+                ctx.deps.db,
+                "temporal_validation_failed",
+                origin=ctx.deps.origin_channel,
+                run_id=ctx.deps.run_id or None,
+                subject="schedule_task:create",
+                payload={"task_id": task_id, "errors": errors},
+            )
+            return (
+                "Error: temporal validation failed for scheduled task prompt: "
+                + "; ".join(errors)
+                + ". Correct the absolute date/weekday before creating the task."
+            )
         try:
             db.create_scheduled_task(task_id, cron, prompt)
             if sched is not None:
@@ -985,6 +1361,24 @@ async def schedule_task(
         if cron:
             updates["cron"] = cron
         if prompt:
+            errors = _temporal_validation_errors(
+                prompt,
+                default_year=_local_now_from_deps(ctx.deps, _local_tz()).year,
+            )
+            if errors:
+                _record_agent_event(
+                    ctx.deps.db,
+                    "temporal_validation_failed",
+                    origin=ctx.deps.origin_channel,
+                    run_id=ctx.deps.run_id or None,
+                    subject="schedule_task:update",
+                    payload={"task_id": task_id, "errors": errors},
+                )
+                return (
+                    "Error: temporal validation failed for scheduled task prompt: "
+                    + "; ".join(errors)
+                    + ". Correct the absolute date/weekday before updating the task."
+                )
             updates["prompt"] = prompt
         if not updates:
             return "Error: at least one of cron or prompt is required for update"

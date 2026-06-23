@@ -91,6 +91,19 @@ class HistoryConfig:
 
 
 @dataclass
+class MarketCalendarConfig:
+    enabled: bool = True
+    provider: str = "longbridge"
+    fallback_provider: str = "pandas_market_calendars"
+    markets: List[str] = field(default_factory=lambda: ["CN", "HK", "US"])
+    lookbehind_days: int = 3
+    lookahead_days: int = 14
+    cache_ttl_minutes: int = 720
+    timeout_seconds: int = 10
+    command: str = "longbridge"
+
+
+@dataclass
 class CodexSubagentConfig:
     model: str = ""
     enable_search: bool = True
@@ -166,6 +179,7 @@ class Config:
     history: HistoryConfig
     subagent: SubagentConfig
     schedules: Dict[str, ScheduleConfig]
+    market_calendar: MarketCalendarConfig = field(default_factory=MarketCalendarConfig)
     timezone: str = "Asia/Shanghai"
     language: str = "auto"
     ui_language: str = "auto"
@@ -218,6 +232,10 @@ class Config:
         history_data = config_data.get("history", {})
         history = HistoryConfig(**history_data)
 
+        # Parse market calendar config
+        market_calendar_data = config_data.get("market_calendar", {})
+        market_calendar = MarketCalendarConfig(**market_calendar_data)
+
         # Parse subagent sidecar config
         subagent_data = config_data.get("subagent", {})
         subagent = SubagentConfig(
@@ -242,6 +260,7 @@ class Config:
             skills=skills,
             search=search,
             history=history,
+            market_calendar=market_calendar,
             subagent=subagent,
             schedules=schedules,
             timezone=config_data.get("timezone", "Asia/Shanghai"),

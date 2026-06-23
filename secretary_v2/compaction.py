@@ -20,7 +20,9 @@ accountant. Real per-run usage is logged separately from result.usage().
 import logging
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import tiktoken
 from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart, ToolReturnPart
@@ -166,6 +168,39 @@ def _prune_tool_outputs_for_summary(
     return pruned
 
 
+def _temporal_anchoring_prompt() -> str:
+    """Instruction injected only into the summarizer input.
+
+    The live agent gets the authoritative clock in the runtime tail. Compaction
+    needs a separate guard because summaries can persist for a long time and be
+    replayed as history.
+    """
+    cfg = get_config()
+    try:
+        today = datetime.now(ZoneInfo(cfg.timezone)).date().isoformat()
+    except Exception:
+        today = datetime.now().date().isoformat()
+    return (
+        "TEMPORAL ANCHORING FOR SUMMARY ONLY:\n"
+        f"- The current local date is {today} in timezone {cfg.timezone}.\n"
+        "- Rewrite completed actions as absolute, dated, past-tense facts.\n"
+        "- Do not preserve old relative phrases such as today/tomorrow/tonight "
+        "as if they were current. Resolve them to historical facts when the "
+        "source text makes that possible.\n"
+        "- Never invent a date for work that has not happened yet. Keep future "
+        "reminders explicitly future-dated."
+    )
+
+
+def _add_temporal_anchoring_for_summary(
+    messages: list[ModelMessage],
+) -> list[ModelMessage]:
+    return [
+        ModelRequest(parts=[SystemPromptPart(content=_temporal_anchoring_prompt())]),
+        *messages,
+    ]
+
+
 async def _run_processor_compaction(
     processor: SummarizationProcessor,
     messages: list[ModelMessage],
@@ -200,6 +235,7 @@ async def _run_processor_compaction(
     messages_to_summarize = _prune_tool_outputs_for_summary(
         messages[:cutoff_index], cfg.compact_tool_output_max_chars
     )
+    messages_to_summarize = _add_temporal_anchoring_for_summary(messages_to_summarize)
     preserved_messages = messages[cutoff_index:]
 
     try:
