@@ -1,15 +1,10 @@
 """History compaction for secretary v2.
 
-Auto-compaction is delegated to the `summarization-pydantic-ai` library: its
-`SummarizationProcessor` is wired into the Agent as a history_processor and,
-before every run, summarizes the head of an over-threshold conversation while
-keeping a recent tail. This module is now thin — it only provides:
-
-  - build_summarization_processor(): factory used by runtime.agent
-  - force_compact(): the user-triggered /compact. Unlike the in-flight
-    processor (which only transforms the messages sent to the model and leaves
-    the DB untouched), force_compact also rewrites the persisted snapshot to
-    [summary, *tail] so subsequent runs load the compacted state directly.
+Before each run, runtime asks this module whether the active persisted history
+has crossed the configured compaction threshold. If it has, the head is
+summarized, the recent tail is kept verbatim, and the compacted snapshot is
+written back to the DB before the model call. Manual /compact uses the same
+snapshot rewrite path.
 
 Threshold decisions use a tiktoken estimate. cl100k_base is GPT's tokenizer,
 not Claude's, so it's only an approximation — acceptable because the fraction
@@ -65,14 +60,14 @@ class SecretarySummarizationProcessor(SummarizationProcessor):
     """SummarizationProcessor with v2's shared pre/post compaction rules."""
 
     async def compact(
-        self, messages: list[ModelMessage], reason: str = "temporary"
+        self, messages: list[ModelMessage], reason: str = "auto"
     ) -> CompactOutcome:
         return await _run_processor_compaction(self, messages, reason=reason)
 
     async def __call__(self, messages: list[ModelMessage]) -> list[ModelMessage]:
-        outcome = await self.compact(messages, reason="temporary")
+        outcome = await self.compact(messages, reason="auto")
         if outcome.failed:
-            logger.error("[compaction] temporary summarization failed: %s", outcome.error)
+            logger.error("[compaction] summarization failed: %s", outcome.error)
             return messages
         return outcome.compacted
 
@@ -103,10 +98,10 @@ def _count_tokens(messages) -> int:
 
 
 def build_summarization_processor(force: bool = False) -> SummarizationProcessor:
-    """Build the SummarizationProcessor used as a pydantic-ai history_processor.
+    """Build the SummarizationProcessor used by automatic and manual compaction.
 
-    force=False: the agent's normal in-flight processor. Triggers at
-        `compress_threshold` fraction of `context_tokens` (25% margin).
+    force=False: automatic pre-run compaction. Triggers at `compress_threshold`
+        fraction of `context_tokens`.
     force=True: used by /compact — triggers on any non-trivial history so the
         user can compact on demand regardless of current size.
     """
@@ -207,7 +202,7 @@ async def _run_processor_compaction(
     *,
     reason: str,
 ) -> CompactOutcome:
-    """Shared compaction implementation for temporary, manual, and auto paths."""
+    """Shared compaction implementation for manual and auto paths."""
     before_tokens = _count_tokens(messages)
     unchanged = CompactOutcome(
         compacted=messages,
@@ -361,32 +356,36 @@ def persist_compacted_snapshot(db, outcome: CompactOutcome) -> int:
     return archived
 
 
-async def maybe_auto_persist_compact(db) -> Optional[CompactOutcome]:
-    """Persist a compacted snapshot when active history is sustainably large."""
+async def maybe_auto_persist_compact(
+    db,
+    history: Optional[list[ModelMessage]] = None,
+) -> Optional[CompactOutcome]:
+    """Persist a compacted snapshot when active history crosses one threshold."""
     global _last_auto_persist_compact_at
 
     cfg = get_config().history
-    if not cfg.auto_persist_compact:
+    if not cfg.auto_compact:
         return None
 
     now = time.monotonic()
-    cooldown_sec = cfg.persist_compact_cooldown_minutes * 60
+    cooldown_sec = cfg.compact_cooldown_minutes * 60
     if (
         _last_auto_persist_compact_at is not None
         and now - _last_auto_persist_compact_at < cooldown_sec
     ):
         return None
 
-    history = db.load_pydantic_messages()
-    if len(history) < cfg.persist_compact_min_active_messages:
+    if history is None:
+        history = db.load_pydantic_messages()
+    if len(history) < cfg.compact_min_active_messages:
         return None
 
     tokens = _count_tokens(history)
-    threshold = int(cfg.context_tokens * cfg.persist_compact_threshold)
+    threshold = int(cfg.context_tokens * cfg.compress_threshold)
     if tokens < threshold:
         return None
 
-    outcome = await run_compaction(history, force=True, reason="auto_persist")
+    outcome = await run_compaction(history, force=True, reason="auto")
     if outcome.failed:
         logger.error("[auto_compact] summarization failed: %s", outcome.error)
         return outcome

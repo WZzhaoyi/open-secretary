@@ -83,10 +83,9 @@ class HistoryConfig:
     compress_threshold: float = 0.75
     tail_token_budget: int = 20000
     max_events: int = 10
-    auto_persist_compact: bool = True
-    persist_compact_threshold: float = 0.85
-    persist_compact_min_active_messages: int = 80
-    persist_compact_cooldown_minutes: int = 120
+    auto_compact: bool = True
+    compact_min_active_messages: int = 4
+    compact_cooldown_minutes: int = 120
     compact_tool_output_max_chars: int = 4000
 
 

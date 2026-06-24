@@ -28,7 +28,7 @@ from pydantic_ai.messages import (
     ThinkingPart,
 )
 
-from compaction import build_summarization_processor, maybe_auto_persist_compact
+from compaction import maybe_auto_persist_compact
 from config import get_config, SECRETARY_PERSONA, DB_SCHEMA_HINT
 from guardrails import (
     BASE_DIR,
@@ -128,11 +128,7 @@ class SecretaryDeps:
     subagent_registry: Optional[Any] = None  # subagent_runs.SubAgentRegistry
 
 
-# Compact persisted conversation history before synthetic system layers are
-# assembled. Letting Pydantic process the fully assembled list could summarize
-# away the cache-stable prefix or fold the volatile runtime clock into history.
 _config = get_config()
-_history_processor = build_summarization_processor()
 agent = Agent(
     model=build_model(_config),
     deps_type=SecretaryDeps,
@@ -1780,7 +1776,21 @@ async def run_agent(
     )
 
     persisted_history = db.load_pydantic_messages()
-    replay_history = await _history_processor(persisted_history)
+    pre_run_compact_outcome = None
+    try:
+        pre_run_compact_outcome = await maybe_auto_persist_compact(
+            db, history=persisted_history
+        )
+        if (
+            pre_run_compact_outcome
+            and pre_run_compact_outcome.changed
+            and not pre_run_compact_outcome.failed
+        ):
+            persisted_history = pre_run_compact_outcome.compacted
+    except Exception as e:
+        logger.error(f"[run_agent] pre-run compaction failed: {e}")
+
+    replay_history = persisted_history
     stable_context, runtime_context = _build_context_layers(deps)
     history = _cache_optimized_history(
         replay_history,
@@ -1952,22 +1962,24 @@ async def run_agent(
     except Exception as e:
         logger.error(f"[run_agent] failed to persist messages: {e}")
 
-    try:
-        outcome = await maybe_auto_persist_compact(db)
-        if outcome and outcome.changed and not outcome.failed:
-            target = origin_channel
+    if (
+        pre_run_compact_outcome
+        and pre_run_compact_outcome.changed
+        and not pre_run_compact_outcome.failed
+    ):
+        target = origin_channel
+        channel_obj = (channels or {}).get(target)
+        if target == "scheduled" or channel_obj is None:
+            target = get_config().channels.default_outgoing
             channel_obj = (channels or {}).get(target)
-            if target == "scheduled" or channel_obj is None:
-                target = get_config().channels.default_outgoing
-                channel_obj = (channels or {}).get(target)
-            if channel_obj is not None:
-                await channel_obj.send(
-                    "Conversation history was automatically compacted: "
-                    f"{outcome.before_messages} -> {outcome.after_messages} messages, "
-                    f"{outcome.before_tokens:,} -> {outcome.after_tokens:,} tokens.",
-                    None if origin_channel == "scheduled" else (conversation_id or user_id),
-                )
-    except Exception as e:
-        logger.error(f"[run_agent] auto persist compaction failed: {e}")
+        if channel_obj is not None:
+            await channel_obj.send(
+                "Conversation history was automatically compacted before this run: "
+                f"{pre_run_compact_outcome.before_messages} -> "
+                f"{pre_run_compact_outcome.after_messages} messages, "
+                f"{pre_run_compact_outcome.before_tokens:,} -> "
+                f"{pre_run_compact_outcome.after_tokens:,} tokens.",
+                None if origin_channel == "scheduled" else (conversation_id or user_id),
+            )
 
     return response

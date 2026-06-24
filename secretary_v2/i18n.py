@@ -56,9 +56,8 @@ MESSAGES = {
             "💬 Messages (DB total / replayable now): {total_messages} / {history_count}\n"
             "🧮 Last context usage: {usage_status}\n"
             "🧊 Last cache: {cache_status}\n"
-            "🗜️ Compaction: temporary `{temp_threshold:,}` tokens, persistent `{persist_threshold:,}` tokens, "
-            "tail `{tail_budget:,}` tokens\n"
-            "🧷 Auto persistent compaction: `{auto_compact_status}`, minimum `{min_messages}` messages, "
+            "🗜️ Compaction: threshold `{compact_threshold:,}` tokens, tail `{tail_budget:,}` tokens\n"
+            "🧷 Auto compaction: `{auto_compact_status}`, minimum `{min_messages}` messages, "
             "cooldown `{cooldown_minutes}` minutes, tool output `{tool_output_chars}` chars\n"
             "🧠 memory.md: `{memory_status}`\n"
         ),
@@ -113,9 +112,8 @@ MESSAGES = {
             "💬 历史消息（DB 总数 / 当前可重放）：{total_messages} / {history_count}\n"
             "🧮 上轮上下文占用：{usage_status}\n"
             "🧊 上轮缓存：{cache_status}\n"
-            "🗜️ 压缩策略：临时 `{temp_threshold:,}` tokens，持久化 `{persist_threshold:,}` tokens，"
-            "tail `{tail_budget:,}` tokens\n"
-            "🧷 自动持久化压缩：`{auto_compact_status}`，最少 `{min_messages}` 条，"
+            "🗜️ 压缩策略：阈值 `{compact_threshold:,}` tokens，tail `{tail_budget:,}` tokens\n"
+            "🧷 自动压缩：`{auto_compact_status}`，最少 `{min_messages}` 条，"
             "冷却 `{cooldown_minutes}` 分钟，工具输出 `{tool_output_chars}` chars\n"
             "🧠 memory.md：`{memory_status}`\n"
         ),

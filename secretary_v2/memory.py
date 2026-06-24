@@ -346,10 +346,9 @@ class Database:
         beyond the budget are simply not loaded. The newest row is always
         included even if it alone exceeds the budget.
 
-        The SummarizationProcessor wired as a history_processor is the real
-        safety net — this budget only bounds how much we deserialize and feed
-        it. Rows without a pydantic_ai_msg payload (legacy plain-text rows, or
-        rows archived by /compact) are skipped.
+        Pre-run compaction is the real safety net — this budget only bounds how
+        much we deserialize and feed it. Rows without a pydantic_ai_msg payload
+        (legacy plain-text rows, or rows archived by /compact) are skipped.
         """
         if token_budget is None:
             token_budget = get_config().history.context_tokens
@@ -725,8 +724,8 @@ def _preview_for_message(msg: ModelMessage) -> str:
     return " | ".join(pieces)[:500]
 
 
-# Database singleton (so history_processor and other module-level callers
-# can reach the active db without re-opening the file)
+# Database singleton (so module-level callers can reach the active db without
+# re-opening the file)
 _db_instance: Optional[Database] = None
 
 

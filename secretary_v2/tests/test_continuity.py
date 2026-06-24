@@ -2,7 +2,7 @@
 
 1. message_history continuity (load + persist pydantic-ai messages)
 2. shell tool registered with proper guardrails
-3. history_processors wired into the Agent
+3. pre-run compaction happens before synthetic context assembly
 4. Scheduler resyncs runtime-created tasks from DB on restart
 
 These tests use Pydantic AI's TestModel so they don't burn API tokens.
@@ -508,12 +508,18 @@ async def test_load_skill_tool_loads_discovered_skill():
     assert "复盘" in loaded
 
 
-# ---- Fix #3: history_processors wired ----
+# ---- Fix #3: pre-run compaction ordering ----
 
 
-def test_history_processor_runs_before_synthetic_context_assembly():
+def test_pre_run_compaction_runs_before_synthetic_context_assembly():
     """Compaction must process persisted history, never synthetic clock layers."""
-    assert isinstance(runtime._history_processor, SummarizationProcessor)
+    import inspect
+
+    source = inspect.getsource(runtime.run_agent)
+    assert source.index("maybe_auto_persist_compact") < source.index(
+        "_build_context_layers"
+    )
+    assert not hasattr(runtime, "_history_processor")
     assert not runtime.agent.history_processors
 
 
@@ -744,6 +750,48 @@ async def test_force_compact_archives_and_replaces(fresh_db, fake_agent_run, mon
         and "## Trusted Runtime Context" not in getattr(p, "content", "")
         for p in parts
     ), "compaction must not persist app-managed clocks"
+
+
+@pytest.mark.asyncio
+async def test_auto_compaction_uses_single_threshold_and_persists(fresh_db, monkeypatch):
+    """Automatic compaction uses compress_threshold and rewrites active history."""
+    import compaction
+
+    cfg = compaction.get_config()
+    monkeypatch.setattr(cfg.history, "context_tokens", 10)
+    monkeypatch.setattr(cfg.history, "compress_threshold", 0.1)
+    monkeypatch.setattr(cfg.history, "auto_compact", True)
+    monkeypatch.setattr(cfg.history, "compact_min_active_messages", 4)
+    monkeypatch.setattr(cfg.history, "compact_cooldown_minutes", 0)
+    monkeypatch.setattr(compaction, "_last_auto_persist_compact_at", None)
+
+    def fake_processor(force=False):
+        return SummarizationProcessor(
+            model=TestModel(custom_output_text="[摘要] 自动压缩"),
+            trigger=("messages", 4),
+            keep=("messages", 1),
+            token_counter=compaction._count_tokens,
+            max_input_tokens=100000,
+        )
+
+    monkeypatch.setattr(compaction, "build_summarization_processor", fake_processor)
+
+    history = [
+        ModelRequest(parts=[UserPromptPart(content=f"历史消息 {i}")])
+        for i in range(4)
+    ]
+    fresh_db.save_pydantic_messages(history)
+
+    outcome = await compaction.maybe_auto_persist_compact(fresh_db, history=history)
+
+    assert outcome is not None
+    assert outcome.changed
+    after = fresh_db.load_pydantic_messages(token_budget=100000)
+    assert len(after) < len(history)
+    assert any(
+        "摘要" in getattr(part, "content", "")
+        for part in getattr(after[0], "parts", [])
+    )
 
 
 # ---- Fix #4: scheduler restart-survival ----

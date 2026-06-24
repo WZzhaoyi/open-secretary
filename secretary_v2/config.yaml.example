@@ -135,14 +135,13 @@ subagent:
 
 # History and compaction
 history:
-  context_tokens: 1000000
-  compress_threshold: 0.75
+  context_tokens: 256000
+  compress_threshold: 0.55
   tail_token_budget: 20000
   max_events: 10
-  auto_persist_compact: true
-  persist_compact_threshold: 0.85
-  persist_compact_min_active_messages: 80
-  persist_compact_cooldown_minutes: 120
+  auto_compact: true
+  compact_min_active_messages: 4
+  compact_cooldown_minutes: 30
   compact_tool_output_max_chars: 4000
 
 # Scheduled tasks use 5-field cron syntax in the configured timezone.

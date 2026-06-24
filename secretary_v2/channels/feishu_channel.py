@@ -429,10 +429,9 @@ class FeishuChannel(Channel):
             cache_status = t("telegram.status.no_run", lang)
 
         hist_cfg = cfg.history
-        temp_threshold = int(hist_cfg.context_tokens * hist_cfg.compress_threshold)
-        persist_threshold = int(hist_cfg.context_tokens * hist_cfg.persist_compact_threshold)
+        compact_threshold = int(hist_cfg.context_tokens * hist_cfg.compress_threshold)
         auto_compact_status = t(
-            "telegram.status.enabled" if hist_cfg.auto_persist_compact else "telegram.status.disabled",
+            "telegram.status.enabled" if hist_cfg.auto_compact else "telegram.status.disabled",
             lang,
         )
         channels_str = ", ".join(f"`{n}`" for n in self.peer_channel_names)
@@ -446,12 +445,11 @@ class FeishuChannel(Channel):
             history_count=history_count,
             usage_status=usage_status,
             cache_status=cache_status,
-            temp_threshold=temp_threshold,
-            persist_threshold=persist_threshold,
+            compact_threshold=compact_threshold,
             tail_budget=hist_cfg.tail_token_budget,
             auto_compact_status=auto_compact_status,
-            min_messages=hist_cfg.persist_compact_min_active_messages,
-            cooldown_minutes=hist_cfg.persist_compact_cooldown_minutes,
+            min_messages=hist_cfg.compact_min_active_messages,
+            cooldown_minutes=hist_cfg.compact_cooldown_minutes,
             tool_output_chars=hist_cfg.compact_tool_output_max_chars,
             memory_status=memory_status,
         )
