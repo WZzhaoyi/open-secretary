@@ -10,7 +10,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Deque, Optional, Tuple
 
-from .base import Channel, IncomingMessage
+from .base import Channel, IncomingMessage, is_no_action_response
 from i18n import resolve_ui_language, t
 
 logger = logging.getLogger(__name__)
@@ -349,6 +349,11 @@ class FeishuChannel(Channel):
 
         try:
             response = await self.message_handler(message)
+            if is_no_action_response(response):
+                logger.warning(
+                    "Suppressing internal NO_ACTION final response for Feishu user message"
+                )
+                return
             await self.send(response, chat_id)
         except Exception as e:
             logger.error(f"Error handling Feishu message: {e}")

@@ -152,6 +152,18 @@ def test_log_redaction_masks_telegram_bot_token():
     assert "bot123456:***67890/sendMessage" in redacted
 
 
+def test_no_action_marker_is_internal_channel_response():
+    from channels.base import is_no_action_response
+    from config import SECRETARY_PERSONA
+
+    assert is_no_action_response("NO_ACTION")
+    assert is_no_action_response("Final output: NO_ACTION")
+    assert not is_no_action_response("已记录。")
+    assert not is_no_action_response("NO_ACTION 是内部定时任务标记。")
+    assert "origin_channel` 为 `scheduled`" in SECRETARY_PERSONA
+    assert "不要用 `send_message` 回答当前用户消息" in SECRETARY_PERSONA
+
+
 @pytest.fixture
 def fresh_db(tmp_path):
     """Database with a unique file per test, no shared state."""

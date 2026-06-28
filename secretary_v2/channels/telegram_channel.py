@@ -12,7 +12,7 @@ from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
-from .base import Channel, IncomingMessage
+from .base import Channel, IncomingMessage, is_no_action_response
 from i18n import resolve_ui_language, t
 
 logger = logging.getLogger(__name__)
@@ -548,6 +548,12 @@ class TelegramChannel(Channel):
                 await typing_task
             except asyncio.CancelledError:
                 pass
+
+            if is_no_action_response(response):
+                logger.warning(
+                    "Suppressing internal NO_ACTION final response for Telegram user message"
+                )
+                return
 
             # Send response
             await self.send(response, chat_id)

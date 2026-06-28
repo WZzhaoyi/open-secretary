@@ -3,7 +3,16 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Dict, Any, Optional
+
+
+def is_no_action_response(text: Optional[str]) -> bool:
+    """Return True when the agent returned the internal NO_ACTION marker."""
+    if not text:
+        return False
+    normalized = text.strip().replace("`", "")
+    return bool(re.fullmatch(r"(?is)(?:final output:\s*)?NO_ACTION\.?", normalized))
 
 
 @dataclass

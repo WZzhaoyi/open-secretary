@@ -4,7 +4,7 @@ import asyncio
 import sys
 from typing import Optional, Callable, Awaitable
 
-from .base import Channel, IncomingMessage
+from .base import Channel, IncomingMessage, is_no_action_response
 
 
 class CLIChannel(Channel):
@@ -51,6 +51,8 @@ class CLIChannel(Channel):
 
         try:
             response = await self.message_handler(message)
+            if is_no_action_response(response):
+                return
             await self.send(response)
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -87,6 +89,8 @@ class CLIChannel(Channel):
                 # Handle message
                 try:
                     response = await self.message_handler(message)
+                    if is_no_action_response(response):
+                        continue
                     await self.send(response)
                 except Exception as e:
                     print(f"Error: {e}", file=sys.stderr)
