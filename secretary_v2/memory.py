@@ -20,6 +20,7 @@ import tiktoken
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
+    ModelRequest,
     ModelResponse,
     ThinkingPart,
 )
@@ -74,16 +75,97 @@ def _strip_thinking_from_response(msg: ModelResponse) -> Optional[ModelResponse]
     return cleaned
 
 
-def sanitize_pydantic_messages_for_history(
+def _tool_call_ids(msg: ModelResponse) -> List[str]:
+    return [
+        tool_call_id
+        for part in msg.parts
+        if getattr(part, "part_kind", "") == "tool-call"
+        for tool_call_id in [getattr(part, "tool_call_id", None)]
+        if tool_call_id
+    ]
+
+
+def _tool_return_ids(msg: ModelRequest) -> List[str]:
+    return [
+        tool_call_id
+        for part in msg.parts
+        if getattr(part, "part_kind", "") == "tool-return"
+        for tool_call_id in [getattr(part, "tool_call_id", None)]
+        if tool_call_id
+    ]
+
+
+def _strip_tool_returns(msg: ModelRequest) -> Optional[ModelRequest]:
+    parts = [part for part in msg.parts if getattr(part, "part_kind", "") != "tool-return"]
+    if not parts:
+        return None
+    return msg if len(parts) == len(msg.parts) else replace(msg, parts=parts)
+
+
+def _drop_incomplete_tool_call_sequences(
     messages: List[ModelMessage],
 ) -> List[ModelMessage]:
-    """Return only model messages safe to persist and replay as history.
+    """Drop history fragments that violate OpenAI tool-call adjacency rules."""
+    result: List[ModelMessage] = []
+    pending_ids: set[str] = set()
+    pending_messages: List[ModelMessage] = []
 
-    DeepSeek/OpenAI-compatible chat history cannot contain an assistant message
-    that has reasoning/thinking but no visible content or tool_calls. We also
-    avoid persisting thinking parts in otherwise valid responses so historical
-    replay stays provider-portable and cannot regress into content=None turns.
-    """
+    def drop_pending(reason: str) -> None:
+        if pending_messages:
+            logger.warning(
+                "Dropping incomplete tool-call history (%s): pending_tool_call_ids=%s",
+                reason,
+                sorted(pending_ids),
+            )
+        pending_ids.clear()
+        pending_messages.clear()
+
+    for msg in messages:
+        if pending_ids:
+            if isinstance(msg, ModelRequest):
+                returns = set(_tool_return_ids(msg))
+                if returns:
+                    pending_messages.append(msg)
+                    pending_ids.difference_update(returns)
+                    if not pending_ids:
+                        result.extend(pending_messages)
+                        pending_messages.clear()
+                    continue
+
+                drop_pending("next request had no tool return")
+                stripped = _strip_tool_returns(msg)
+                if stripped is not None:
+                    result.append(stripped)
+                continue
+
+            drop_pending("next message was not a tool return")
+
+        if isinstance(msg, ModelResponse):
+            call_ids = set(_tool_call_ids(msg))
+            if call_ids:
+                pending_ids = call_ids
+                pending_messages = [msg]
+            else:
+                result.append(msg)
+            continue
+
+        if isinstance(msg, ModelRequest):
+            stripped = _strip_tool_returns(msg)
+            if stripped is not None:
+                result.append(stripped)
+            elif _tool_return_ids(msg):
+                logger.warning("Dropping orphan tool-return history message")
+            continue
+
+        result.append(msg)
+
+    drop_pending("end of history")
+    return result
+
+
+def _strip_non_replayable_messages(
+    messages: List[ModelMessage],
+) -> List[ModelMessage]:
     sanitized: List[ModelMessage] = []
     for msg in messages:
         if isinstance(msg, ModelResponse):
@@ -100,6 +182,25 @@ def sanitize_pydantic_messages_for_history(
     return sanitized
 
 
+def sanitize_pydantic_messages_for_history(
+    messages: List[ModelMessage],
+) -> List[ModelMessage]:
+    """Return only model messages safe to persist and replay as history.
+
+    DeepSeek/OpenAI-compatible chat history cannot contain an assistant message
+    that has reasoning/thinking but no visible content or tool_calls. We also
+    avoid persisting thinking parts in otherwise valid responses so historical
+    replay stays provider-portable and cannot regress into content=None turns.
+
+    OpenAI-compatible history also requires every assistant tool-call response
+    to be followed by tool-return messages for all tool_call_id values before
+    the next assistant response. Legacy SQLite rows can lose one side of that
+    pair, so we drop incomplete fragments instead of replaying invalid history.
+    """
+    sanitized = _strip_non_replayable_messages(messages)
+    return _drop_incomplete_tool_call_sequences(sanitized)
+
+
 class Event(Base):
     """事件记录表 - Compatible with original schema."""
     __tablename__ = "events"
@@ -109,6 +210,10 @@ class Event(Base):
     status = Column(String, nullable=False, default="logged", server_default="logged")
     content = Column(Text)
     created_at = Column(DateTime, default=_utcnow)
+    source_channel = Column(String, nullable=True)
+    session_key = Column(String, nullable=True, index=True)
+    source_message_id = Column(String, nullable=True)
+    metadata_json = Column(Text, nullable=True)
 
 
 class Message(Base):
@@ -123,6 +228,14 @@ class Message(Base):
     tokens_out = Column(Integer, default=0)
     created_at = Column(DateTime, default=_utcnow)
     pydantic_ai_msg = Column(BLOB, nullable=True)  # 序列化的 Pydantic AI 消息
+    agent_id = Column(String, nullable=True, default="secretary", index=True)
+    session_key = Column(String, nullable=True, index=True)
+    channel = Column(String, nullable=True)
+    conversation_id = Column(String, nullable=True)
+    thread_id = Column(String, nullable=True)
+    sender_id = Column(String, nullable=True)
+    reply_to_id = Column(String, nullable=True)
+    metadata_json = Column(Text, nullable=True)
 
 
 class ScheduledTask(Base):
@@ -206,6 +319,39 @@ class Database:
         """Initialize database tables."""
         Base.metadata.create_all(self.engine)
         self._ensure_event_status_column()
+        self._ensure_columns(
+            "events",
+            {
+                "source_channel": "TEXT",
+                "session_key": "TEXT",
+                "source_message_id": "TEXT",
+                "metadata_json": "TEXT",
+            },
+        )
+        self._ensure_columns(
+            "messages",
+            {
+                "agent_id": "TEXT DEFAULT 'secretary'",
+                "session_key": "TEXT",
+                "channel": "TEXT",
+                "conversation_id": "TEXT",
+                "thread_id": "TEXT",
+                "sender_id": "TEXT",
+                "reply_to_id": "TEXT",
+                "metadata_json": "TEXT",
+            },
+        )
+
+    def _ensure_columns(self, table: str, columns: Dict[str, str]) -> None:
+        """Add missing SQLite columns for existing local databases."""
+        with self.engine.begin() as conn:
+            existing = {
+                row._mapping["name"]
+                for row in conn.execute(text(f"PRAGMA table_info({table})"))
+            }
+            for name, ddl_type in columns.items():
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}"))
 
     def _ensure_event_status_column(self) -> None:
         """Backfill schema for existing SQLite databases.
@@ -233,14 +379,31 @@ class Database:
 
     # Event operations
     def create_event(
-        self, event_type: str, content: str, status: str = "logged"
+        self,
+        event_type: str,
+        content: str,
+        status: str = "logged",
+        *,
+        source_channel: Optional[str] = None,
+        session_key: Optional[str] = None,
+        source_message_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Event:
         """Create a new event."""
+        metadata_json = (
+            json.dumps(metadata, ensure_ascii=False, default=str)
+            if metadata is not None
+            else None
+        )
         with self.get_session() as session:
             event = Event(
                 type=event_type,
                 status=status,
                 content=content,
+                source_channel=source_channel,
+                session_key=session_key,
+                source_message_id=source_message_id,
+                metadata_json=metadata_json,
             )
             session.add(event)
             session.commit()
@@ -311,6 +474,15 @@ class Database:
         self,
         messages: List[ModelMessage],
         preview_text: Optional[str] = None,
+        *,
+        agent_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        channel: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        sender_id: Optional[str] = None,
+        reply_to_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Persist a batch of Pydantic AI messages from one agent run.
 
@@ -321,6 +493,11 @@ class Database:
         messages = sanitize_pydantic_messages_for_history(messages)
         if not messages:
             return
+        metadata_json = (
+            json.dumps(metadata, ensure_ascii=False, default=str)
+            if metadata is not None
+            else None
+        )
         with self.get_session() as session:
             for msg in messages:
                 blob = bytes(ModelMessagesTypeAdapter.dump_json([msg]))
@@ -331,12 +508,25 @@ class Database:
                         source=source,
                         content=preview[:500] if preview else "",
                         pydantic_ai_msg=blob,
+                        agent_id=agent_id,
+                        session_key=session_key,
+                        channel=channel,
+                        conversation_id=conversation_id,
+                        thread_id=thread_id,
+                        sender_id=sender_id,
+                        reply_to_id=reply_to_id,
+                        metadata_json=metadata_json,
                     )
                 )
             session.commit()
 
     def load_pydantic_messages(
-        self, token_budget: Optional[int] = None, batch_size: int = 100
+        self,
+        token_budget: Optional[int] = None,
+        batch_size: int = 100,
+        *,
+        session_key: Optional[str] = None,
+        include_legacy: bool = True,
     ) -> List[ModelMessage]:
         """Load recent pydantic-ai messages newest-first up to a token budget.
 
@@ -359,10 +549,19 @@ class Database:
 
         with self.get_session() as session:
             while True:
+                query = session.query(Message.id, Message.pydantic_ai_msg).filter(
+                    Message.pydantic_ai_msg.isnot(None)
+                )
+                if session_key is not None:
+                    if include_legacy:
+                        query = query.filter(
+                            (Message.session_key == session_key)
+                            | (Message.session_key.is_(None))
+                        )
+                    else:
+                        query = query.filter(Message.session_key == session_key)
                 rows = (
-                    session.query(Message.id, Message.pydantic_ai_msg)
-                    .filter(Message.pydantic_ai_msg.isnot(None))
-                    .order_by(Message.id.desc())
+                    query.order_by(Message.id.desc())
                     .offset(offset)
                     .limit(batch_size)
                     .all()
@@ -377,7 +576,7 @@ class Database:
                     except Exception as e:
                         logger.warning(f"Failed to deserialize message id={row.id}: {e}")
                         continue
-                    msgs = sanitize_pydantic_messages_for_history(msgs)
+                    msgs = _strip_non_replayable_messages(msgs)
                     if not msgs:
                         logger.warning(
                             "Skipping non-actionable serialized message id=%s",
@@ -399,7 +598,7 @@ class Database:
         result: List[ModelMessage] = []
         for msgs in selected:
             result.extend(msgs)
-        return result
+        return sanitize_pydantic_messages_for_history(result)
 
     def archive_invalid_pydantic_messages(self) -> int:
         """Sanitize active history blobs and archive rows that cannot be replayed.
@@ -426,7 +625,7 @@ class Database:
                     changed += 1
                     continue
 
-                sanitized = sanitize_pydantic_messages_for_history(msgs)
+                sanitized = _strip_non_replayable_messages(msgs)
                 if not sanitized:
                     row.pydantic_ai_msg = None
                     changed += 1
@@ -457,18 +656,24 @@ class Database:
             session.commit()
             return count
 
-    def archive_all_pydantic_messages(self) -> int:
+    def archive_all_pydantic_messages(
+        self, session_key: Optional[str] = None, include_legacy: bool = True
+    ) -> int:
         """Null out the BLOB for every active pydantic_ai_msg row.
 
         Used by /compact when we replace the entire conversation snapshot with
         [summary, *tail]. Returns the number of rows archived.
         """
         with self.get_session() as session:
-            count = (
-                session.query(Message)
-                .filter(Message.pydantic_ai_msg.isnot(None))
-                .update({Message.pydantic_ai_msg: None}, synchronize_session=False)
-            )
+            query = session.query(Message).filter(Message.pydantic_ai_msg.isnot(None))
+            if session_key is not None:
+                if include_legacy:
+                    query = query.filter(
+                        (Message.session_key == session_key) | (Message.session_key.is_(None))
+                    )
+                else:
+                    query = query.filter(Message.session_key == session_key)
+            count = query.update({Message.pydantic_ai_msg: None}, synchronize_session=False)
             session.commit()
             return count
 

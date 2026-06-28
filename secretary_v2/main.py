@@ -148,6 +148,7 @@ class SecretaryApp:
                 token=self.config.channels.http.token,
                 message_handler=self._handle_user_message,
                 response_channel=self._resolve_webhook_response_channel,
+                event_recorder=self.db.create_event,
             )
 
     def _resolve_webhook_response_channel(self):
@@ -233,11 +234,13 @@ class SecretaryApp:
             response = await run_agent(
                 user_text=message.text,
                 db=self.db,
+                agent_id=message.agent_id,
                 origin_channel=message.channel,
                 user_id=message.user_id,
                 conversation_id=message.conversation_id,
                 reply_to_id=message.reply_to_id,
                 thread_id=message.thread_id,
+                message_metadata=message.metadata,
                 skill_content=skill_content,
                 channels=self.channels,
                 scheduler=self.scheduler,
@@ -275,8 +278,10 @@ class SecretaryApp:
             return await run_agent(
                 user_text=message.text,
                 db=self.db,
+                agent_id=message.agent_id,
                 origin_channel="scheduled",
                 user_id="scheduler",
+                message_metadata=message.metadata,
                 skill_content=self._collect_skill_content(message.text),
                 channels=self.channels,
                 scheduler=self.scheduler,

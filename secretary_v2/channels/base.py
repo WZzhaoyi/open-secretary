@@ -27,6 +27,7 @@ class IncomingMessage:
     text: str
     channel: str  # "telegram" | "feishu" | "cli" | "http" | "scheduled"
     user_id: str
+    agent_id: str = "secretary"
     conversation_id: Optional[str] = None
     reply_to_id: Optional[str] = None
     thread_id: Optional[str] = None

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import re
+import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Deque, Optional, Tuple
+from urllib.parse import quote
 
 from .base import Channel, IncomingMessage, is_no_action_response
 from i18n import resolve_ui_language, t
@@ -68,6 +72,7 @@ class FeishuChannel(Channel):
         peer_channel_names: Optional[list[str]] = None,
         outbox_capacity: int = 100,
         sdk_channel_factory: Optional[Callable[..., Any]] = None,
+        http_client_factory: Optional[Callable[[], Any]] = None,
     ):
         self.app_id = app_id
         self.app_secret = app_secret
@@ -82,12 +87,15 @@ class FeishuChannel(Channel):
         self.allow_sender_ids = set(allow_sender_ids or [])
         self.peer_channel_names = list(peer_channel_names or ["feishu"])
         self._sdk_channel_factory = sdk_channel_factory
+        self._http_client_factory = http_client_factory
         self._sdk_channel: Any = None
         self._running = False
         self._ready = False
         self._outbox: Deque[Tuple[str, str]] = deque(maxlen=outbox_capacity)
         self._file_outbox: Deque[Tuple[str, str, Optional[str]]] = deque(maxlen=outbox_capacity)
         self._drain_lock = asyncio.Lock()
+        self._tenant_access_token: Optional[str] = None
+        self._tenant_access_token_expires_at = 0.0
 
     async def start(self) -> None:
         """Start the Feishu channel.
@@ -283,6 +291,118 @@ class FeishuChannel(Channel):
             fallback = f"{caption or 'File send failed'}\n\nReport file: `{path}`"
             await self.send(fallback, target_chat_id)
 
+    async def _add_message_reaction(
+        self,
+        message_id: Optional[str],
+        emoji_type: str = "THUMBSUP",
+    ) -> bool:
+        if not message_id:
+            return False
+        try:
+            await self._feishu_api_post(
+                f"/open-apis/im/v1/messages/{quote(str(message_id), safe='')}/reactions",
+                {"reaction_type": {"emoji_type": emoji_type}},
+            )
+            return True
+        except Exception as err:
+            logger.warning(f"Feishu reaction skipped for {message_id}: {err}")
+            return False
+
+    async def _reply_to_message(self, text: str, message_id: Optional[str]) -> bool:
+        if not message_id:
+            return False
+
+        chunks = self._split_message(text, 4000)
+        try:
+            for chunk in chunks:
+                plain_chunk = _plain_text_for_feishu(chunk)
+                content = json.dumps({"text": plain_chunk}, ensure_ascii=False)
+                await self._feishu_api_post(
+                    f"/open-apis/im/v1/messages/{quote(str(message_id), safe='')}/reply",
+                    {
+                        "msg_type": "text",
+                        "content": content,
+                        "uuid": str(uuid.uuid4()),
+                    },
+                )
+            return True
+        except Exception as err:
+            logger.warning(
+                f"Feishu reply failed for {message_id}; falling back to send: {err}"
+            )
+            return False
+
+    async def _feishu_api_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        token = await self._get_tenant_access_token()
+        return await self._post_json(
+            path,
+            payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    async def _get_tenant_access_token(self) -> str:
+        now = time.monotonic()
+        if self._tenant_access_token and now < self._tenant_access_token_expires_at:
+            return self._tenant_access_token
+
+        data = await self._post_json(
+            "/open-apis/auth/v3/tenant_access_token/internal",
+            {"app_id": self.app_id, "app_secret": self.app_secret},
+            headers={},
+        )
+        token = data.get("tenant_access_token")
+        if not token:
+            raise RuntimeError("Feishu tenant_access_token missing from response")
+        try:
+            expires_in = int(data.get("expire", 7200))
+        except (TypeError, ValueError):
+            expires_in = 7200
+        self._tenant_access_token = str(token)
+        self._tenant_access_token_expires_at = now + max(expires_in - 300, 60)
+        return self._tenant_access_token
+
+    async def _post_json(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        if self._http_client_factory is None and not self._has_live_lark_sdk_channel():
+            raise RuntimeError("Feishu REST API requires a live lark-oapi channel")
+
+        client = None
+        close_client = False
+        try:
+            if self._http_client_factory is not None:
+                client = self._http_client_factory()
+            else:
+                import httpx
+
+                client = httpx.AsyncClient(base_url=self.domain, timeout=10)
+                close_client = True
+
+            request_headers = {"Content-Type": "application/json; charset=utf-8"}
+            request_headers.update(headers)
+            response = await client.post(path, json=payload, headers=request_headers)
+            if isinstance(response, dict):
+                data = response
+            else:
+                response.raise_for_status()
+                data = response.json()
+            code = data.get("code", 0)
+            if code != 0:
+                raise RuntimeError(data.get("msg") or data)
+            return data
+        finally:
+            if close_client and client is not None:
+                await client.aclose()
+
+    def _has_live_lark_sdk_channel(self) -> bool:
+        if self._sdk_channel is None:
+            return False
+        module = self._sdk_channel.__class__.__module__
+        return module.startswith("lark_oapi")
+
     async def _drain_outbox(self) -> int:
         async with self._drain_lock:
             if (not self._outbox and not self._file_outbox) or not self._is_ready():
@@ -331,16 +451,19 @@ class FeishuChannel(Channel):
             await self._handle_command(command, chat_id)
             return
 
+        source_message_id = getattr(msg, "message_id", None)
+        await self._add_message_reaction(source_message_id, "THUMBSUP")
+
         message = IncomingMessage(
             text=text,
             channel="feishu",
             user_id=sender_id,
             conversation_id=chat_id,
-            reply_to_id=getattr(msg, "message_id", None),
+            reply_to_id=source_message_id,
             thread_id=getattr(getattr(msg, "conversation", None), "thread_id", None),
             metadata={
                 "chat_id": chat_id,
-                "message_id": getattr(msg, "message_id", None),
+                "message_id": source_message_id,
                 "sender_id": sender_id,
                 "sender_name": getattr(msg, "sender_name", None),
                 "chat_type": getattr(msg, "chat_type", None),
@@ -354,10 +477,14 @@ class FeishuChannel(Channel):
                     "Suppressing internal NO_ACTION final response for Feishu user message"
                 )
                 return
+            if await self._reply_to_message(response, source_message_id):
+                return
             await self.send(response, chat_id)
         except Exception as e:
             logger.error(f"Error handling Feishu message: {e}")
-            await self.send(t("telegram.message.error", self._ui_lang()), chat_id)
+            error_text = t("telegram.message.error", self._ui_lang())
+            if not await self._reply_to_message(error_text, source_message_id):
+                await self.send(error_text, chat_id)
 
     async def _handle_command(self, command: str, chat_id: str) -> None:
         if command == "start":
@@ -482,7 +609,14 @@ class FeishuChannel(Channel):
         lang = self._ui_lang()
         await self.send(t("telegram.compact.running", lang), chat_id)
         try:
-            result = await force_compact(get_db())
+            from runtime import build_session_key
+
+            session_key = build_session_key(
+                channel="feishu",
+                user_id=chat_id,
+                conversation_id=chat_id,
+            )
+            result = await force_compact(get_db(), session_key=session_key)
         except Exception as e:
             logger.error(f"Feishu /compact failed: {e}")
             await self.send(t("telegram.compact.failed", lang, error=e), chat_id)

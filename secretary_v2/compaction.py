@@ -309,13 +309,13 @@ def _summary_failed(compacted) -> bool:
     return False
 
 
-async def force_compact(db) -> str:
+async def force_compact(db, session_key: Optional[str] = None) -> str:
     """User-triggered /compact: summarize history and rewrite the DB snapshot.
 
     Archives the rolled-up rows and persists [summary, *tail] so subsequent
     runs load the compacted state directly. Returns a human-readable status.
     """
-    history = db.load_pydantic_messages()
+    history = db.load_pydantic_messages(session_key=session_key)
     if len(history) < 4:
         return "Not enough conversation history to compact"
 
@@ -328,7 +328,7 @@ async def force_compact(db) -> str:
         return "Recent history is already within budget; no compaction needed"
 
     try:
-        archived = persist_compacted_snapshot(db, outcome)
+        archived = persist_compacted_snapshot(db, outcome, session_key=session_key)
     except Exception as e:
         logger.error(f"[force_compact] persistence failed: {e}")
         return f"Compaction partially completed; summary was generated but persistence failed: {e}"
@@ -347,18 +347,23 @@ async def force_compact(db) -> str:
     )
 
 
-def persist_compacted_snapshot(db, outcome: CompactOutcome) -> int:
+def persist_compacted_snapshot(
+    db,
+    outcome: CompactOutcome,
+    session_key: Optional[str] = None,
+) -> int:
     """Archive active history and save the compacted snapshot."""
     if outcome.failed or not outcome.changed:
         return 0
-    archived = db.archive_all_pydantic_messages()
-    db.save_pydantic_messages(outcome.compacted)
+    archived = db.archive_all_pydantic_messages(session_key=session_key)
+    db.save_pydantic_messages(outcome.compacted, session_key=session_key)
     return archived
 
 
 async def maybe_auto_persist_compact(
     db,
     history: Optional[list[ModelMessage]] = None,
+    session_key: Optional[str] = None,
 ) -> Optional[CompactOutcome]:
     """Persist a compacted snapshot when active history crosses one threshold."""
     global _last_auto_persist_compact_at
@@ -376,7 +381,7 @@ async def maybe_auto_persist_compact(
         return None
 
     if history is None:
-        history = db.load_pydantic_messages()
+        history = db.load_pydantic_messages(session_key=session_key)
     if len(history) < cfg.compact_min_active_messages:
         return None
 
@@ -392,7 +397,7 @@ async def maybe_auto_persist_compact(
     if not outcome.changed:
         return outcome
 
-    archived = persist_compacted_snapshot(db, outcome)
+    archived = persist_compacted_snapshot(db, outcome, session_key=session_key)
     _last_auto_persist_compact_at = now
     logger.info(
         "[auto_compact] archived=%s messages=%s->%s tokens=%s->%s",

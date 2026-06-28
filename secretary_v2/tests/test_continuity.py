@@ -20,6 +20,7 @@ from pydantic_ai.messages import (
     SystemPromptPart,
     TextPart,
     ThinkingPart,
+    ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
@@ -280,6 +281,96 @@ async def test_two_turns_share_history(fresh_db, fake_agent_run):
     assert found_first_prompt, "first turn user prompt should survive in reloaded history"
 
 
+@pytest.mark.asyncio
+async def test_run_agent_isolates_history_by_session_key(fresh_db, monkeypatch):
+    captured = []
+
+    async def _fake_run(user_text, *args, **kwargs):
+        captured.append(kwargs["message_history"])
+        return FakeRunResult(user_text, "ok")
+
+    monkeypatch.setattr(runtime.agent, "run", _fake_run)
+
+    await run_agent(
+        "alpha session only",
+        db=fresh_db,
+        origin_channel="telegram",
+        user_id="sender-a",
+        conversation_id="chat-a",
+    )
+    await run_agent(
+        "beta session",
+        db=fresh_db,
+        origin_channel="telegram",
+        user_id="sender-b",
+        conversation_id="chat-b",
+    )
+
+    assert "alpha session only" not in str(captured[1])
+    alpha_key = runtime.build_session_key(
+        channel="telegram", user_id="sender-a", conversation_id="chat-a"
+    )
+    beta_key = runtime.build_session_key(
+        channel="telegram", user_id="sender-b", conversation_id="chat-b"
+    )
+    assert "alpha session only" in str(
+        fresh_db.load_pydantic_messages(session_key=alpha_key, include_legacy=False)
+    )
+    assert "beta session" in str(
+        fresh_db.load_pydantic_messages(session_key=beta_key, include_legacy=False)
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_uses_legacy_history_only_for_empty_session(fresh_db, monkeypatch):
+    captured = []
+    fresh_db.save_pydantic_messages(
+        [ModelRequest(parts=[UserPromptPart(content="legacy global context")])]
+    )
+
+    async def _fake_run(user_text, *args, **kwargs):
+        captured.append(kwargs["message_history"])
+        return FakeRunResult(user_text, "ok")
+
+    monkeypatch.setattr(runtime.agent, "run", _fake_run)
+    kwargs = {
+        "db": fresh_db,
+        "origin_channel": "telegram",
+        "user_id": "sender-a",
+        "conversation_id": "chat-a",
+    }
+    await run_agent("first isolated turn", **kwargs)
+    await run_agent("second isolated turn", **kwargs)
+
+    assert "legacy global context" in str(captured[0])
+    assert "legacy global context" not in str(captured[1])
+    assert "first isolated turn" in str(captured[1])
+
+
+@pytest.mark.asyncio
+async def test_run_agent_self_test_skips_legacy_history(fresh_db, monkeypatch):
+    captured = []
+    fresh_db.save_pydantic_messages(
+        [ModelRequest(parts=[UserPromptPart(content="legacy global context")])]
+    )
+
+    async def _fake_run(user_text, *args, **kwargs):
+        captured.append(kwargs["message_history"])
+        return FakeRunResult(user_text, "OK")
+
+    monkeypatch.setattr(runtime.agent, "run", _fake_run)
+
+    reply = await run_agent(
+        "Diagnostic ping. Reply only with OK and do not call any tools.",
+        db=fresh_db,
+        origin_channel="self_test",
+        user_id="self_test",
+    )
+
+    assert reply == "OK"
+    assert "legacy global context" not in str(captured[0])
+
+
 def test_cache_optimized_history_puts_runtime_after_replayed_history():
     summary = ModelRequest(
         parts=[
@@ -447,6 +538,70 @@ def test_archive_invalid_pydantic_messages_nulls_bad_blob(fresh_db):
     assert stored.pydantic_ai_msg is None
 
 
+def test_load_pydantic_messages_drops_incomplete_tool_call_chain(fresh_db):
+    tool_call = ModelResponse(
+        parts=[
+            ToolCallPart(
+                tool_name="db_query",
+                args={"sql": "select 1"},
+                tool_call_id="call_missing",
+            )
+        ]
+    )
+    final_text = ModelResponse(parts=[TextPart(content="final answer")])
+
+    fresh_db.save_message(
+        "response",
+        "",
+        pydantic_ai_msg=bytes(ModelMessagesTypeAdapter.dump_json([tool_call])),
+    )
+    fresh_db.save_message("request", "human-readable tool result without blob")
+    fresh_db.save_message(
+        "response",
+        "final answer",
+        pydantic_ai_msg=bytes(ModelMessagesTypeAdapter.dump_json([final_text])),
+    )
+
+    loaded = fresh_db.load_pydantic_messages()
+
+    assert len(loaded) == 1
+    assert isinstance(loaded[0], ModelResponse)
+    assert loaded[0].parts[0].content == "final answer"
+
+
+def test_load_pydantic_messages_keeps_complete_tool_call_chain(fresh_db):
+    fresh_db.save_pydantic_messages(
+        [
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="db_query",
+                        args={"sql": "select 1"},
+                        tool_call_id="call_ok",
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="db_query",
+                        content="[(1,)]",
+                        tool_call_id="call_ok",
+                    )
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content="final answer")]),
+        ]
+    )
+
+    loaded = fresh_db.load_pydantic_messages()
+
+    assert [msg.kind for msg in loaded] == ["response", "request", "response"]
+    assert loaded[0].parts[0].part_kind == "tool-call"
+    assert loaded[1].parts[0].part_kind == "tool-return"
+    assert loaded[2].parts[0].content == "final answer"
+
+
 @pytest.mark.asyncio
 async def test_run_agent_treats_thinking_only_no_action_as_no_action(fresh_db, monkeypatch):
     """A NO_ACTION hidden in reasoning must not be replaced by recovered stale text."""
@@ -508,6 +663,7 @@ def test_memory_tools_registered():
     """Long-term memory should have dedicated tools, not rely on generic file_write."""
     tool_names = list(runtime.agent._function_toolset.tools.keys())
     assert "load_skill" in tool_names
+    assert "record_event" in tool_names
     assert "memory_read" in tool_names
     assert "memory_update" in tool_names
 
@@ -972,6 +1128,30 @@ async def test_dynamic_context_keeps_stable_prefix_before_runtime_tail(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_dynamic_context_warns_recorded_webhook_not_to_duplicate_event():
+    from runtime import dynamic_context, SecretaryDeps
+
+    deps = SecretaryDeps(
+        db=Database(db_path=":memory:"),
+        origin_channel="http",
+        message_metadata={"record": "logged", "webhook_run_id": "hook_test"},
+    )
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    text = await dynamic_context(_Ctx(deps))
+
+    assert "Webhook Record Notice" in text
+    assert "already been recorded verbatim in `events`" in text
+    assert "status='logged'" in text
+    assert "summarize, restate, reclassify" in text
+    assert "cross-channel visibility" in text
+    assert "distinct actionable follow-up" in text
+
+
+@pytest.mark.asyncio
 async def test_dynamic_context_omits_resolved_events_from_recent_window(monkeypatch):
     from config import get_config
     from runtime import dynamic_context, SecretaryDeps
@@ -1219,6 +1399,41 @@ async def test_db_execute_rejects_event_weekday_mismatch(fresh_db):
     ]
     assert events
     assert events[0].subject == "db_execute:events"
+
+
+@pytest.mark.asyncio
+async def test_record_event_persists_source_metadata(fresh_db):
+    from runtime import SecretaryDeps, record_event
+
+    deps = SecretaryDeps(
+        db=fresh_db,
+        origin_channel="telegram",
+        user_id="sender-123",
+        conversation_id="-100987",
+        reply_to_id="msg-42",
+        thread_id="topic-7",
+        session_key="agent:secretary:telegram:conversation:-100987:thread:topic-7",
+        message_metadata={"chat_type": "supergroup"},
+    )
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await record_event(
+        _Ctx(deps),
+        "remind",
+        "明天复盘 OpenClaw 方案",
+        status="open",
+    )
+
+    assert "Event recorded" in result
+    event = fresh_db.get_events()[0]
+    assert event.source_channel == "telegram"
+    assert event.session_key == deps.session_key
+    assert event.source_message_id == "msg-42"
+    assert "sender-123" in event.metadata_json
+    assert "topic-7" in event.metadata_json
 
 
 @pytest.mark.asyncio
@@ -1554,6 +1769,133 @@ async def test_feishu_inbound_message_uses_chat_id_as_routable_user_id():
     assert seen[0].metadata["sender_id"] == "ou_user"
 
 
+@pytest.mark.asyncio
+async def test_feishu_inbound_message_reacts_then_replies_to_source_message():
+    from channels.feishu_channel import FeishuChannel
+
+    async def _handler(_msg):
+        return "**done**"
+
+    calls = []
+
+    class FakeHttpResponse:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._data
+
+    class FakeHttpClient:
+        async def post(self, path, json, headers):
+            calls.append((path, json, headers))
+            if path == "/open-apis/auth/v3/tenant_access_token/internal":
+                return FakeHttpResponse(
+                    {"code": 0, "tenant_access_token": "t-token", "expire": 7200}
+                )
+            return FakeHttpResponse({"code": 0, "msg": "ok"})
+
+    class FakeSdkChannel:
+        async def send(self, *args):
+            raise AssertionError(f"unexpected fallback send: {args}")
+
+    class FakeInbound:
+        content_text = "hello"
+        chat_id = "oc_chat"
+        chat_type = "p2p"
+        sender_id = "ou_user"
+        sender_name = "User"
+        message_id = "om_msg"
+        mentioned_bot = False
+
+    chan = FeishuChannel(
+        app_id="cli_x",
+        app_secret="secret",
+        default_chat_id="oc_default",
+        message_handler=_handler,
+        http_client_factory=FakeHttpClient,
+    )
+    chan._running = True
+    chan._ready = True
+    chan._sdk_channel = FakeSdkChannel()
+
+    await chan._handle_message(FakeInbound())
+
+    assert calls[0][0] == "/open-apis/auth/v3/tenant_access_token/internal"
+    assert calls[1][0] == "/open-apis/im/v1/messages/om_msg/reactions"
+    assert calls[1][1] == {"reaction_type": {"emoji_type": "THUMBSUP"}}
+    assert calls[2][0] == "/open-apis/im/v1/messages/om_msg/reply"
+    assert calls[2][1]["msg_type"] == "text"
+    assert calls[2][1]["content"] == '{"text": "done"}'
+    assert calls[2][2]["Authorization"] == "Bearer t-token"
+
+
+@pytest.mark.asyncio
+async def test_feishu_inbound_message_falls_back_to_send_when_reply_fails():
+    from channels.feishu_channel import FeishuChannel
+
+    async def _handler(_msg):
+        return "ok"
+
+    sent = []
+
+    class FakeHttpResponse:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._data
+
+    class FakeHttpClient:
+        async def post(self, path, json, headers):
+            if path == "/open-apis/auth/v3/tenant_access_token/internal":
+                return FakeHttpResponse(
+                    {"code": 0, "tenant_access_token": "t-token", "expire": 7200}
+                )
+            if path.endswith("/reply"):
+                return FakeHttpResponse({"code": 230050, "msg": "not visible"})
+            return FakeHttpResponse({"code": 0, "msg": "ok"})
+
+    class FakeSdkChannel:
+        async def send(self, *args):
+            sent.append(args)
+
+    class FakeInbound:
+        content_text = "hello"
+        chat_id = "oc_chat"
+        chat_type = "p2p"
+        sender_id = "ou_user"
+        sender_name = "User"
+        message_id = "om_msg"
+        mentioned_bot = False
+
+    chan = FeishuChannel(
+        app_id="cli_x",
+        app_secret="secret",
+        default_chat_id="oc_default",
+        message_handler=_handler,
+        http_client_factory=FakeHttpClient,
+    )
+    chan._running = True
+    chan._ready = True
+    chan._sdk_channel = FakeSdkChannel()
+
+    await chan._handle_message(FakeInbound())
+
+    assert sent == [
+        (
+            "oc_chat",
+            {"text": "ok"},
+            {"receive_id_type": "chat_id"},
+        )
+    ]
+
+
 def test_webhook_response_channel_prefers_configured_default_outgoing():
     from main import SecretaryApp
 
@@ -1610,6 +1952,165 @@ def test_webhook_response_channel_falls_back_to_recent_chat_channel():
 
     app._remember_chat_channel("feishu")
     assert app._resolve_webhook_response_channel() is app.channels["feishu"]
+
+
+@pytest.mark.asyncio
+async def test_http_webhook_record_logged_creates_event(fresh_db):
+    import httpx
+    from channels.http_channel import HTTPChannel
+
+    handled = asyncio.Event()
+    seen = []
+
+    async def _handler(msg):
+        seen.append(msg)
+        handled.set()
+        return "ok"
+
+    chan = HTTPChannel(
+        token="secret",
+        message_handler=_handler,
+        event_recorder=fresh_db.create_event,
+    )
+
+    transport = httpx.ASGITransport(app=chan.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/hooks",
+            json={"message": "AAPL 放量突破失败，RS 转弱", "record": "logged"},
+            headers={"x-webhook-token": "secret"},
+        )
+
+    assert response.status_code == 202
+    run_id = response.json()["runId"]
+    await asyncio.wait_for(handled.wait(), timeout=1)
+
+    event = fresh_db.get_events(limit=1)[0]
+    assert event.type == "note"
+    assert event.status == "logged"
+    assert event.content == "AAPL 放量突破失败，RS 转弱"
+    assert event.source_channel == "http"
+    assert event.session_key == "agent:secretary:http:conversation:webhook_user"
+    assert run_id in event.metadata_json
+    assert seen[0].metadata["record"] == "logged"
+    assert seen[0].metadata["webhook_run_id"] == run_id
+
+
+@pytest.mark.asyncio
+async def test_http_messages_route_is_registered_without_webhook_record():
+    import httpx
+    from channels.http_channel import HTTPChannel
+
+    async def _handler(_msg):
+        return "ok"
+
+    chan = HTTPChannel(token="secret", message_handler=_handler)
+    await chan.send("queued", user_id="target")
+
+    transport = httpx.ASGITransport(app=chan.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/messages",
+            headers={"x-webhook-token": "secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"messages": [{"text": "queued", "user_id": "target"}]}
+
+
+@pytest.mark.asyncio
+async def test_http_webhook_record_open_creates_open_event(fresh_db):
+    import httpx
+    from channels.http_channel import HTTPChannel
+
+    handled = asyncio.Event()
+
+    async def _handler(_msg):
+        handled.set()
+        return "ok"
+
+    chan = HTTPChannel(
+        token="secret",
+        message_handler=_handler,
+        event_recorder=fresh_db.create_event,
+    )
+
+    transport = httpx.ASGITransport(app=chan.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/hooks",
+            json={"message": "需要收盘后复查 AAPL 20MA", "record": "open"},
+            headers={"x-webhook-token": "secret"},
+        )
+
+    assert response.status_code == 202
+    await asyncio.wait_for(handled.wait(), timeout=1)
+
+    event = fresh_db.get_events(limit=1)[0]
+    assert event.type == "note"
+    assert event.status == "open"
+    assert event.content == "需要收盘后复查 AAPL 20MA"
+
+
+@pytest.mark.asyncio
+async def test_http_webhook_record_false_skips_event(fresh_db):
+    import httpx
+    from channels.http_channel import HTTPChannel
+
+    handled = asyncio.Event()
+
+    async def _handler(_msg):
+        handled.set()
+        return "ok"
+
+    chan = HTTPChannel(
+        token="secret",
+        message_handler=_handler,
+        event_recorder=fresh_db.create_event,
+    )
+
+    transport = httpx.ASGITransport(app=chan.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/hooks",
+            json={"message": "普通 webhook 输入", "record": False},
+            headers={"x-webhook-token": "secret"},
+        )
+
+    assert response.status_code == 202
+    await asyncio.wait_for(handled.wait(), timeout=1)
+    assert fresh_db.get_events(limit=1) == []
+
+
+@pytest.mark.asyncio
+async def test_http_webhook_rejects_invalid_record(fresh_db):
+    import httpx
+    from channels.http_channel import HTTPChannel
+
+    handled = False
+
+    async def _handler(_msg):
+        nonlocal handled
+        handled = True
+        return "ok"
+
+    chan = HTTPChannel(
+        token="secret",
+        message_handler=_handler,
+        event_recorder=fresh_db.create_event,
+    )
+
+    transport = httpx.ASGITransport(app=chan.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/hooks",
+            json={"message": "bad", "record": "resolved"},
+            headers={"x-webhook-token": "secret"},
+        )
+
+    assert response.status_code == 422
+    assert handled is False
+    assert fresh_db.get_events(limit=1) == []
 
 
 def test_channel_all_mode_starts_every_configured_non_cli_channel():

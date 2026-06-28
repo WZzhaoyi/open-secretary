@@ -494,7 +494,21 @@ class TelegramChannel(Channel):
         lang = self._ui_lang(update)
         await update.message.reply_text(t("telegram.compact.running", lang))
         try:
-            result = await force_compact(get_db())
+            from runtime import build_session_key
+
+            chat_id = str(update.effective_chat.id)
+            thread_id = (
+                str(update.message.message_thread_id)
+                if getattr(update.message, "message_thread_id", None) is not None
+                else None
+            )
+            session_key = build_session_key(
+                channel="telegram",
+                user_id=str(update.effective_user.id),
+                conversation_id=chat_id,
+                thread_id=thread_id,
+            )
+            result = await force_compact(get_db(), session_key=session_key)
         except Exception as e:
             logger.error(f"/compact failed: {e}")
             await update.message.reply_text(t("telegram.compact.failed", lang, error=e))

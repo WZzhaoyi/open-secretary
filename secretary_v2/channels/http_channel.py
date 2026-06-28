@@ -14,7 +14,7 @@ import asyncio
 import logging
 import uuid
 from collections import deque
-from typing import Awaitable, Callable, Deque, Optional, Union
+from typing import Any, Awaitable, Callable, Deque, Optional, Union
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -26,11 +26,38 @@ from .base import Channel, IncomingMessage
 logger = logging.getLogger(__name__)
 
 ResponseChannel = Union[Channel, Callable[[], Optional[Channel]]]
+EventRecorder = Callable[..., Any]
+_WEBHOOK_RECORD_STATUSES = {"logged", "open"}
 
 
 class WebhookMessage(BaseModel):
     message: str
+    record: Optional[Union[str, bool]] = None
     user_id: str = "webhook_user"
+
+
+def _session_part(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    return text.replace(":", "_")
+
+
+def _webhook_session_key(user_id: str, agent_id: str = "secretary") -> str:
+    return f"agent:{_session_part(agent_id)}:http:conversation:{_session_part(user_id)}"
+
+
+def _normalize_record_status(record: object) -> Optional[str]:
+    """Return the events.status requested by a webhook record value."""
+    if record is None or record is False:
+        return None
+    if isinstance(record, str):
+        normalized = record.strip().lower()
+        if normalized in {"", "false", "none", "no", "off"}:
+            return None
+        if normalized in _WEBHOOK_RECORD_STATUSES:
+            return normalized
+    raise ValueError("record must be omitted, false, 'logged', or 'open'")
 
 
 class HTTPChannel(Channel):
@@ -43,6 +70,7 @@ class HTTPChannel(Channel):
         token: str,
         message_handler: Callable[[IncomingMessage], Awaitable[str]],
         response_channel: Optional[ResponseChannel] = None,
+        event_recorder: Optional[EventRecorder] = None,
         port: int = 11269,
         bind_host: str = "127.0.0.1",
         outbox_capacity: int = 100,
@@ -50,6 +78,7 @@ class HTTPChannel(Channel):
         self.token = token
         self.message_handler = message_handler
         self.response_channel = response_channel
+        self.event_recorder = event_recorder
         self.port = port
         self.bind_host = bind_host
         self.app = FastAPI()
@@ -75,13 +104,32 @@ class HTTPChannel(Channel):
         ):
             if x_webhook_token != self.token:
                 raise HTTPException(status_code=401, detail="Invalid token")
+            try:
+                record_status = _normalize_record_status(message.record)
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=str(e)) from e
+
+            run_id = f"hook_{uuid.uuid4().hex[:12]}"
+            session_key = _webhook_session_key(message.user_id)
+            metadata = {
+                "webhook_run_id": run_id,
+                "user_id": message.user_id,
+            }
+            if record_status:
+                metadata["record"] = record_status
+                self._record_webhook_event(
+                    message=message,
+                    record_status=record_status,
+                    session_key=session_key,
+                    metadata=metadata,
+                )
             incoming = IncomingMessage(
                 text=message.message,
                 channel="http",
                 user_id=message.user_id,
                 conversation_id=message.user_id,
+                metadata=metadata,
             )
-            run_id = f"hook_{uuid.uuid4().hex[:12]}"
             task = asyncio.create_task(self._handle_webhook_async(run_id, incoming))
             self._webhook_tasks.add(task)
             task.add_done_callback(self._webhook_tasks.discard)
@@ -105,6 +153,29 @@ class HTTPChannel(Channel):
             drained = list(self._outbox)
             self._outbox.clear()
             return {"messages": drained}
+
+    def _record_webhook_event(
+        self,
+        *,
+        message: WebhookMessage,
+        record_status: str,
+        session_key: str,
+        metadata: dict,
+    ) -> None:
+        if self.event_recorder is None:
+            logger.warning(
+                "Webhook requested record=%s but no recorder is configured",
+                record_status,
+            )
+            return
+        self.event_recorder(
+            "note",
+            message.message,
+            status=record_status,
+            source_channel="http",
+            session_key=session_key,
+            metadata=metadata,
+        )
 
     async def _handle_webhook_async(
         self, run_id: str, incoming: IncomingMessage

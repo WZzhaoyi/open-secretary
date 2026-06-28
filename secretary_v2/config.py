@@ -344,10 +344,15 @@ DB_SCHEMA_HINT = """## 数据库表结构
 - status: TEXT NOT NULL (logged | open | resolved | promoted)，默认 logged
 - content: TEXT
 - created_at: DATETIME
+- source_channel: TEXT (来源 channel / webhook source)
+- session_key: TEXT (来源局部会话，用于回查上下文)
+- source_message_id: TEXT (平台原始消息 id，可空)
+- metadata_json: TEXT (conversation_id/thread_id/sender_id/reply_to_id 等 JSON 元数据)
 
 注：长期记忆（偏好、计划、需要持续跟踪的事项等）不在数据库里，而在 memory.md。
 events 表只记有时点的事件流水，供定时任务做未回复检查等。
 `status='open'` 是主动注意力清单；最近事件注入只是截断视图，不代表事件全集。
+写 events 优先使用 record_event 工具，自动填充来源元数据；只有复杂维护/修正才使用 db_execute。
 
 ### messages 表（对话历史）
 - id: INTEGER PRIMARY KEY AUTOINCREMENT
@@ -357,6 +362,14 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 - tokens_out: INTEGER DEFAULT 0
 - created_at: DATETIME DEFAULT CURRENT_TIMESTAMP
 - pydantic_ai_msg: BLOB (序列化的Pydantic AI消息)
+- agent_id: TEXT
+- session_key: TEXT (局部历史隔离键)
+- channel: TEXT
+- conversation_id: TEXT
+- thread_id: TEXT
+- sender_id: TEXT
+- reply_to_id: TEXT
+- metadata_json: TEXT
 
 ### agent_events 表（agent 行为审计 / 系统复盘）
 - id: INTEGER PRIMARY KEY AUTOINCREMENT
@@ -401,16 +414,17 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 
 1. **load_skill** - 按名称读取可用技能索引中的完整 skill 说明
 2. **db_query** - 读数据库（SELECT/PRAGMA）
-3. **db_execute** - 写 events 等普通业务流水；不要修改系统表、调度表、消息表或子任务表
-4. **memory_read** - 查看完整 memory.md
-5. **memory_update** - 更新长期记忆（优先用于 memory.md；section 使用 memory.md 中已有的精确二级标题）
-6. **file_read** - 读普通项目文件（日志、技能、权限策略、研究产物等）；不能读 config.yaml、数据库或凭证文件
-7. **file_write** - 写普通 data 文件；agent 不能用它写 memory.md、logs、permissions、research/subagent_runs、代码、配置或数据库文件
-8. **http_request** - 调外部 API（知道具体 URL 时用）
-9. **web_search** - 搜索互联网（不知道去哪里找信息时用）
-10. **send_message** - 主动发消息给用户（通知、提醒）
-11. **schedule_task** - 管理定时任务
-12. **start_subagent / get_subagent_status / cancel_subagent / resume_subagent** - 启动、查询、取消、续跑后台子任务（可用类型见「可用后台子任务」，如 deep_research 深度研究）
+3. **record_event** - 写 events 业务事件/提醒/回复，自动带来源 channel 与 session_key
+4. **db_execute** - 复杂维护 SQL；不要修改系统表、调度表、消息表或子任务表
+5. **memory_read** - 查看完整 memory.md
+6. **memory_update** - 更新长期记忆（优先用于 memory.md；section 使用 memory.md 中已有的精确二级标题）
+7. **file_read** - 读普通项目文件（日志、技能、权限策略、研究产物等）；不能读 config.yaml、数据库或凭证文件
+8. **file_write** - 写普通 data 文件；agent 不能用它写 memory.md、logs、permissions、research/subagent_runs、代码、配置或数据库文件
+9. **http_request** - 调外部 API（知道具体 URL 时用）
+10. **web_search** - 搜索互联网（不知道去哪里找信息时用）
+11. **send_message** - 主动发消息给用户（通知、提醒）
+12. **schedule_task** - 管理定时任务
+13. **start_subagent / get_subagent_status / cancel_subagent / resume_subagent** - 启动、查询、取消、续跑后台子任务（可用类型见「可用后台子任务」，如 deep_research 深度研究）
 
 ### 工具选择
 - 看到「可用技能索引」里有相关技能 → 先用 load_skill(name) 读取完整说明
