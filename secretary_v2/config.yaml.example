@@ -52,6 +52,14 @@ channels:
 database:
   path: secretary_v2.db
 
+# Long-term memory markdown file and backups. Relative paths are resolved from
+# the secretary_v2 directory, mirroring the default memory.md location.
+memory:
+  path: memory.md
+  # When enabled, the app writes one snapshot per local date next to memory.path
+  # before memory changes, e.g. memory-2026-06-29.md.
+  backup_enabled: true
+
 # Skill loading
 skills:
   max_size: 50000

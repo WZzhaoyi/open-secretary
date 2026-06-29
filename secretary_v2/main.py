@@ -9,7 +9,7 @@ from typing import Dict, Any
 
 from config import get_config
 from memory import Database
-from runtime import run_agent
+from runtime import ensure_daily_memory_backup, run_agent
 from channels.base import IncomingMessage
 from channels.cli_channel import CLIChannel
 from channels.telegram_channel import TelegramChannel
@@ -419,6 +419,7 @@ class SecretaryApp:
     async def run(self):
         """Run the application: start scheduler + all selected channels concurrently."""
         try:
+            ensure_daily_memory_backup()
             logger.info(get_market_calendar_service().strategy_summary())
             await self.scheduler.start()
             # The self-test guards long-lived channels before users hit them.

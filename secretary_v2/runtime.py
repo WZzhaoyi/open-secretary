@@ -174,7 +174,8 @@ def build_session_key(
 
 # Path to the user+agent shared long-term memory scratchpad.
 # Free-form markdown that gets injected into every run's system prompt.
-MEMORY_FILE = BASE_DIR / "memory.md"
+DEFAULT_MEMORY_FILE = BASE_DIR / "memory.md"
+MEMORY_FILE = DEFAULT_MEMORY_FILE
 OPEN_EVENTS_CONTEXT_LIMIT = 200
 
 _WEEKDAY_ZH = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -397,10 +398,13 @@ def _format_event_context_line(event, *, tz: ZoneInfo, local_today: date) -> str
     if getattr(event, "source_message_id", None):
         source_parts.append(f"message={event.source_message_id}")
     source = f" {' '.join(source_parts)}" if source_parts else ""
+    summary = (getattr(event, "summary", None) or "").strip()
+    if not summary:
+        summary = (event.content or "")[:160]
     return (
         f"- local_created_at={local_created}: "
         f"[id={event.id} type={event.type} status={event.status}{temporal}{source}] "
-        f"{(event.content or '')[:160]}"
+        f"{summary}"
     )
 
 
@@ -409,10 +413,25 @@ def _webhook_record_notice(deps: "SecretaryDeps") -> str:
     record = str(metadata.get("record") or "").strip().lower()
     if deps.origin_channel != "http" or record not in {"logged", "open"}:
         return ""
+    event_id = metadata.get("recorded_event_id")
+    event_ref = f" as event id `{event_id}`" if event_id is not None else ""
+    summary_supplied = bool(metadata.get("summary_supplied"))
+    update_call = (
+        f"`update_event_summary({event_id}, summary)`"
+        if event_id is not None
+        else "`update_event_summary(event_id, summary)`"
+    )
+    summary_instruction = (
+        "- The webhook supplied a summary; do not update it unless it is clearly misleading.\n"
+        if summary_supplied
+        else "- If the fallback summary is too raw and you can write a better factual index line, "
+        f"call {update_call} once. Summarize the original webhook, not your reply.\n"
+    )
     return (
         "### Webhook Record Notice\n"
-        f"- This webhook message has already been recorded verbatim in `events` "
+        f"- This webhook message has already been recorded verbatim in `events`{event_ref} "
         f"with `status='{record}'` before the LLM run.\n"
+        f"{summary_instruction}"
         "- Do not call `record_event` to summarize, restate, reclassify, or preserve "
         "the same webhook message for cross-channel visibility.\n"
         "- Only call `record_event` for a distinct actionable follow-up, reminder, "
@@ -456,16 +475,82 @@ def _language_policy(language: str) -> str:
 
 def _load_memory_md() -> str:
     """Read memory.md if it exists. Soft-cap to keep system prompt sane."""
-    if not MEMORY_FILE.exists():
+    memory_path = _memory_file_path()
+    if not memory_path.exists():
         return ""
     try:
-        text = MEMORY_FILE.read_text(encoding="utf-8")
+        text = memory_path.read_text(encoding="utf-8")
     except Exception as e:
         logger.warning(f"Failed to read memory.md: {e}")
         return ""
     # 50KB cap: same as file_read tool, prevents a runaway memory.md from
     # blowing up every prompt.
     return text[:50_000]
+
+
+def _resolve_config_path(path_value: str, *, default_path: Path) -> Path:
+    raw = str(path_value or "").strip()
+    if not raw or raw == default_path.name:
+        return default_path
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path
+    return BASE_DIR / path
+
+
+def _memory_file_path() -> Path:
+    if MEMORY_FILE != DEFAULT_MEMORY_FILE:
+        return MEMORY_FILE
+    cfg = get_config()
+    memory_cfg = getattr(cfg, "memory", None)
+    path_value = getattr(memory_cfg, "path", "memory.md")
+    return _resolve_config_path(path_value, default_path=MEMORY_FILE)
+
+
+def _memory_backup_path(local_day: date) -> Path:
+    memory_path = _memory_file_path()
+    suffix = memory_path.suffix
+    if suffix:
+        backup_name = f"{memory_path.stem}-{local_day.isoformat()}{suffix}"
+    else:
+        backup_name = f"{memory_path.name}-{local_day.isoformat()}"
+    return memory_path.with_name(backup_name)
+
+
+def _local_today_for_config() -> date:
+    cfg = get_config()
+    try:
+        tz = ZoneInfo(cfg.timezone)
+    except Exception:
+        tz = ZoneInfo("Asia/Shanghai")
+    return datetime.now(tz).date()
+
+
+def ensure_daily_memory_backup() -> Optional[Path]:
+    """Create one daily backup next to the configured memory file."""
+    cfg = get_config()
+    memory_cfg = getattr(cfg, "memory", None)
+    if not getattr(memory_cfg, "backup_enabled", True):
+        return None
+    try:
+        memory_path = _memory_file_path()
+        if not memory_path.exists():
+            return None
+        content = memory_path.read_text(encoding="utf-8")
+        if not content.strip():
+            return None
+
+        backup_path = _memory_backup_path(_local_today_for_config())
+        if backup_path.exists():
+            return backup_path
+
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        backup_path.write_text(content, encoding="utf-8")
+        logger.info("Created daily memory backup: %s", backup_path)
+        return backup_path
+    except Exception as e:
+        logger.warning("Failed to create daily memory backup: %s", e)
+        return None
 
 
 def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
@@ -628,6 +713,16 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
     record_notice = _webhook_record_notice(deps)
     if record_notice:
         runtime_parts.append(record_notice)
+
+    if deps.origin_channel == "http":
+        runtime_parts.append(
+            "### Webhook Delivery Contract\n"
+            "- This run came from an HTTP webhook, not a scheduled task.\n"
+            "- Analyze the webhook payload and put the user-visible reply in final output; "
+            "the application will forward that final output to the configured response channel.\n"
+            "- Do not call `send_message` to answer the current webhook, and do not write `NO_ACTION` "
+            "as the final output unless the webhook explicitly asks for silent processing."
+        )
 
     runtime_parts.append(
         "## Trusted Runtime Context\n"
@@ -1006,6 +1101,7 @@ async def record_event(
     event_type: str,
     content: str,
     status: str = "logged",
+    summary: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Record a business event with current channel/session provenance.
@@ -1056,6 +1152,7 @@ async def record_event(
         event_type,
         content,
         status=status,
+        summary=summary,
         source_channel=ctx.deps.origin_channel,
         session_key=ctx.deps.session_key,
         source_message_id=ctx.deps.reply_to_id,
@@ -1070,6 +1167,50 @@ async def record_event(
         payload={"event_id": event.id, "session_key": ctx.deps.session_key},
     )
     return f"Event recorded: id={event.id} type={event.type} status={event.status}"
+
+
+@agent.tool
+async def update_event_summary(
+    ctx: RunContext[SecretaryDeps],
+    event_id: int,
+    summary: str,
+) -> str:
+    """Update only events.summary, leaving event content and metadata unchanged.
+
+    For recorded webhooks, use this to replace the automatic fallback summary
+    with one factual index line about the original webhook payload.
+    """
+    if event_id <= 0:
+        return "Error: event_id must be positive"
+    clean_summary = " ".join(str(summary or "").split())
+    if not clean_summary:
+        return "Error: summary must be non-empty"
+
+    recorded_id = (ctx.deps.message_metadata or {}).get("recorded_event_id")
+    if recorded_id is not None:
+        try:
+            allowed_id = int(recorded_id)
+        except (TypeError, ValueError):
+            allowed_id = None
+        if allowed_id is not None and event_id != allowed_id:
+            return (
+                "Error: this webhook run may only update summary for "
+                f"recorded_event_id={allowed_id}"
+            )
+
+    event = ctx.deps.db.update_event_summary(event_id, clean_summary)
+    if event is None:
+        return f"Error: event not found: {event_id}"
+
+    _record_agent_event(
+        ctx.deps.db,
+        "event_summary_update",
+        origin=ctx.deps.origin_channel,
+        run_id=ctx.deps.run_id or None,
+        subject=f"event:{event_id}",
+        payload={"summary": event.summary},
+    )
+    return f"Event summary updated: id={event.id} summary={event.summary}"
 
 
 # ==================== File tools ====================
@@ -1130,6 +1271,21 @@ def _find_memory_section(lines: List[str], section: str) -> Optional[Tuple[int, 
     return start, end
 
 
+def _memory_section_block(header: str, body_lines: List[str], *, has_next: bool) -> List[str]:
+    body = [line.rstrip() for line in body_lines]
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+
+    block = [header]
+    if body:
+        block.extend(["", *body])
+    if has_next:
+        block.append("")
+    return block
+
+
 def _replace_memory_section(text: str, section: str, body: str) -> Optional[str]:
     text = _ensure_memory_document(text)
     lines = text.splitlines()
@@ -1139,9 +1295,57 @@ def _replace_memory_section(text: str, section: str, body: str) -> Optional[str]
 
     start, end = bounds
     header = f"## {section}"
-    replacement = [header, *body.rstrip().splitlines()]
+    replacement = _memory_section_block(
+        header,
+        body.splitlines(),
+        has_next=end < len(lines),
+    )
     new_lines = [*lines[:start], *replacement, *lines[end:]]
     return "\n".join(new_lines).rstrip() + "\n"
+
+
+def _memory_substantive_lines(lines: List[str]) -> List[str]:
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("<!--") and stripped.endswith("-->"):
+            continue
+        result.append(stripped)
+    return result
+
+
+def _replace_section_removal_error(
+    text: str, section: str, replacement_body: str
+) -> Optional[str]:
+    """Reject accidental destructive section replacement.
+
+    `replace_section` is still available for deliberate rewrites, but the new
+    body must carry forward the existing substantive lines. This catches the
+    common LLM mistake of using replacement when it meant append.
+    """
+    current = _ensure_memory_document(text)
+    lines = current.splitlines()
+    bounds = _find_memory_section(lines, section)
+    if bounds is None:
+        return None
+
+    start, end = bounds
+    existing_lines = _memory_substantive_lines(lines[start + 1 : end])
+    if not existing_lines:
+        return None
+
+    replacement_lines = set(_memory_substantive_lines(replacement_body.splitlines()))
+    missing = [line for line in existing_lines if line not in replacement_lines]
+    if not missing:
+        return None
+
+    return (
+        "Error: replace_section would remove existing memory content. "
+        "Use mode='append' to add one item, or call memory_read and pass the "
+        f"complete updated body for ## {section}. First omitted line: {missing[0]}"
+    )
 
 
 def _append_memory_section(text: str, section: str, content: str) -> Optional[str]:
@@ -1162,12 +1366,17 @@ def _append_memory_section(text: str, section: str, content: str) -> Optional[st
     if entry.strip() in normalized_existing:
         return current.rstrip() + "\n"
 
-    insert_at = end
-    if insert_at > start + 1 and lines[insert_at - 1].strip():
-        lines.insert(insert_at, entry)
-    else:
-        lines.insert(insert_at, entry)
-    return "\n".join(lines).rstrip() + "\n"
+    body_lines = [line.rstrip() for line in section_lines]
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+    body_lines.append(entry)
+    replacement = _memory_section_block(
+        f"## {section}",
+        body_lines,
+        has_next=end < len(lines),
+    )
+    new_lines = [*lines[:start], *replacement, *lines[end:]]
+    return "\n".join(new_lines).rstrip() + "\n"
 
 
 @agent.tool
@@ -1206,14 +1415,20 @@ async def memory_update(
         return "Error: mode must be 'append' or 'replace_section'"
 
     try:
-        current = MEMORY_FILE.read_text(encoding="utf-8") if MEMORY_FILE.exists() else ""
+        memory_path = _memory_file_path()
+        current = memory_path.read_text(encoding="utf-8") if memory_path.exists() else ""
         if mode == "replace_section":
+            removal_error = _replace_section_removal_error(current, section_title, content)
+            if removal_error is not None:
+                return removal_error
             updated = _replace_memory_section(current, section_title, content)
         else:
             updated = _append_memory_section(current, section_title, content)
         if updated is None:
             return _missing_memory_section_error(section_title, _ensure_memory_document(current))
-        MEMORY_FILE.write_text(updated, encoding="utf-8")
+        ensure_daily_memory_backup()
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        memory_path.write_text(updated, encoding="utf-8")
         _record_agent_event(
             ctx.deps.db,
             "memory_update",

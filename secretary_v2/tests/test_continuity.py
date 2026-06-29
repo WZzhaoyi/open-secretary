@@ -127,6 +127,19 @@ def test_config_defaults_language_to_auto(tmp_path):
     assert cfg.ui_language == "auto"
 
 
+def test_config_loads_memory_path_and_backup_switch(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "timezone: UTC\nmemory:\n  path: data/custom-memory.md\n  backup_enabled: false\n",
+        encoding="utf-8",
+    )
+
+    cfg = Config.load(str(config_file))
+
+    assert cfg.memory.path == "data/custom-memory.md"
+    assert cfg.memory.backup_enabled is False
+
+
 def test_ui_i18n_resolves_auto_from_channel_language():
     from channels.telegram_channel import bot_commands
     from i18n import resolve_ui_language, t
@@ -664,6 +677,7 @@ def test_memory_tools_registered():
     tool_names = list(runtime.agent._function_toolset.tools.keys())
     assert "load_skill" in tool_names
     assert "record_event" in tool_names
+    assert "update_event_summary" in tool_names
     assert "memory_read" in tool_names
     assert "memory_update" in tool_names
 
@@ -1091,7 +1105,12 @@ async def test_dynamic_context_keeps_stable_prefix_before_runtime_tail(tmp_path,
     reset_skills_loader()
 
     db = Database(db_path=":memory:")
-    db.create_event("remind", "运行时事件 sentinel", status="open")
+    db.create_event(
+        "remind",
+        "运行时事件 full body should stay out of context",
+        status="open",
+        summary="运行时事件 sentinel",
+    )
     db.create_event("note", "最近流水 sentinel", status="logged")
     deps = SecretaryDeps(
         db=db,
@@ -1119,6 +1138,7 @@ async def test_dynamic_context_keeps_stable_prefix_before_runtime_tail(tmp_path,
     assert schema_at < language_at < skill_index_at < auto_skill_at < memory_at < event_context_at
     assert event_context_at < event_at < recent_at < loaded_skill_at < run_context_at
     assert "shown 1 / total 1" in text
+    assert "full body should stay out of context" not in text
     assert "Configured language: `en`" in text
     assert "default user-facing language: English" in text
     assert "shown 1 / configured 1" in text
@@ -1134,7 +1154,11 @@ async def test_dynamic_context_warns_recorded_webhook_not_to_duplicate_event():
     deps = SecretaryDeps(
         db=Database(db_path=":memory:"),
         origin_channel="http",
-        message_metadata={"record": "logged", "webhook_run_id": "hook_test"},
+        message_metadata={
+            "record": "logged",
+            "webhook_run_id": "hook_test",
+            "recorded_event_id": 123,
+        },
     )
 
     class _Ctx:
@@ -1145,10 +1169,16 @@ async def test_dynamic_context_warns_recorded_webhook_not_to_duplicate_event():
 
     assert "Webhook Record Notice" in text
     assert "already been recorded verbatim in `events`" in text
+    assert "event id `123`" in text
     assert "status='logged'" in text
+    assert "update_event_summary(123, summary)" in text
     assert "summarize, restate, reclassify" in text
     assert "cross-channel visibility" in text
     assert "distinct actionable follow-up" in text
+    assert "Webhook Delivery Contract" in text
+    assert "not a scheduled task" in text
+    assert "put the user-visible reply in final output" in text
+    assert "Do not call `send_message` to answer the current webhook" in text
 
 
 @pytest.mark.asyncio
@@ -1277,6 +1307,228 @@ async def test_memory_update_appends_to_exact_section_title(tmp_path, monkeypatc
     assert events[0].subject == "在追踪的事项"
 
 
+def test_daily_memory_backup_creates_one_snapshot_per_day(tmp_path, monkeypatch):
+    import runtime
+    from config import get_config
+
+    cfg = _config_for_model("anthropic", "claude-sonnet-4-20250514")
+    cfg.timezone = "UTC"
+    monkeypatch.setattr(get_config, "_config", cfg, raising=False)
+    monkeypatch.setattr(runtime, "MEMORY_FILE", tmp_path / "memory.md")
+    monkeypatch.setattr(
+        runtime,
+        "_local_today_for_config",
+        lambda: runtime.date(2026, 6, 29),
+    )
+
+    runtime.MEMORY_FILE.write_text("# Memory\n\nfirst version\n", encoding="utf-8")
+
+    first = runtime.ensure_daily_memory_backup()
+    runtime.MEMORY_FILE.write_text("# Memory\n\nsecond version\n", encoding="utf-8")
+    second = runtime.ensure_daily_memory_backup()
+
+    assert first == second
+    assert first.name == "memory-2026-06-29.md"
+    assert first.parent == tmp_path
+    assert first.read_text(encoding="utf-8") == "# Memory\n\nfirst version\n"
+
+
+def test_daily_memory_backup_follows_configured_memory_path(tmp_path, monkeypatch):
+    import runtime
+    from config import get_config
+
+    memory_file = tmp_path / "notes" / "custom-memory.md"
+    memory_file.parent.mkdir()
+    memory_file.write_text("# Memory\n\nconfigured path\n", encoding="utf-8")
+
+    cfg = _config_for_model("anthropic", "claude-sonnet-4-20250514")
+    cfg.memory.path = str(memory_file)
+    monkeypatch.setattr(get_config, "_config", cfg, raising=False)
+    monkeypatch.setattr(
+        runtime,
+        "_local_today_for_config",
+        lambda: runtime.date(2026, 6, 29),
+    )
+
+    backup = runtime.ensure_daily_memory_backup()
+
+    assert backup == tmp_path / "notes" / "custom-memory-2026-06-29.md"
+    assert backup.read_text(encoding="utf-8") == "# Memory\n\nconfigured path\n"
+
+
+def test_daily_memory_backup_respects_config_switch(tmp_path, monkeypatch):
+    import runtime
+    from config import get_config
+
+    cfg = _config_for_model("anthropic", "claude-sonnet-4-20250514")
+    cfg.memory.backup_enabled = False
+    monkeypatch.setattr(get_config, "_config", cfg, raising=False)
+    monkeypatch.setattr(runtime, "MEMORY_FILE", tmp_path / "memory.md")
+
+    runtime.MEMORY_FILE.write_text("# Memory\n", encoding="utf-8")
+
+    assert runtime.ensure_daily_memory_backup() is None
+    assert list(tmp_path.glob("memory-*.md")) == []
+
+
+@pytest.mark.asyncio
+async def test_memory_update_append_preserves_existing_section_content(tmp_path, monkeypatch):
+    import runtime
+    from runtime import memory_update, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    original = (
+        "# 长期记忆\n\n"
+        "## 用户偏好\n\n"
+        "- 旧偏好\n"
+        "## 协作约定\n"
+        "- 旧约定\n"
+        "## 在追踪的事项\n"
+        "- 旧追踪项\n"
+    )
+    memory_file.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_update(
+        _Ctx(deps),
+        section="用户偏好",
+        content="新增偏好",
+    )
+
+    text = memory_file.read_text(encoding="utf-8")
+    assert "memory.md updated: 用户偏好" in result
+    assert "- 旧偏好" in text
+    assert "- 新增偏好" in text
+    assert "- 旧约定" in text
+    assert "- 旧追踪项" in text
+
+
+@pytest.mark.asyncio
+async def test_memory_update_append_preserves_markdown_section_spacing(
+    tmp_path, monkeypatch
+):
+    import runtime
+    from runtime import memory_update, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text(
+        "# 长期记忆\n\n"
+        "## 用户偏好\n\n"
+        "- 旧偏好 A\n"
+        "- 旧偏好 B\n\n"
+        "## 协作约定\n\n"
+        "- 旧约定\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_update(
+        _Ctx(deps),
+        section="用户偏好",
+        content="新增偏好",
+    )
+
+    assert "memory.md updated: 用户偏好" in result
+    assert memory_file.read_text(encoding="utf-8") == (
+        "# 长期记忆\n\n"
+        "## 用户偏好\n\n"
+        "- 旧偏好 A\n"
+        "- 旧偏好 B\n"
+        "- 新增偏好\n\n"
+        "## 协作约定\n\n"
+        "- 旧约定\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_update_replace_section_normalizes_markdown_spacing(
+    tmp_path, monkeypatch
+):
+    import runtime
+    from runtime import memory_update, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text(
+        "# 长期记忆\n\n"
+        "## 用户偏好\n\n"
+        "- 旧偏好\n\n"
+        "## 协作约定\n\n"
+        "- 旧约定\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_update(
+        _Ctx(deps),
+        section="用户偏好",
+        content="\n- 旧偏好\n- 新偏好\n\n",
+        mode="replace_section",
+    )
+
+    assert "memory.md updated: 用户偏好" in result
+    assert memory_file.read_text(encoding="utf-8") == (
+        "# 长期记忆\n\n"
+        "## 用户偏好\n\n"
+        "- 旧偏好\n"
+        "- 新偏好\n\n"
+        "## 协作约定\n\n"
+        "- 旧约定\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_update_replace_section_rejects_accidental_deletion(
+    tmp_path, monkeypatch
+):
+    import runtime
+    from runtime import memory_update, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    original = (
+        "# 长期记忆\n\n"
+        "## 用户偏好\n"
+        "- 旧偏好 A\n"
+        "- 旧偏好 B\n"
+    )
+    memory_file.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_update(
+        _Ctx(deps),
+        section="用户偏好",
+        content="- 新增偏好",
+        mode="replace_section",
+    )
+
+    assert "replace_section would remove existing memory content" in result
+    assert memory_file.read_text(encoding="utf-8") == original
+    assert deps.db.get_agent_events() == []
+
+
 @pytest.mark.asyncio
 async def test_memory_update_accepts_english_section_names(tmp_path, monkeypatch):
     import runtime
@@ -1300,6 +1552,35 @@ async def test_memory_update_accepts_english_section_names(tmp_path, monkeypatch
     assert "memory.md updated: User Preferences" in result
     assert "## User Preferences" in text
     assert "- Prefers concise updates" in text
+
+
+@pytest.mark.asyncio
+async def test_memory_update_uses_configured_memory_path(tmp_path, monkeypatch):
+    from config import get_config
+    from runtime import memory_update, SecretaryDeps
+
+    cfg = _config_for_model("anthropic", "claude-sonnet-4-20250514")
+    cfg.memory.path = str(tmp_path / "configured-memory.md")
+    monkeypatch.setattr(get_config, "_config", cfg, raising=False)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_update(
+        _Ctx(deps),
+        section="User Preferences",
+        content="Configured memory path works",
+    )
+
+    configured_memory = tmp_path / "configured-memory.md"
+    assert "memory.md updated: User Preferences" in result
+    assert configured_memory.exists()
+    assert "- Configured memory path works" in configured_memory.read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.asyncio
@@ -1425,6 +1706,7 @@ async def test_record_event_persists_source_metadata(fresh_db):
         "remind",
         "明天复盘 OpenClaw 方案",
         status="open",
+        summary="OpenClaw 复盘",
     )
 
     assert "Event recorded" in result
@@ -1432,8 +1714,37 @@ async def test_record_event_persists_source_metadata(fresh_db):
     assert event.source_channel == "telegram"
     assert event.session_key == deps.session_key
     assert event.source_message_id == "msg-42"
+    assert event.summary == "OpenClaw 复盘"
     assert "sender-123" in event.metadata_json
     assert "topic-7" in event.metadata_json
+
+
+@pytest.mark.asyncio
+async def test_update_event_summary_only_updates_allowed_webhook_event(fresh_db):
+    from runtime import SecretaryDeps, update_event_summary
+
+    allowed = fresh_db.create_event("note", "raw webhook payload")
+    other = fresh_db.create_event("note", "other payload")
+    deps = SecretaryDeps(
+        db=fresh_db,
+        origin_channel="http",
+        message_metadata={"recorded_event_id": allowed.id},
+    )
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    blocked = await update_event_summary(_Ctx(deps), other.id, "wrong target")
+    assert "may only update summary" in blocked
+
+    result = await update_event_summary(_Ctx(deps), allowed.id, "clean index line")
+    assert "Event summary updated" in result
+
+    events = {event.id: event for event in fresh_db.get_events(limit=10)}
+    assert events[allowed.id].summary == "clean index line"
+    assert events[allowed.id].content == "raw webhook payload"
+    assert events[other.id].summary == "other payload"
 
 
 @pytest.mark.asyncio
@@ -1493,9 +1804,14 @@ async def test_shell_cwd_must_stay_inside_base_dir(fresh_db):
 
 
 @pytest.mark.asyncio
-async def test_file_permission_denial_is_structured_and_recorded(fresh_db):
+async def test_file_permission_denial_is_structured_and_recorded(fresh_db, monkeypatch):
     """file_read/file_write permission failures should be stable for the LLM."""
+    from config import get_config
     from runtime import file_read, file_write, SecretaryDeps
+
+    cfg = _config_for_model("anthropic", "claude-sonnet-4-20250514")
+    cfg.memory.path = "data/custom-memory.md"
+    monkeypatch.setattr(get_config, "_config", cfg, raising=False)
 
     class _Ctx:
         def __init__(self, deps):
@@ -1509,6 +1825,11 @@ async def test_file_permission_denial_is_structured_and_recorded(fresh_db):
     assert "reason: protected_read_file" in result
 
     result = await file_write(ctx, "memory.md", "bad")
+    assert result.startswith("PERMISSION_DENIED")
+    assert "tool: file_write" in result
+    assert "allowed_alternative: memory_update" in result
+
+    result = await file_write(ctx, "data/custom-memory.md", "bad")
     assert result.startswith("PERMISSION_DENIED")
     assert "tool: file_write" in result
     assert "allowed_alternative: memory_update" in result
@@ -1977,7 +2298,11 @@ async def test_http_webhook_record_logged_creates_event(fresh_db):
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/hooks",
-            json={"message": "AAPL 放量突破失败，RS 转弱", "record": "logged"},
+            json={
+                "message": "AAPL 放量突破失败，RS 转弱",
+                "summary": "AAPL 突破失败",
+                "record": "logged",
+            },
             headers={"x-webhook-token": "secret"},
         )
 
@@ -1989,11 +2314,15 @@ async def test_http_webhook_record_logged_creates_event(fresh_db):
     assert event.type == "note"
     assert event.status == "logged"
     assert event.content == "AAPL 放量突破失败，RS 转弱"
+    assert event.summary == "AAPL 突破失败"
     assert event.source_channel == "http"
     assert event.session_key == "agent:secretary:http:conversation:webhook_user"
     assert run_id in event.metadata_json
     assert seen[0].metadata["record"] == "logged"
     assert seen[0].metadata["webhook_run_id"] == run_id
+    assert seen[0].metadata["recorded_event_id"] == event.id
+    assert seen[0].metadata["recorded_event_summary"] == "AAPL 突破失败"
+    assert seen[0].metadata["summary_supplied"] is True
 
 
 @pytest.mark.asyncio
@@ -2050,6 +2379,7 @@ async def test_http_webhook_record_open_creates_open_event(fresh_db):
     assert event.type == "note"
     assert event.status == "open"
     assert event.content == "需要收盘后复查 AAPL 20MA"
+    assert event.summary == "需要收盘后复查 AAPL 20MA"
 
 
 @pytest.mark.asyncio

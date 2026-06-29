@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
-from .base import Channel, IncomingMessage
+from .base import Channel, IncomingMessage, is_no_action_response
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ _WEBHOOK_RECORD_STATUSES = {"logged", "open"}
 
 class WebhookMessage(BaseModel):
     message: str
+    summary: Optional[str] = None
     record: Optional[Union[str, bool]] = None
     user_id: str = "webhook_user"
 
@@ -117,12 +118,18 @@ class HTTPChannel(Channel):
             }
             if record_status:
                 metadata["record"] = record_status
-                self._record_webhook_event(
+                event = self._record_webhook_event(
                     message=message,
                     record_status=record_status,
                     session_key=session_key,
                     metadata=metadata,
                 )
+                if event is not None:
+                    event_id = getattr(event, "id", None)
+                    if event_id is not None:
+                        metadata["recorded_event_id"] = event_id
+                    metadata["recorded_event_summary"] = getattr(event, "summary", None)
+                    metadata["summary_supplied"] = bool(message.summary)
             incoming = IncomingMessage(
                 text=message.message,
                 channel="http",
@@ -161,17 +168,18 @@ class HTTPChannel(Channel):
         record_status: str,
         session_key: str,
         metadata: dict,
-    ) -> None:
+    ) -> Any:
         if self.event_recorder is None:
             logger.warning(
                 "Webhook requested record=%s but no recorder is configured",
                 record_status,
             )
-            return
-        self.event_recorder(
+            return None
+        return self.event_recorder(
             "note",
             message.message,
             status=record_status,
+            summary=message.summary,
             source_channel="http",
             session_key=session_key,
             metadata=metadata,
@@ -185,6 +193,13 @@ class HTTPChannel(Channel):
         except Exception as e:
             logger.error(f"Error handling webhook run {run_id}: {e}")
             response = f"Webhook handling failed ({run_id}): {e}"
+
+        if is_no_action_response(response):
+            logger.info(
+                "Suppressing internal NO_ACTION final response for webhook run %s",
+                run_id,
+            )
+            return
 
         response_channel = self._get_response_channel()
         if response_channel is None:

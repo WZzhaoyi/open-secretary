@@ -12,6 +12,15 @@ def _utcnow():
     while keeping the existing schema semantics (naive datetime columns)."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
+
+def _event_summary(content: str, summary: Optional[str] = None, max_chars: int = 160) -> str:
+    """Short event index text stored separately from full content."""
+    text = summary if summary is not None and str(summary).strip() else content
+    compact = " ".join(str(text).split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 1].rstrip() + "…"
+
 from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, BLOB, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sqlalchemy.pool import StaticPool
@@ -208,6 +217,7 @@ class Event(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     type = Column(String, nullable=False)  # remind | check | response | note | triggered
     status = Column(String, nullable=False, default="logged", server_default="logged")
+    summary = Column(Text, nullable=True)
     content = Column(Text)
     created_at = Column(DateTime, default=_utcnow)
     source_channel = Column(String, nullable=True)
@@ -322,6 +332,7 @@ class Database:
         self._ensure_columns(
             "events",
             {
+                "summary": "TEXT",
                 "source_channel": "TEXT",
                 "session_key": "TEXT",
                 "source_message_id": "TEXT",
@@ -341,6 +352,7 @@ class Database:
                 "metadata_json": "TEXT",
             },
         )
+        self._backfill_event_summaries()
 
     def _ensure_columns(self, table: str, columns: Dict[str, str]) -> None:
         """Add missing SQLite columns for existing local databases."""
@@ -373,6 +385,20 @@ class Database:
                     )
                 )
 
+    def _backfill_event_summaries(self) -> None:
+        """Populate event summaries for rows created before the summary column."""
+        with self.get_session() as session:
+            rows = (
+                session.query(Event)
+                .filter((Event.summary.is_(None)) | (Event.summary == ""))
+                .all()
+            )
+            if not rows:
+                return
+            for event in rows:
+                event.summary = _event_summary(event.content or "")
+            session.commit()
+
     def get_session(self) -> Session:
         """Get a database session."""
         return self.SessionLocal()
@@ -384,6 +410,7 @@ class Database:
         content: str,
         status: str = "logged",
         *,
+        summary: Optional[str] = None,
         source_channel: Optional[str] = None,
         session_key: Optional[str] = None,
         source_message_id: Optional[str] = None,
@@ -399,6 +426,7 @@ class Database:
             event = Event(
                 type=event_type,
                 status=status,
+                summary=_event_summary(content, summary),
                 content=content,
                 source_channel=source_channel,
                 session_key=session_key,
@@ -406,6 +434,17 @@ class Database:
                 metadata_json=metadata_json,
             )
             session.add(event)
+            session.commit()
+            session.refresh(event)
+            return event
+
+    def update_event_summary(self, event_id: int, summary: str) -> Optional[Event]:
+        """Update only the short index summary for an event."""
+        with self.get_session() as session:
+            event = session.get(Event, event_id)
+            if event is None:
+                return None
+            event.summary = _event_summary(event.content or "", summary)
             session.commit()
             session.refresh(event)
             return event

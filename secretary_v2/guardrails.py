@@ -128,9 +128,9 @@ def permission_denied(
 
 
 def _path_alternative(normalized: str, for_write: bool) -> Optional[str]:
-    if normalized == "memory.md" and for_write:
+    if _is_memory_path(normalized) and for_write:
         return "memory_update"
-    if normalized == "memory.md":
+    if _is_memory_path(normalized):
         return "memory_read"
     if normalized.startswith(("research/", "subagent_runs/")) and for_write:
         return "start_subagent / subagent artifact manager"
@@ -141,6 +141,23 @@ def _path_alternative(normalized: str, for_write: bool) -> Optional[str]:
     if for_write:
         return "file_write under data/"
     return None
+
+
+def _configured_memory_path() -> str:
+    try:
+        from config import get_config
+
+        cfg = get_config()
+        raw = str(getattr(getattr(cfg, "memory", None), "path", "memory.md") or "memory.md")
+    except Exception:
+        raw = "memory.md"
+    if os.path.isabs(raw):
+        return os.path.normpath(raw)
+    return os.path.normpath(raw)
+
+
+def _is_memory_path(normalized: str) -> bool:
+    return normalized in {"memory.md", _configured_memory_path()}
 
 
 def check_path_decision(path: str, for_write: bool = False, tool: Optional[str] = None) -> tuple[Optional[str], PermissionDecision]:
@@ -182,7 +199,7 @@ def check_path_decision(path: str, for_write: bool = False, tool: Optional[str] 
             message="Path not allowed: dotfiles are protected",
         )
 
-    if for_write and normalized in PROTECTED_FILES:
+    if for_write and (normalized in PROTECTED_FILES or _is_memory_path(normalized)):
         return None, permission_denied(
             tool_name,
             normalized,

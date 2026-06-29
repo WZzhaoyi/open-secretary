@@ -61,6 +61,12 @@ class DatabaseConfig:
 
 
 @dataclass
+class MemoryConfig:
+    path: str = "memory.md"
+    backup_enabled: bool = True
+
+
+@dataclass
 class SkillsConfig:
     max_size: int = 50000
     max_loaded: int = 5
@@ -178,6 +184,7 @@ class Config:
     history: HistoryConfig
     subagent: SubagentConfig
     schedules: Dict[str, ScheduleConfig]
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     market_calendar: MarketCalendarConfig = field(default_factory=MarketCalendarConfig)
     timezone: str = "Asia/Shanghai"
     language: str = "auto"
@@ -219,6 +226,13 @@ class Config:
         database_data = config_data.get("database", {})
         database = DatabaseConfig(**database_data)
 
+        # Parse memory config
+        memory_data = config_data.get("memory", {}) or {}
+        memory = MemoryConfig(
+            path=memory_data.get("path", "memory.md"),
+            backup_enabled=bool(memory_data.get("backup_enabled", True)),
+        )
+
         # Parse skills config
         skills_data = config_data.get("skills", {})
         skills = SkillsConfig(**skills_data)
@@ -256,6 +270,7 @@ class Config:
             llm=llm,
             channels=channels,
             database=database,
+            memory=memory,
             skills=skills,
             search=search,
             history=history,
@@ -285,7 +300,7 @@ SECRETARY_PERSONA = """你是一个个人秘书 agent，通过对话帮助用户
 ## 定时任务输出契约（强制）
 
 **适用范围**：本节只适用于 `Trusted Runtime Context` 中 `origin_channel` 为 `scheduled` 的运行。
-当 `origin_channel` 是 `telegram`、`feishu`、`cli` 或普通用户对话渠道时，必须直接在 final output
+当 `origin_channel` 是 `telegram`、`feishu`、`cli`、`http` 或普通用户/ webhook 输入渠道时，必须直接在 final output
 中回复用户；不要用 `send_message` 回答当前用户消息，也不要把 final output 写成 `NO_ACTION`。
 
 **前提**：定时任务触发时，用户**看不到**你的 final output。要把内容送达用户，唯一方式是调 `send_message` 工具。final output 只用于内部 NO_ACTION 检测和日志，对用户不可见。
@@ -342,6 +357,7 @@ DB_SCHEMA_HINT = """## 数据库表结构
 - id: INTEGER PRIMARY KEY AUTOINCREMENT
 - type: TEXT NOT NULL (remind | check | response | note | triggered)
 - status: TEXT NOT NULL (logged | open | resolved | promoted)，默认 logged
+- summary: TEXT (事件目录摘要/标题式预览，供上下文索引；详细内容仍在 content)
 - content: TEXT
 - created_at: DATETIME
 - source_channel: TEXT (来源 channel / webhook source)
@@ -352,7 +368,7 @@ DB_SCHEMA_HINT = """## 数据库表结构
 注：长期记忆（偏好、计划、需要持续跟踪的事项等）不在数据库里，而在 memory.md。
 events 表只记有时点的事件流水，供定时任务做未回复检查等。
 `status='open'` 是主动注意力清单；最近事件注入只是截断视图，不代表事件全集。
-写 events 优先使用 record_event 工具，自动填充来源元数据；只有复杂维护/修正才使用 db_execute。
+写 events 优先使用 record_event 工具，summary 写一句短标题/摘要，content 写完整内容；只修正目录摘要时使用 update_event_summary，不要改 content/metadata_json；只有复杂维护/修正才使用 db_execute。
 
 ### messages 表（对话历史）
 - id: INTEGER PRIMARY KEY AUTOINCREMENT

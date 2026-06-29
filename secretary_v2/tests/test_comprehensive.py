@@ -22,14 +22,24 @@ class TestDatabaseOperations:
         )
         assert event.id is not None
         assert event.content == "测试事件"
+        assert event.summary == "测试事件"
         assert event.status == "logged"
 
         open_event = test_db.create_event(
             event_type="remind",
             content="需要后续提醒",
             status="open",
+            summary="后续提醒",
         )
         assert open_event.status == "open"
+        assert open_event.summary == "后续提醒"
+
+        fallback_event = test_db.create_event(
+            event_type="note",
+            content="空摘要回退",
+            summary=" ",
+        )
+        assert fallback_event.summary == "空摘要回退"
 
     def test_existing_events_table_gets_status_column(self, tmp_path):
         """Older SQLite databases should be migrated in place."""
@@ -49,8 +59,10 @@ class TestDatabaseOperations:
         conn.close()
 
         db = Database(db_path=str(db_path))
-        rows = db.execute_query("SELECT type, content, status FROM events")
-        assert rows == [{"type": "note", "content": "legacy", "status": "logged"}]
+        rows = db.execute_query("SELECT type, content, status, summary FROM events")
+        assert rows == [
+            {"type": "note", "content": "legacy", "status": "logged", "summary": "legacy"}
+        ]
 
     def test_save_message(self, test_db):
         """Test saving a message."""
