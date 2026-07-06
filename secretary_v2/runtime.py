@@ -30,6 +30,7 @@ from pydantic_ai.messages import (
 
 from compaction import maybe_auto_persist_compact
 from config import get_config, SECRETARY_PERSONA, DB_SCHEMA_HINT
+from fileops import atomic_write_text, edit_snippet, numbered_lines, str_replace_unique
 from guardrails import (
     BASE_DIR,
     check_path,
@@ -173,6 +174,9 @@ def build_session_key(
 
 
 # Path to the user+agent shared long-term memory scratchpad.
+# Injection cap and write soft-cap share one constant so the agent can never
+# durably write memory that the prompt injection silently drops.
+MEMORY_SOFT_CAP_CHARS = 50_000
 # Free-form markdown that gets injected into every run's system prompt.
 DEFAULT_MEMORY_FILE = BASE_DIR / "memory.md"
 MEMORY_FILE = DEFAULT_MEMORY_FILE
@@ -484,8 +488,15 @@ def _load_memory_md() -> str:
         logger.warning(f"Failed to read memory.md: {e}")
         return ""
     # 50KB cap: same as file_read tool, prevents a runaway memory.md from
-    # blowing up every prompt.
-    return text[:50_000]
+    # blowing up every prompt. The truncation must be visible to the model,
+    # otherwise entries past the cap look like they were never written.
+    if len(text) > MEMORY_SOFT_CAP_CHARS:
+        return (
+            text[:MEMORY_SOFT_CAP_CHARS]
+            + "\n\n[memory.md truncated at 50KB — entries beyond this point are "
+            "not visible. Prune stale entries with memory_str_replace.]"
+        )
+    return text
 
 
 def _resolve_config_path(path_value: str, *, default_path: Path) -> Path:
@@ -1231,218 +1242,192 @@ def _ensure_memory_document(text: str) -> str:
     )
 
 
-def _memory_section_titles(text: str) -> List[str]:
-    titles = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            titles.append(stripped[3:].strip())
-    return titles
+# Serializes read-modify-write cycles across the CLI/Telegram/Feishu/webhook
+# channels and scheduled runs that share this process, so concurrent edits
+# can't lose each other's updates. Shared by memory_* and file_* mutations.
+_file_write_lock = asyncio.Lock()
 
 
-def _missing_memory_section_error(section: str, text: str) -> str:
-    titles = _memory_section_titles(text)
-    if titles:
-        available = ", ".join(f"## {title}" for title in titles)
-    else:
-        available = "none"
-    return (
-        f"Error: memory section not found: ## {section}. "
-        f"Existing sections: {available}. Call memory_read before choosing a section title."
-    )
+def _read_memory_document() -> str:
+    """Full-fidelity memory.md for editing (no injection cap), with scaffold."""
+    memory_path = _memory_file_path()
+    current = memory_path.read_text(encoding="utf-8") if memory_path.exists() else ""
+    return _ensure_memory_document(current)
 
 
-def _find_memory_section(lines: List[str], section: str) -> Optional[Tuple[int, int]]:
-    header = f"## {section}"
-    start = None
-    for i, line in enumerate(lines):
-        if line.strip() == header:
-            start = i
-            break
+def _memory_capacity_error(updated: str, current: str) -> Optional[str]:
+    """Reject writes that grow memory.md past the injection cap.
 
-    if start is None:
-        return None
-
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if lines[j].strip().startswith("## "):
-            end = j
-            break
-    return start, end
-
-
-def _memory_section_block(header: str, body_lines: List[str], *, has_next: bool) -> List[str]:
-    body = [line.rstrip() for line in body_lines]
-    while body and not body[0].strip():
-        body.pop(0)
-    while body and not body[-1].strip():
-        body.pop()
-
-    block = [header]
-    if body:
-        block.extend(["", *body])
-    if has_next:
-        block.append("")
-    return block
-
-
-def _replace_memory_section(text: str, section: str, body: str) -> Optional[str]:
-    text = _ensure_memory_document(text)
-    lines = text.splitlines()
-    bounds = _find_memory_section(lines, section)
-    if bounds is None:
-        return None
-
-    start, end = bounds
-    header = f"## {section}"
-    replacement = _memory_section_block(
-        header,
-        body.splitlines(),
-        has_next=end < len(lines),
-    )
-    new_lines = [*lines[:start], *replacement, *lines[end:]]
-    return "\n".join(new_lines).rstrip() + "\n"
-
-
-def _memory_substantive_lines(lines: List[str]) -> List[str]:
-    result = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("<!--") and stripped.endswith("-->"):
-            continue
-        result.append(stripped)
-    return result
-
-
-def _replace_section_removal_error(
-    text: str, section: str, replacement_body: str
-) -> Optional[str]:
-    """Reject accidental destructive section replacement.
-
-    `replace_section` is still available for deliberate rewrites, but the new
-    body must carry forward the existing substantive lines. This catches the
-    common LLM mistake of using replacement when it meant append.
+    Shrinking edits are always allowed even above the cap — pruning must stay
+    possible, otherwise an oversized file could never be repaired.
     """
-    current = _ensure_memory_document(text)
-    lines = current.splitlines()
-    bounds = _find_memory_section(lines, section)
-    if bounds is None:
+    if len(updated) <= MEMORY_SOFT_CAP_CHARS or len(updated) <= len(current):
         return None
-
-    start, end = bounds
-    existing_lines = _memory_substantive_lines(lines[start + 1 : end])
-    if not existing_lines:
-        return None
-
-    replacement_lines = set(_memory_substantive_lines(replacement_body.splitlines()))
-    missing = [line for line in existing_lines if line not in replacement_lines]
-    if not missing:
-        return None
-
     return (
-        "Error: replace_section would remove existing memory content. "
-        "Use mode='append' to add one item, or call memory_read and pass the "
-        f"complete updated body for ## {section}. First omitted line: {missing[0]}"
+        f"Error: memory.md would grow to {len(updated)} chars, over the "
+        f"{MEMORY_SOFT_CAP_CHARS} char injection cap. Prune stale entries first "
+        "(memory_str_replace with new_str='') instead of adding more."
     )
 
 
-def _append_memory_section(text: str, section: str, content: str) -> Optional[str]:
-    current = _ensure_memory_document(text)
-    lines = current.splitlines()
-    bounds = _find_memory_section(lines, section)
-
-    entry = content.rstrip()
-    if entry and not entry.lstrip().startswith(("-", "*", "1.")):
-        entry = f"- {entry}"
-
-    if bounds is None:
-        return None
-
-    start, end = bounds
-    section_lines = lines[start + 1 : end]
-    normalized_existing = {line.strip() for line in section_lines if line.strip()}
-    if entry.strip() in normalized_existing:
-        return current.rstrip() + "\n"
-
-    body_lines = [line.rstrip() for line in section_lines]
-    while body_lines and not body_lines[-1].strip():
-        body_lines.pop()
-    body_lines.append(entry)
-    replacement = _memory_section_block(
-        f"## {section}",
-        body_lines,
-        has_next=end < len(lines),
-    )
-    new_lines = [*lines[:start], *replacement, *lines[end:]]
-    return "\n".join(new_lines).rstrip() + "\n"
-
-
-@agent.tool
-async def memory_read(ctx: RunContext[SecretaryDeps]) -> str:
-    """Read the complete memory.md file for inspection or complex edits.
-
-    Long-term memory is already injected into every run. Use this when the user
-    asks to inspect memory.md, or before complex rewrites that need the latest
-    on-disk file. For routine memory updates, prefer memory_update.
-    """
-    return _load_memory_md() or "memory.md is empty or missing"
-
-
-@agent.tool
-async def memory_update(
+def _write_memory_document(
     ctx: RunContext[SecretaryDeps],
-    section: str,
-    content: str,
-    mode: str = "append",
+    memory_path: Path,
+    updated: str,
+    *,
+    tool: str,
+    subject: str,
+) -> None:
+    ensure_daily_memory_backup()
+    atomic_write_text(memory_path, updated)
+    _record_agent_event(
+        ctx.deps.db,
+        "memory_update",
+        origin=ctx.deps.origin_channel,
+        run_id=ctx.deps.run_id or None,
+        subject=subject,
+        payload={"tool": tool, "content_chars": len(updated)},
+    )
+
+
+@agent.tool
+async def memory_view(
+    ctx: RunContext[SecretaryDeps],
+    view_range: Optional[List[int]] = None,
 ) -> str:
-    """Update memory.md as the long-term memory store.
+    """View memory.md with line numbers.
 
-    Use this instead of file_write for durable user preferences, collaboration
-    agreements, long-term facts, tracking items, trading plans, and topics that
-    should affect future reminders or reviews. The section argument is an exact
-    Markdown H2 title from memory.md, without the leading "##". Use memory_read
-    before choosing a section title. mode='append' adds one item;
-    mode='replace_section' replaces the whole section body.
+    Long-term memory is already injected into every run. Call this before
+    editing so memory_str_replace / memory_insert can anchor on the exact
+    current on-disk text. view_range=[start, end] limits output to those
+    1-based lines (end=-1 means end of file).
     """
-    section_title = (section or "").strip()
-    if section_title.startswith("## "):
-        section_title = section_title[3:].strip()
-    if not section_title:
-        return "Error: section must be a non-empty Markdown H2 title"
-    if mode not in ("append", "replace_section"):
-        return "Error: mode must be 'append' or 'replace_section'"
-
     try:
-        memory_path = _memory_file_path()
-        current = memory_path.read_text(encoding="utf-8") if memory_path.exists() else ""
-        if mode == "replace_section":
-            removal_error = _replace_section_removal_error(current, section_title, content)
-            if removal_error is not None:
-                return removal_error
-            updated = _replace_memory_section(current, section_title, content)
-        else:
-            updated = _append_memory_section(current, section_title, content)
-        if updated is None:
-            return _missing_memory_section_error(section_title, _ensure_memory_document(current))
-        ensure_daily_memory_backup()
-        memory_path.parent.mkdir(parents=True, exist_ok=True)
-        memory_path.write_text(updated, encoding="utf-8")
-        _record_agent_event(
-            ctx.deps.db,
-            "memory_update",
-            origin=ctx.deps.origin_channel,
-            run_id=ctx.deps.run_id or None,
-            subject=section_title,
-            payload={
-                "mode": mode,
-                "content_chars": len(content or ""),
-            },
+        text = _read_memory_document()
+    except Exception as e:
+        return f"Error reading memory.md: {e}"
+    lines = text.split("\n")
+
+    start, end = 1, len(lines)
+    if view_range is not None:
+        if len(view_range) != 2:
+            return "Error: view_range must be [start_line, end_line]"
+        start = max(1, view_range[0])
+        end = len(lines) if view_range[1] == -1 else min(view_range[1], len(lines))
+        if start > end:
+            return f"Error: invalid view_range {view_range}; memory.md has {len(lines)} lines"
+
+    numbered = numbered_lines(lines[start - 1 : end], start)
+    return "Contents of memory.md with line numbers:\n" + "\n".join(numbered)
+
+
+@agent.tool
+async def memory_str_replace(
+    ctx: RunContext[SecretaryDeps],
+    old_str: str,
+    new_str: str = "",
+) -> str:
+    """Edit long-term memory by replacing an exact snippet of memory.md.
+
+    This is the primary tool for durable user preferences, collaboration
+    agreements, long-term facts, tracking items, and trading plans: rewrite an
+    entry by replacing its current text, or delete it with new_str="" (include
+    the trailing newline in old_str to avoid leaving a blank line). old_str
+    must appear verbatim and exactly once in memory.md — call memory_view
+    first and copy the exact text without the line-number prefix. To add a new
+    entry, use memory_insert instead.
+    """
+    if not old_str:
+        return "Error: old_str must be a non-empty exact snippet from memory.md"
+    try:
+        async with _file_write_lock:
+            memory_path = _memory_file_path()
+            text = _read_memory_document()
+
+            try:
+                updated, changed_line_index = str_replace_unique(
+                    text, old_str, new_str, filename="memory.md"
+                )
+            except ValueError as e:
+                return f"Error: {e} Call memory_view and copy the exact current text."
+
+            capacity_error = _memory_capacity_error(updated, text)
+            if capacity_error is not None:
+                return capacity_error
+            _write_memory_document(
+                ctx,
+                memory_path,
+                updated,
+                tool="memory_str_replace",
+                subject=old_str.strip().split("\n")[0][:80],
+            )
+        return (
+            "memory.md edited. Snippet around the change:\n"
+            + edit_snippet(updated, changed_line_index)
         )
-        return f"memory.md updated: {section_title} ({mode})"
     except Exception as e:
         return f"Error updating memory.md: {e}"
+
+
+@agent.tool
+async def memory_insert(
+    ctx: RunContext[SecretaryDeps],
+    insert_line: int,
+    insert_text: str,
+) -> str:
+    """Add a new entry to memory.md after a given 1-based line number.
+
+    insert_line=N inserts after line N (0 inserts at the top of the file).
+    Call memory_view to pick the target line — usually the last entry of the
+    section the new item belongs to. Format entries as short "- " bullets and
+    keep memory concise. To rewrite or delete existing entries, use
+    memory_str_replace instead.
+    """
+    entry = insert_text.rstrip("\n")
+    if not entry.strip():
+        return "Error: insert_text must be non-empty"
+    try:
+        async with _file_write_lock:
+            memory_path = _memory_file_path()
+            text = _read_memory_document()
+            lines = text.split("\n")
+
+            if insert_line < 0 or insert_line > len(lines):
+                return (
+                    f"Error: invalid insert_line {insert_line}; "
+                    f"it must be within [0, {len(lines)}]"
+                )
+            # Exact-duplicate guard: the same entry re-inserted (e.g. a retried
+            # run) is a silent no-op success rather than a duplicated memory.
+            existing = {line.strip() for line in lines if line.strip()}
+            if "\n" not in entry and entry.strip() in existing:
+                return "memory.md unchanged: identical entry already exists"
+
+            lines[insert_line:insert_line] = entry.split("\n")
+            updated = "\n".join(lines)
+            if not updated.endswith("\n"):
+                updated += "\n"
+            capacity_error = _memory_capacity_error(updated, text)
+            if capacity_error is not None:
+                return capacity_error
+            _write_memory_document(
+                ctx,
+                memory_path,
+                updated,
+                tool="memory_insert",
+                subject=entry.strip().split("\n")[0][:80],
+            )
+        return (
+            "memory.md edited. Snippet around the change:\n"
+            + edit_snippet(updated, insert_line)
+        )
+    except Exception as e:
+        return f"Error updating memory.md: {e}"
+
+
+# file_read truncation cap. Also bounds file_write overwrites: replacing a
+# file the model can never have fully read silently drops the unseen tail.
+FILE_READ_CAP_CHARS = 50_000
 
 
 @agent.tool
@@ -1456,12 +1441,52 @@ async def file_read(ctx: RunContext[SecretaryDeps], path: str) -> str:
         return f"Error: File not found: {path}"
     try:
         with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read(50_000)
-        if len(content) == 50_000:
+            content = f.read(FILE_READ_CAP_CHARS)
+        if len(content) == FILE_READ_CAP_CHARS:
             content += "\n... [truncated at 50KB]"
         return content
     except Exception as e:
         return f"Error reading file: {e}"
+
+
+@agent.tool
+async def file_edit(
+    ctx: RunContext[SecretaryDeps],
+    path: str,
+    old_str: str,
+    new_str: str = "",
+) -> str:
+    """Edit a file by replacing an exact snippet (whitelist-restricted).
+
+    Prefer this over file_write for targeted changes to an existing data
+    file: old_str must appear verbatim and exactly once in the file (call
+    file_read first and copy the exact text); new_str="" deletes the snippet.
+    For memory.md use memory_str_replace instead.
+    """
+    safe, decision = check_path_decision(path, for_write=True, tool="file_edit")
+    if not decision.allowed:
+        return _record_permission_denied(ctx.deps, decision)
+    if not old_str:
+        return f"Error: old_str must be a non-empty exact snippet from {path}"
+    file_path = BASE_DIR / safe
+    if not file_path.exists():
+        return f"Error: File not found: {path}"
+    try:
+        async with _file_write_lock:
+            text = file_path.read_text(encoding="utf-8")
+            try:
+                updated, changed_line_index = str_replace_unique(
+                    text, old_str, new_str, filename=path
+                )
+            except ValueError as e:
+                return f"Error: {e} Call file_read and copy the exact current text."
+            atomic_write_text(file_path, updated)
+        return (
+            f"{path} edited. Snippet around the change:\n"
+            + edit_snippet(updated, changed_line_index)
+        )
+    except Exception as e:
+        return f"Error editing file: {e}"
 
 
 @agent.tool
@@ -1471,16 +1496,34 @@ async def file_write(
     content: str,
     mode: str = "overwrite",
 ) -> str:
-    """Write to a file (whitelist-restricted)."""
+    """Write to a file (whitelist-restricted).
+
+    mode='overwrite' replaces the whole file; mode='append' adds to the end.
+    Overwriting an existing file larger than the 50KB file_read cap is
+    refused — the unseen tail would be silently lost; use file_edit or
+    mode='append' instead.
+    """
     safe, decision = check_path_decision(path, for_write=True, tool="file_write")
     if not decision.allowed:
         return _record_permission_denied(ctx.deps, decision)
     file_path = BASE_DIR / safe
     try:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        write_mode = "a" if mode == "append" else "w"
-        with open(file_path, write_mode, encoding="utf-8") as f:
-            f.write(content)
+        async with _file_write_lock:
+            existing = (
+                file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+            )
+            if mode == "append":
+                updated = existing + content
+            else:
+                if len(existing) > FILE_READ_CAP_CHARS:
+                    return (
+                        f"Error: {path} is larger than the 50KB file_read cap; "
+                        "overwriting it would silently drop content you never "
+                        "saw. Use file_edit for targeted changes or "
+                        "mode='append'."
+                    )
+                updated = content
+            atomic_write_text(file_path, updated)
         return f"File written successfully: {path}"
     except Exception as e:
         return f"Error writing file: {e}"

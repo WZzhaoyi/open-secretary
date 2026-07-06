@@ -678,8 +678,12 @@ def test_memory_tools_registered():
     assert "load_skill" in tool_names
     assert "record_event" in tool_names
     assert "update_event_summary" in tool_names
-    assert "memory_read" in tool_names
-    assert "memory_update" in tool_names
+    assert "memory_view" in tool_names
+    assert "memory_str_replace" in tool_names
+    assert "memory_insert" in tool_names
+    # Old blob-based tools must be fully removed, not left as aliases.
+    assert "memory_read" not in tool_names
+    assert "memory_update" not in tool_names
 
 
 @pytest.mark.asyncio
@@ -852,7 +856,7 @@ def test_default_schedule_prompts_follow_memory_events_design():
     # scheduled prompts point at memory.md/events instead of the removed
     # items table.
     assert "status='open'" in pending_prompt
-    assert "memory_read" in consolidation_prompt
+    assert "memory_view" in consolidation_prompt
     assert "secretary-core" in consolidation_prompt
     assert "memory.md rules" in consolidation_prompt
     assert "50KB" in consolidation_prompt or "50 KB" in consolidation_prompt
@@ -1270,17 +1274,18 @@ async def test_auto_loaded_core_skill_injected_into_system_prompt(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_memory_update_appends_to_exact_section_title(tmp_path, monkeypatch):
-    """memory_update should use the exact Markdown H2 title already in memory.md."""
+async def test_memory_insert_adds_entry_after_line(tmp_path, monkeypatch):
+    """memory_insert adds one bullet after a 1-based line, preserving the rest verbatim."""
     import runtime
-    from runtime import memory_update, SecretaryDeps
+    from runtime import memory_insert, SecretaryDeps
 
     memory_file = tmp_path / "memory.md"
     memory_file.write_text(
         "# 长期记忆\n\n"
         "## 用户偏好\n\n"
         "## 协作约定\n\n"
-        "## 在追踪的事项\n",
+        "## 在追踪的事项\n"
+        "- 已有追踪项\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
@@ -1291,20 +1296,72 @@ async def test_memory_update_appends_to_exact_section_title(tmp_path, monkeypatc
         def __init__(self, deps):
             self.deps = deps
 
-    result = await memory_update(
+    result = await memory_insert(
         _Ctx(deps),
-        section="在追踪的事项",
-        content="中东局势（伊朗、霍尔木兹海峡）",
+        insert_line=8,
+        insert_text="- 中东局势（伊朗、霍尔木兹海峡）",
     )
 
-    text = memory_file.read_text(encoding="utf-8")
-    assert "memory.md updated: 在追踪的事项" in result
-    assert "- 中东局势（伊朗、霍尔木兹海峡）" in text
-    assert "## 在追踪的事项" in text
-    assert "## Tracked Items" not in text
+    assert "memory.md edited" in result
+    assert memory_file.read_text(encoding="utf-8") == (
+        "# 长期记忆\n\n"
+        "## 用户偏好\n\n"
+        "## 协作约定\n\n"
+        "## 在追踪的事项\n"
+        "- 已有追踪项\n"
+        "- 中东局势（伊朗、霍尔木兹海峡）\n"
+    )
     events = deps.db.get_agent_events()
     assert events[0].type == "memory_update"
-    assert events[0].subject == "在追踪的事项"
+    assert events[0].subject == "- 中东局势（伊朗、霍尔木兹海峡）"
+    assert '"tool": "memory_insert"' in events[0].payload_json
+
+
+@pytest.mark.asyncio
+async def test_memory_insert_skips_exact_duplicate_entry(tmp_path, monkeypatch):
+    """Re-inserting an identical entry (e.g. a retried run) must not duplicate it."""
+    import runtime
+    from runtime import memory_insert, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    original = "# 长期记忆\n\n## 在追踪的事项\n- 已有追踪项\n"
+    memory_file.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_insert(_Ctx(deps), insert_line=4, insert_text="- 已有追踪项")
+
+    assert "identical entry already exists" in result
+    assert memory_file.read_text(encoding="utf-8") == original
+    assert deps.db.get_agent_events() == []
+
+
+@pytest.mark.asyncio
+async def test_memory_insert_rejects_out_of_range_line(tmp_path, monkeypatch):
+    import runtime
+    from runtime import memory_insert, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    original = "# 长期记忆\n\n## 用户偏好\n"
+    memory_file.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_insert(_Ctx(deps), insert_line=99, insert_text="- 新条目")
+
+    assert "Error: invalid insert_line 99" in result
+    assert memory_file.read_text(encoding="utf-8") == original
+    assert deps.db.get_agent_events() == []
 
 
 def test_daily_memory_backup_creates_one_snapshot_per_day(tmp_path, monkeypatch):
@@ -1372,142 +1429,90 @@ def test_daily_memory_backup_respects_config_switch(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_memory_update_append_preserves_existing_section_content(tmp_path, monkeypatch):
+async def test_memory_str_replace_rewrites_unique_snippet(tmp_path, monkeypatch):
+    """A unique verbatim match is rewritten in place; the rest stays untouched."""
     import runtime
-    from runtime import memory_update, SecretaryDeps
-
-    memory_file = tmp_path / "memory.md"
-    original = (
-        "# 长期记忆\n\n"
-        "## 用户偏好\n\n"
-        "- 旧偏好\n"
-        "## 协作约定\n"
-        "- 旧约定\n"
-        "## 在追踪的事项\n"
-        "- 旧追踪项\n"
-    )
-    memory_file.write_text(original, encoding="utf-8")
-    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
-
-    deps = SecretaryDeps(db=Database(db_path=":memory:"))
-
-    class _Ctx:
-        def __init__(self, deps):
-            self.deps = deps
-
-    result = await memory_update(
-        _Ctx(deps),
-        section="用户偏好",
-        content="新增偏好",
-    )
-
-    text = memory_file.read_text(encoding="utf-8")
-    assert "memory.md updated: 用户偏好" in result
-    assert "- 旧偏好" in text
-    assert "- 新增偏好" in text
-    assert "- 旧约定" in text
-    assert "- 旧追踪项" in text
-
-
-@pytest.mark.asyncio
-async def test_memory_update_append_preserves_markdown_section_spacing(
-    tmp_path, monkeypatch
-):
-    import runtime
-    from runtime import memory_update, SecretaryDeps
+    from runtime import memory_str_replace, SecretaryDeps
 
     memory_file = tmp_path / "memory.md"
     memory_file.write_text(
-        "# 长期记忆\n\n"
-        "## 用户偏好\n\n"
-        "- 旧偏好 A\n"
-        "- 旧偏好 B\n\n"
-        "## 协作约定\n\n"
-        "- 旧约定\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
-
-    deps = SecretaryDeps(db=Database(db_path=":memory:"))
-
-    class _Ctx:
-        def __init__(self, deps):
-            self.deps = deps
-
-    result = await memory_update(
-        _Ctx(deps),
-        section="用户偏好",
-        content="新增偏好",
-    )
-
-    assert "memory.md updated: 用户偏好" in result
-    assert memory_file.read_text(encoding="utf-8") == (
-        "# 长期记忆\n\n"
-        "## 用户偏好\n\n"
-        "- 旧偏好 A\n"
-        "- 旧偏好 B\n"
-        "- 新增偏好\n\n"
-        "## 协作约定\n\n"
-        "- 旧约定\n"
-    )
-
-
-@pytest.mark.asyncio
-async def test_memory_update_replace_section_normalizes_markdown_spacing(
-    tmp_path, monkeypatch
-):
-    import runtime
-    from runtime import memory_update, SecretaryDeps
-
-    memory_file = tmp_path / "memory.md"
-    memory_file.write_text(
-        "# 长期记忆\n\n"
-        "## 用户偏好\n\n"
-        "- 旧偏好\n\n"
-        "## 协作约定\n\n"
-        "- 旧约定\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
-
-    deps = SecretaryDeps(db=Database(db_path=":memory:"))
-
-    class _Ctx:
-        def __init__(self, deps):
-            self.deps = deps
-
-    result = await memory_update(
-        _Ctx(deps),
-        section="用户偏好",
-        content="\n- 旧偏好\n- 新偏好\n\n",
-        mode="replace_section",
-    )
-
-    assert "memory.md updated: 用户偏好" in result
-    assert memory_file.read_text(encoding="utf-8") == (
-        "# 长期记忆\n\n"
-        "## 用户偏好\n\n"
-        "- 旧偏好\n"
-        "- 新偏好\n\n"
-        "## 协作约定\n\n"
-        "- 旧约定\n"
-    )
-
-
-@pytest.mark.asyncio
-async def test_memory_update_replace_section_rejects_accidental_deletion(
-    tmp_path, monkeypatch
-):
-    import runtime
-    from runtime import memory_update, SecretaryDeps
-
-    memory_file = tmp_path / "memory.md"
-    original = (
         "# 长期记忆\n\n"
         "## 用户偏好\n"
-        "- 旧偏好 A\n"
-        "- 旧偏好 B\n"
+        "- 喜欢喝茶\n"
+        "- 早上不要打扰\n\n"
+        "## 协作约定\n"
+        "- 旧约定\n",
+        encoding="utf-8",
     )
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_str_replace(
+        _Ctx(deps),
+        old_str="- 喜欢喝茶",
+        new_str="- 喜欢喝咖啡，不喝茶",
+    )
+
+    assert "memory.md edited" in result
+    assert memory_file.read_text(encoding="utf-8") == (
+        "# 长期记忆\n\n"
+        "## 用户偏好\n"
+        "- 喜欢喝咖啡，不喝茶\n"
+        "- 早上不要打扰\n\n"
+        "## 协作约定\n"
+        "- 旧约定\n"
+    )
+    events = deps.db.get_agent_events()
+    assert events[0].type == "memory_update"
+    assert '"tool": "memory_str_replace"' in events[0].payload_json
+
+
+@pytest.mark.asyncio
+async def test_memory_str_replace_deletes_entry_with_empty_new_str(
+    tmp_path, monkeypatch
+):
+    """Stale entries are removable: new_str='' with a trailing-newline anchor."""
+    import runtime
+    from runtime import memory_str_replace, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text(
+        "# 长期记忆\n\n"
+        "## 在追踪的事项\n"
+        "- 已平仓的旧持仓\n"
+        "- 仍在跟踪的计划\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    result = await memory_str_replace(_Ctx(deps), old_str="- 已平仓的旧持仓\n")
+
+    assert "memory.md edited" in result
+    assert memory_file.read_text(encoding="utf-8") == (
+        "# 长期记忆\n\n"
+        "## 在追踪的事项\n"
+        "- 仍在跟踪的计划\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_str_replace_rejects_zero_matches(tmp_path, monkeypatch):
+    import runtime
+    from runtime import memory_str_replace, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    original = "# 长期记忆\n\n## 用户偏好\n- 喜欢喝茶\n"
     memory_file.write_text(original, encoding="utf-8")
     monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
 
@@ -1517,47 +1522,103 @@ async def test_memory_update_replace_section_rejects_accidental_deletion(
         def __init__(self, deps):
             self.deps = deps
 
-    result = await memory_update(
-        _Ctx(deps),
-        section="用户偏好",
-        content="- 新增偏好",
-        mode="replace_section",
+    result = await memory_str_replace(
+        _Ctx(deps), old_str="- 喜欢喝奶茶", new_str="- 改写"
     )
 
-    assert "replace_section would remove existing memory content" in result
+    assert "did not appear verbatim" in result
     assert memory_file.read_text(encoding="utf-8") == original
     assert deps.db.get_agent_events() == []
 
 
 @pytest.mark.asyncio
-async def test_memory_update_accepts_english_section_names(tmp_path, monkeypatch):
+async def test_memory_str_replace_rejects_ambiguous_matches(tmp_path, monkeypatch):
+    """Multiple matches are refused with line numbers so the model can disambiguate."""
     import runtime
-    from runtime import memory_update, SecretaryDeps
+    from runtime import memory_str_replace, SecretaryDeps
 
     memory_file = tmp_path / "memory.md"
+    original = (
+        "# 长期记忆\n\n"
+        "## 用户偏好\n"
+        "- 关注 AI\n\n"
+        "## 在追踪的事项\n"
+        "- 关注 AI\n"
+    )
+    memory_file.write_text(original, encoding="utf-8")
     monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
     deps = SecretaryDeps(db=Database(db_path=":memory:"))
 
     class _Ctx:
         def __init__(self, deps):
             self.deps = deps
 
-    result = await memory_update(
-        _Ctx(deps),
-        section="User Preferences",
-        content="Prefers concise updates",
-    )
+    result = await memory_str_replace(_Ctx(deps), old_str="- 关注 AI", new_str="x")
 
-    text = memory_file.read_text(encoding="utf-8")
-    assert "memory.md updated: User Preferences" in result
-    assert "## User Preferences" in text
-    assert "- Prefers concise updates" in text
+    assert "appears 2 times" in result
+    assert "lines 4, 7" in result
+    assert memory_file.read_text(encoding="utf-8") == original
+    assert deps.db.get_agent_events() == []
 
 
 @pytest.mark.asyncio
-async def test_memory_update_uses_configured_memory_path(tmp_path, monkeypatch):
+async def test_memory_capacity_guard_blocks_growth_allows_prune(tmp_path, monkeypatch):
+    """Writes past the injection cap are refused, but pruning stays possible."""
+    import runtime
+    from runtime import memory_insert, memory_str_replace, SecretaryDeps
+
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text(
+        "# Memory\n\n## Tracked Items\n- old entry aaaaaaaaaa\n- keep\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+    monkeypatch.setattr(runtime, "MEMORY_SOFT_CAP_CHARS", 10)
+
+    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    original = memory_file.read_text(encoding="utf-8")
+    grow = await memory_insert(_Ctx(deps), insert_line=4, insert_text="- new entry")
+    assert "over the 10 char injection cap" in grow
+    assert memory_file.read_text(encoding="utf-8") == original
+
+    prune = await memory_str_replace(_Ctx(deps), old_str="- old entry aaaaaaaaaa\n")
+    assert "memory.md edited" in prune
+    assert "- old entry" not in memory_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_memory_view_shows_line_numbers_and_range(tmp_path, monkeypatch):
+    import runtime
+    from runtime import memory_view
+
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text(
+        "# 长期记忆\n\n## 用户偏好\n- 喜欢喝茶\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    full = await memory_view(None)
+    assert "    1\t# 长期记忆" in full
+    assert "    4\t- 喜欢喝茶" in full
+
+    ranged = await memory_view(None, view_range=[3, -1])
+    assert "    3\t## 用户偏好" in ranged
+    assert "# 长期记忆" not in ranged
+
+
+@pytest.mark.asyncio
+async def test_memory_insert_materializes_scaffold_on_configured_path(
+    tmp_path, monkeypatch
+):
+    """First write on a missing configured file creates the default scaffold."""
     from config import get_config
-    from runtime import memory_update, SecretaryDeps
+    from runtime import memory_insert, SecretaryDeps
 
     cfg = _config_for_model("anthropic", "claude-sonnet-4-20250514")
     cfg.memory.path = str(tmp_path / "configured-memory.md")
@@ -1569,45 +1630,32 @@ async def test_memory_update_uses_configured_memory_path(tmp_path, monkeypatch):
         def __init__(self, deps):
             self.deps = deps
 
-    result = await memory_update(
+    result = await memory_insert(
         _Ctx(deps),
-        section="User Preferences",
-        content="Configured memory path works",
+        insert_line=6,
+        insert_text="- Configured memory path works",
     )
 
     configured_memory = tmp_path / "configured-memory.md"
-    assert "memory.md updated: User Preferences" in result
-    assert configured_memory.exists()
-    assert "- Configured memory path works" in configured_memory.read_text(
-        encoding="utf-8"
-    )
+    assert "memory.md edited" in result
+    text = configured_memory.read_text(encoding="utf-8")
+    assert "## User Preferences" in text
+    assert "- Configured memory path works" in text
 
 
-@pytest.mark.asyncio
-async def test_memory_update_rejects_missing_section_title(tmp_path, monkeypatch):
+def test_load_memory_md_marks_truncation(tmp_path, monkeypatch):
+    """Prompt injection past the cap must be visibly truncated, never silent."""
     import runtime
-    from runtime import memory_update, SecretaryDeps
 
     memory_file = tmp_path / "memory.md"
-    memory_file.write_text("# 长期记忆\n\n## 用户偏好\n", encoding="utf-8")
+    memory_file.write_text("x" * 40, encoding="utf-8")
     monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
-    deps = SecretaryDeps(db=Database(db_path=":memory:"))
+    monkeypatch.setattr(runtime, "MEMORY_SOFT_CAP_CHARS", 10)
 
-    class _Ctx:
-        def __init__(self, deps):
-            self.deps = deps
-
-    result = await memory_update(
-        _Ctx(deps),
-        section="Tracked Items",
-        content="Should not create a new section",
-    )
-
-    text = memory_file.read_text(encoding="utf-8")
-    assert "Error: memory section not found: ## Tracked Items" in result
-    assert "Existing sections: ## 用户偏好" in result
-    assert "## Tracked Items" not in text
-    assert deps.db.get_agent_events() == []
+    injected = runtime._load_memory_md()
+    assert injected.startswith("x" * 10)
+    assert "truncated" in injected
+    assert "memory_str_replace" in injected
 
 
 @pytest.mark.asyncio
@@ -1827,12 +1875,12 @@ async def test_file_permission_denial_is_structured_and_recorded(fresh_db, monke
     result = await file_write(ctx, "memory.md", "bad")
     assert result.startswith("PERMISSION_DENIED")
     assert "tool: file_write" in result
-    assert "allowed_alternative: memory_update" in result
+    assert "allowed_alternative: memory_str_replace / memory_insert" in result
 
     result = await file_write(ctx, "data/custom-memory.md", "bad")
     assert result.startswith("PERMISSION_DENIED")
     assert "tool: file_write" in result
-    assert "allowed_alternative: memory_update" in result
+    assert "allowed_alternative: memory_str_replace / memory_insert" in result
 
     events = [
         event
@@ -1842,6 +1890,86 @@ async def test_file_permission_denial_is_structured_and_recorded(fresh_db, monke
     subjects = [event.subject for event in events]
     assert "file_read:protected_read_file" in subjects
     assert "file_write:protected_file" in subjects
+
+
+def test_file_edit_tool_registered():
+    """Generic files get the same anchored-edit model as memory.md."""
+    tool_names = list(runtime.agent._function_toolset.tools.keys())
+    assert "file_edit" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_file_edit_replaces_unique_snippet(tmp_path, monkeypatch):
+    """file_edit shares the memory editing core: unique verbatim anchor."""
+    import runtime
+    from runtime import file_edit, SecretaryDeps
+
+    monkeypatch.setattr(runtime, "BASE_DIR", tmp_path)
+    target = tmp_path / "data" / "notes.md"
+    target.parent.mkdir()
+    target.write_text("# Notes\n\n- old line\n- keep\n", encoding="utf-8")
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    ctx = _Ctx(SecretaryDeps(db=Database(db_path=":memory:")))
+
+    result = await file_edit(
+        ctx, "data/notes.md", old_str="- old line", new_str="- new line"
+    )
+    assert "data/notes.md edited" in result
+    assert target.read_text(encoding="utf-8") == "# Notes\n\n- new line\n- keep\n"
+
+    result = await file_edit(ctx, "data/notes.md", old_str="- missing")
+    assert "did not appear verbatim in data/notes.md" in result
+    assert "file_read" in result
+    assert target.read_text(encoding="utf-8") == "# Notes\n\n- new line\n- keep\n"
+
+
+@pytest.mark.asyncio
+async def test_file_edit_denied_on_memory_path(fresh_db):
+    """file_edit must respect the same protected-file policy as file_write."""
+    from runtime import file_edit, SecretaryDeps
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    ctx = _Ctx(SecretaryDeps(db=fresh_db))
+
+    result = await file_edit(ctx, "memory.md", old_str="x", new_str="y")
+    assert result.startswith("PERMISSION_DENIED")
+    assert "tool: file_edit" in result
+    assert "allowed_alternative: memory_str_replace / memory_insert" in result
+
+
+@pytest.mark.asyncio
+async def test_file_write_refuses_overwrite_beyond_read_cap(tmp_path, monkeypatch):
+    """Overwriting a file the model cannot fully read would drop the unseen tail."""
+    import runtime
+    from runtime import file_write, SecretaryDeps
+
+    monkeypatch.setattr(runtime, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(runtime, "FILE_READ_CAP_CHARS", 10)
+    target = tmp_path / "data" / "big.log"
+    target.parent.mkdir()
+    target.write_text("x" * 40, encoding="utf-8")
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    ctx = _Ctx(SecretaryDeps(db=Database(db_path=":memory:")))
+
+    result = await file_write(ctx, "data/big.log", "tiny")
+    assert "Error" in result
+    assert "file_edit" in result
+    assert target.read_text(encoding="utf-8") == "x" * 40
+
+    result = await file_write(ctx, "data/big.log", "-more", mode="append")
+    assert "successfully" in result
+    assert target.read_text(encoding="utf-8") == "x" * 40 + "-more"
 
 
 def test_memory_template_uses_three_sections():

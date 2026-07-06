@@ -129,9 +129,9 @@ def permission_denied(
 
 def _path_alternative(normalized: str, for_write: bool) -> Optional[str]:
     if _is_memory_path(normalized) and for_write:
-        return "memory_update"
+        return "memory_str_replace / memory_insert"
     if _is_memory_path(normalized):
-        return "memory_read"
+        return "memory_view"
     if normalized.startswith(("research/", "subagent_runs/")) and for_write:
         return "start_subagent / subagent artifact manager"
     if normalized == "config.yaml":
@@ -139,7 +139,7 @@ def _path_alternative(normalized: str, for_write: bool) -> Optional[str]:
     if normalized == "secretary_v2.db":
         return "db_query"
     if for_write:
-        return "file_write under data/"
+        return "file_edit / file_write under data/"
     return None
 
 

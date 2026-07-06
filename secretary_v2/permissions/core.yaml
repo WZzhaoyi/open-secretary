@@ -36,8 +36,8 @@ paths:
     - .example
 
   protected_files:
-    # Protected from generic agent file_write, not from human editing.
-    # memory.md is a shared user/agent document; agent writes it via memory_update.
+    # Protected from generic agent file_write/file_edit, not from human editing.
+    # memory.md is a shared user/agent document; agent writes it via memory_str_replace / memory_insert.
     - config.yaml
     - memory.md
     - secretary_v2.db

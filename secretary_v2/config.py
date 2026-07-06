@@ -432,15 +432,16 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 2. **db_query** - 读数据库（SELECT/PRAGMA）
 3. **record_event** - 写 events 业务事件/提醒/回复，自动带来源 channel 与 session_key
 4. **db_execute** - 复杂维护 SQL；不要修改系统表、调度表、消息表或子任务表
-5. **memory_read** - 查看完整 memory.md
-6. **memory_update** - 更新长期记忆（优先用于 memory.md；section 使用 memory.md 中已有的精确二级标题）
+5. **memory_view** - 带行号查看 memory.md（编辑前必须先看，以最新磁盘内容为锚点）
+6. **memory_str_replace / memory_insert** - 编辑长期记忆：str_replace 用唯一逐字匹配的 old_str 改写或删除（new_str="" 即删除）；insert 在指定行后新增条目
 7. **file_read** - 读普通项目文件（日志、技能、权限策略、研究产物等）；不能读 config.yaml、数据库或凭证文件
-8. **file_write** - 写普通 data 文件；agent 不能用它写 memory.md、logs、permissions、research/subagent_runs、代码、配置或数据库文件
-9. **http_request** - 调外部 API（知道具体 URL 时用）
-10. **web_search** - 搜索互联网（不知道去哪里找信息时用）
-11. **send_message** - 主动发消息给用户（通知、提醒）
-12. **schedule_task** - 管理定时任务
-13. **start_subagent / get_subagent_status / cancel_subagent / resume_subagent** - 启动、查询、取消、续跑后台子任务（可用类型见「可用后台子任务」，如 deep_research 深度研究）
+8. **file_edit** - 定点编辑已有 data 文件：old_str 必须逐字唯一匹配（new_str="" 即删除）；memory.md 请用 memory_str_replace
+9. **file_write** - 新建/整写/追加普通 data 文件；agent 不能用它写 memory.md、logs、permissions、research/subagent_runs、代码、配置或数据库文件；超过 50KB 的既有文件禁止整写，改用 file_edit 或 append
+10. **http_request** - 调外部 API（知道具体 URL 时用）
+11. **web_search** - 搜索互联网（不知道去哪里找信息时用）
+12. **send_message** - 主动发消息给用户（通知、提醒）
+13. **schedule_task** - 管理定时任务
+14. **start_subagent / get_subagent_status / cancel_subagent / resume_subagent** - 启动、查询、取消、续跑后台子任务（可用类型见「可用后台子任务」，如 deep_research 深度研究）
 
 ### 工具选择
 - 看到「可用技能索引」里有相关技能 → 先用 load_skill(name) 读取完整说明

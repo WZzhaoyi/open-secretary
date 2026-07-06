@@ -213,7 +213,7 @@ schedules:
     enabled: true
     prompt: |-
       Long-term memory consolidation: a weekly silent promote-then-prune maintenance task.
-      1. Call memory_read to inspect the current memory.md.
+      1. Call memory_view to inspect the current memory.md with line numbers.
       2. Use db_query to inspect recent event patterns: SELECT id,type,status,content,created_at FROM events WHERE created_at >= datetime('now','-30 days') ORDER BY created_at ASC
       3. Use db_query to inspect old events that can be pruned: SELECT id,type,status,content,created_at FROM events WHERE created_at < datetime('now','-30 days') AND status != 'open' ORDER BY created_at ASC
       4. Write only long-term valuable information into memory.md: stable preferences, collaboration agreements, tracked plans/projects/trading rules, and important decisions with their reasons.

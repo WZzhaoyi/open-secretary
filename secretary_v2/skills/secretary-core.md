@@ -36,7 +36,7 @@ auto_load: true
 - 仍需长期跟踪的计划、项目、主题和行为规则。
 
 `events` 是有时间点的事件流水，不替代长期记忆。若一条信息既是事件又会影响未来判断，
-应同时写 `events`，并用 `memory_update` 维护 `memory.md`。
+应同时写 `events`，并用 `memory_str_replace` / `memory_insert` 维护 `memory.md`。
 
 ## memory.md 栏目规则
 
@@ -46,16 +46,20 @@ auto_load: true
 读写规则：
 
 - 用户可以直接编辑 `memory.md`；agent 必须尊重用户手动维护的内容和结构。
-- 查看完整文件：`memory_read()`。
-- 更新长期记忆：优先使用 `memory_update(section, content, mode="append")`，其中
-  `section` 必须是 `memory_read()` 里已经存在的精确二级标题文本，不带 `##`。
-- 如果不确定该写入哪个栏目，先 `memory_read()`，从现有二级标题中选择最合适的一项；
+- 编辑前先 `memory_view()` 带行号查看最新文件，以磁盘上的原文为锚点。
+- 新增一条记忆：`memory_insert(insert_line, insert_text)`，在第 `insert_line` 行之后插入
+  （0 表示文件开头）。插入位置选所属栏目的最后一条之后；条目写成简短的 `- ` bullet。
+- 改写或纠正一条记忆：`memory_str_replace(old_str, new_str)`。`old_str` 必须逐字复制
+  `memory_view()` 里的现有原文（不含行号前缀），且在全文只出现一次；不唯一时按报错提示
+  补足上下文。
+- 删除过期条目：`memory_str_replace(old_str, new_str="")`，`old_str` 带上行尾换行符，
+  避免留下空行。
+- 如果不确定该写入哪个栏目，从 `memory_view()` 里的现有二级标题中选择最合适的一项；
   不要翻译、归一化或新建相似栏目。
-- 如果 `memory_update` 返回栏目不存在，重新 `memory_read()` 并选择现有标题，不要换一种语言重试。
-- 复杂合并、删除过期追踪项或重排某栏时，先 `memory_read()`，再用
-  `memory_update(..., mode="replace_section")`。
-- agent 不要用通用 `file_write("memory.md", ...)` 写长期记忆；即使用户要求重写，也应先
-  `memory_read()`，再用 `memory_update(..., mode="replace_section")` 按现有栏目更新。
+- 合并、重排或整理某栏时，用多次 `memory_str_replace` 逐条完成，每次只动一处原文。
+- agent 不要用通用 `file_write("memory.md", ...)` 写长期记忆；即使用户要求整体重写，
+  也应先 `memory_view()`，再逐条编辑。
+- `memory.md` 有 50KB 注入上限；写入被容量护栏拒绝时，先删除过期条目再补新内容。
 - 只有当用户明确要求新增栏目或整理整个文件结构时，才可以建议新增标题；新增前应说明原因，
   并避免制造与现有栏目含义重复的标题。
 
@@ -71,7 +75,7 @@ auto_load: true
 - `logged`：已记录，持续关注，未来出现相关线索时提醒。默认状态。
 - `open`：需要未来主动提醒、检查、追问或复盘。
 - `resolved`：原本需要关注，但用户已回复、完成、取消、放弃或给出结论。
-- `promoted`：事件中的长期价值已通过 `memory_update` 沉淀进 `memory.md`。
+- `promoted`：事件中的长期价值已沉淀进 `memory.md`。
 
 写 events 时：
 
@@ -82,7 +86,7 @@ auto_load: true
   event 并更新为 `resolved`。
 - 用户的后续更新即使被记录成 `note`，只要内容覆盖了某个提醒/检查的主题，也视为
   对该 `open` event 的回复；不要因为没有单独的 `response` event 就重复追问。
-- 当事件内容已通过 `memory_update` 写入 `memory.md` 后，相关 event 更新为 `promoted`。
+- 当事件内容已写入 `memory.md` 后，相关 event 更新为 `promoted`。
 - 不确定时宁可 `logged`，不要制造过多 `open`；但明确需要秘书持续持有注意力时必须 `open`。
 
 ## 定时任务查询规则
