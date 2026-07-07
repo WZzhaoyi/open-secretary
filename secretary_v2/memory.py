@@ -98,14 +98,18 @@ def _tool_return_ids(msg: ModelRequest) -> List[str]:
     return [
         tool_call_id
         for part in msg.parts
-        if getattr(part, "part_kind", "") == "tool-return"
+        if getattr(part, "part_kind", "") in {"tool-return", "retry-prompt"}
         for tool_call_id in [getattr(part, "tool_call_id", None)]
         if tool_call_id
     ]
 
 
 def _strip_tool_returns(msg: ModelRequest) -> Optional[ModelRequest]:
-    parts = [part for part in msg.parts if getattr(part, "part_kind", "") != "tool-return"]
+    parts = [
+        part
+        for part in msg.parts
+        if getattr(part, "part_kind", "") not in {"tool-return", "retry-prompt"}
+    ]
     if not parts:
         return None
     return msg if len(parts) == len(msg.parts) else replace(msg, parts=parts)

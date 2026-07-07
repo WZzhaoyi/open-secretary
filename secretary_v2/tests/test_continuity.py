@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
     ThinkingPart,
@@ -569,6 +570,36 @@ def test_load_pydantic_messages_drops_incomplete_tool_call_chain(fresh_db):
         pydantic_ai_msg=bytes(ModelMessagesTypeAdapter.dump_json([tool_call])),
     )
     fresh_db.save_message("request", "human-readable tool result without blob")
+    fresh_db.save_message(
+        "response",
+        "final answer",
+        pydantic_ai_msg=bytes(ModelMessagesTypeAdapter.dump_json([final_text])),
+    )
+
+    loaded = fresh_db.load_pydantic_messages()
+
+    assert len(loaded) == 1
+    assert isinstance(loaded[0], ModelResponse)
+    assert loaded[0].parts[0].content == "final answer"
+
+
+def test_load_pydantic_messages_drops_orphan_retry_prompt(fresh_db):
+    retry_prompt = ModelRequest(
+        parts=[
+            RetryPromptPart(
+                content="Unknown tool name: 'memory_read'",
+                tool_name="memory_read",
+                tool_call_id="call_orphan",
+            )
+        ]
+    )
+    final_text = ModelResponse(parts=[TextPart(content="final answer")])
+
+    fresh_db.save_message(
+        "request",
+        "tool retry without matching tool call",
+        pydantic_ai_msg=bytes(ModelMessagesTypeAdapter.dump_json([retry_prompt])),
+    )
     fresh_db.save_message(
         "response",
         "final answer",
