@@ -3,9 +3,11 @@
 #
 # What it does (idempotent — safe to re-run for upgrades):
 #   1. Creates a 2G swapfile + vm.swappiness=10 (subagent CLI bursts need headroom)
-#   2. Installs Python 3.12 from the deadsnakes PPA (Ubuntu 22.04 ships 3.10;
-#      the codebase uses 3.11+ features such as tomllib)
-#   3. Creates/updates secretary_v2/venv and installs requirements.txt
+#   2. Installs uv and, through it, Python 3.12 (Ubuntu 22.04 ships 3.10; the
+#      codebase uses 3.11+ features such as tomllib)
+#   3. Creates/updates a runtime venv OUTSIDE the source tree
+#      (default ~/.venvs/secretary, override with SECRETARY_VENV=...) so the
+#      checkout can be re-cloned or swapped without rebuilding the environment
 #   4. Copies config.yaml.example -> config.yaml if missing
 #   5. Installs the OpenCode CLI (vibe-coding tool for remote maintenance)
 #   6. Installs the systemd unit (bounded restarts), logrotate config, and the
@@ -14,7 +16,8 @@
 #
 # Usage — as the non-root user that should own the service (sudo required):
 #   bash deploy/deploy.sh
-#   RUN_TESTS=1 bash deploy/deploy.sh    # also run pytest before starting
+#   RUN_TESTS=1 bash deploy/deploy.sh              # also run pytest before starting
+#   SECRETARY_VENV=/opt/secretary-venv bash deploy/deploy.sh
 #
 # The HTTP webhook binds 127.0.0.1:11269 (hard-coded in the app). Expose it
 # through Cloudflare Tunnel + Zero Trust; do not open the port in the VPS
@@ -32,6 +35,9 @@ TEMPLATE_DIR="$REPO_DIR/deploy/templates"
 APP_USER="$(id -un)"
 APP_GROUP="$(id -gn)"
 APP_HOME="$HOME"
+# Runtime environment lives outside the repo to decouple code from environment.
+VENV_DIR="${SECRETARY_VENV:-$APP_HOME/.venvs/secretary}"
+PYTHON_VERSION="3.12"
 SWAP_FILE="/swapfile"
 SWAP_SIZE="2G"
 
@@ -64,26 +70,26 @@ if [ ! -f /etc/sysctl.d/99-secretary.conf ]; then
     sudo sysctl -q -p /etc/sysctl.d/99-secretary.conf
 fi
 
-# --- 2. Python 3.12 ----------------------------------------------------------
-if command -v python3.12 >/dev/null 2>&1; then
-    log "python3.12 already installed, skipping"
+# --- 2. Base packages + uv ---------------------------------------------------
+log "Installing base packages"
+sudo apt-get update -qq
+sudo apt-get install -y -qq curl git logrotate
+export PATH="$APP_HOME/.local/bin:$PATH"
+if command -v uv >/dev/null 2>&1; then
+    log "uv already installed, skipping"
 else
-    log "Installing Python 3.12 (deadsnakes PPA)"
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq software-properties-common curl git logrotate
-    sudo add-apt-repository -y ppa:deadsnakes/ppa
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq python3.12 python3.12-venv
+    log "Installing uv"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
+command -v uv >/dev/null 2>&1 || die "uv not on PATH after install"
 
-# --- 3. venv + dependencies --------------------------------------------------
-if [ ! -x "$SEC_DIR/venv/bin/python" ]; then
-    log "Creating virtualenv at secretary_v2/venv"
-    python3.12 -m venv "$SEC_DIR/venv"
+# --- 3. Runtime venv (outside the source tree) + dependencies ----------------
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    log "Creating runtime venv at $VENV_DIR (Python $PYTHON_VERSION via uv)"
+    uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
 fi
-log "Installing Python dependencies"
-"$SEC_DIR/venv/bin/pip" install --quiet --upgrade pip
-"$SEC_DIR/venv/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
+log "Installing Python dependencies into $VENV_DIR"
+uv pip install --quiet --python "$VENV_DIR/bin/python" -r "$REPO_DIR/requirements.txt"
 
 # --- 4. Config ---------------------------------------------------------------
 if [ ! -f "$SEC_DIR/config.yaml" ]; then
@@ -110,6 +116,7 @@ render() {
         -e "s|@APP_USER@|$APP_USER|g" \
         -e "s|@APP_GROUP@|$APP_GROUP|g" \
         -e "s|@APP_HOME@|$APP_HOME|g" \
+        -e "s|@VENV_DIR@|$VENV_DIR|g" \
         "$1" | sudo tee "$2" >/dev/null
 }
 log "Installing systemd units and logrotate config"
@@ -124,7 +131,7 @@ sudo systemctl start secretary-logclean.timer
 # --- 7. Tests (optional) -----------------------------------------------------
 if [ "${RUN_TESTS:-0}" = "1" ]; then
     log "Running test suite"
-    (cd "$SEC_DIR" && ./venv/bin/python -m pytest tests -q)
+    (cd "$SEC_DIR" && "$VENV_DIR/bin/python" -m pytest tests -q)
 fi
 
 # --- 8. Start ----------------------------------------------------------------
@@ -149,6 +156,10 @@ cat <<EOF
               (tighten the VPS security group to SSH only; Cloudflare Tunnel is outbound)
   opencode    run inside tmux for remote vibe coding:
               cd $REPO_DIR && opencode
-  NOTE        prefer systemctl over manage.sh on this host; manage.sh stop kills
-              the process but systemd will restart it, which is confusing.
+  runtime env $VENV_DIR (outside the source tree; re-clone/replace the checkout
+              freely, then re-run deploy/deploy.sh to sync dependencies)
+  upgrade     cd $REPO_DIR && git pull && bash deploy/deploy.sh && sudo systemctl restart secretary
+  NOTE        use systemctl, not manage.sh, on this host: manage.sh assumes a
+              repo-local venv that does not exist here, and its stop/start
+              fights the systemd unit.
 EOF
