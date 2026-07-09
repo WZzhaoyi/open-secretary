@@ -106,6 +106,11 @@ if grep -q "YOUR_LLM_API_KEY\|YOUR_TELEGRAM_BOT_TOKEN" "$SEC_DIR/config.yaml"; t
     CONFIG_READY=0
 fi
 
+# The unit redirects stdout to logs/secretary_v2.log; systemd opens that file
+# before ANY Exec step runs, so the directory must exist before first start
+# (logs/ is gitignored and absent from a fresh clone).
+mkdir -p "$SEC_DIR/logs"
+
 # --- 5. systemd units + logrotate ---------------------------------------------
 render() {
     sed -e "s|@APP_DIR@|$REPO_DIR|g" \
