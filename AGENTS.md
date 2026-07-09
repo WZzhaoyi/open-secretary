@@ -13,12 +13,8 @@
 - Prefer existing project patterns and helpers over introducing new abstractions.
 - Do not commit secrets, tokens, local config files, runtime logs, virtual environments, or generated caches.
 - Do not run `manage.sh` directly from Codex sandboxed commands because it can start the service incorrectly. Ask the user to start, stop, or restart the service manually when service control is needed.
-- For Python changes, run the relevant tests when feasible:
-
-  ```bash
-  cd secretary_v2
-  ./venv/bin/python -m pytest tests -q
-  ```
+- For Python changes, run the relevant tests when feasible: `python -m pytest tests -q` from `secretary_v2`.
+- Do not assume where the Python environment lives. The runtime venv is decoupled from the source tree and varies by host (a repo-local `secretary_v2/venv` on some dev machines, an external uv-managed venv such as `~/.venvs/secretary` on deployed hosts, or something else entirely). If the session has not already established which interpreter to use, ask the user instead of guessing a path.
 
 ## Operations (service control, logs)
 
