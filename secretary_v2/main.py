@@ -122,6 +122,7 @@ class SecretaryApp:
                 chat_id=self.config.channels.telegram.chat_id,
                 message_handler=self._handle_user_message,
                 peer_channel_names=active,
+                proxy=self.config.channels.telegram.proxy,
             )
 
         # Create Feishu channel if configured

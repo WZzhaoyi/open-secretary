@@ -76,9 +76,13 @@ class TelegramChannel(Channel):
         message_handler: Callable[[IncomingMessage], Awaitable[str]],
         peer_channel_names: Optional[list] = None,
         outbox_capacity: int = 100,
+        proxy: str = "",
     ):
         self.bot_token = bot_token
         self.chat_id = chat_id
+        # Outbound proxy URL for both the bot API pool and long-polling,
+        # e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080.
+        self.proxy = (proxy or "").strip()
         self.message_handler = message_handler
         # Names of all channels running alongside this one — surfaced via /status
         # so users can see the full I/O footprint (e.g. "telegram + http").
@@ -169,13 +173,19 @@ class TelegramChannel(Channel):
         self._get_updates_request = _StallTrackedRequest(
             connection_pool_size=1,
             http_version="1.1",
+            proxy=self.proxy or None,
         )
-        self.app = (
+        builder = (
             Application.builder()
             .token(self.bot_token)
             .get_updates_request(self._get_updates_request)
-            .build()
         )
+        if self.proxy:
+            # Covers the main bot API request pool. getUpdates traffic gets the
+            # proxy via the request object above instead, because PTB forbids
+            # combining get_updates_proxy() with get_updates_request().
+            builder = builder.proxy(self.proxy)
+        self.app = builder.build()
 
         self.app.add_handler(CommandHandler("start", self._start_command))
         self.app.add_handler(CommandHandler("help", self._help_command))

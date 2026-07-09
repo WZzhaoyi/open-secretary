@@ -24,6 +24,9 @@ class LLMConfig:
 class TelegramConfig:
     bot_token: str = ""
     chat_id: str = ""
+    # Optional outbound proxy for all Telegram API traffic, e.g.
+    # http://127.0.0.1:7890 or socks5://127.0.0.1:1080 (socks needs httpx[socks]).
+    proxy: str = ""
 
 
 @dataclass
