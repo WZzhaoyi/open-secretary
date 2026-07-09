@@ -83,6 +83,22 @@ def _opencli_search_enabled(tools: List[str]) -> bool:
     return any(pattern.startswith("opencli") for pattern in _bash_patterns_from_tools(tools))
 
 
+def agent_fallback_missing_binaries() -> List[str]:
+    """Binaries named by subagent.agent allowlisted Bash patterns but absent
+    from PATH. Non-empty means the fallback agent's shell tools cannot run on
+    this host and research degrades to model-only answers."""
+    missing = set()
+    for pattern in _bash_patterns_from_tools(get_config().subagent.agent.allowed_tools):
+        parts = pattern.split()
+        first = parts[0] if parts else ""
+        # Skip patterns whose command name itself is a wildcard.
+        if not first or any(ch in first for ch in "*?["):
+            continue
+        if shutil.which(first) is None:
+            missing.add(first)
+    return sorted(missing)
+
+
 def _internal_agent_system_prompt() -> str:
     cfg = get_config()
     agent_cfg = cfg.subagent.agent
@@ -262,6 +278,8 @@ class SubAgentRunner:
                 if engine == "agent":
                     raise RuntimeError("internal agent subagent fallback is disabled")
                 raise RuntimeError(f"{engine} CLI is not installed or not on PATH")
+            if engine == "agent":
+                self._warn_agent_fallback_gaps()
             return engine
 
         cfg = get_config().subagent
@@ -272,11 +290,25 @@ class SubAgentRunner:
             order.append(fallback)
         for engine in dict.fromkeys(order):
             if self.is_available(engine):
+                if engine == "agent":
+                    self._warn_agent_fallback_gaps()
                 return engine
         raise RuntimeError(
             "No subagent engine is available: neither claude nor codex CLI is on PATH, "
             "and internal agent fallback is disabled"
         )
+
+    def _warn_agent_fallback_gaps(self) -> None:
+        """Surface hosts where the fallback agent is enabled but toothless."""
+        missing = agent_fallback_missing_binaries()
+        if missing:
+            logger.warning(
+                "Internal agent fallback selected, but allowlisted command(s) "
+                "%s are not on PATH; its shell tools will fail and research "
+                "degrades to model-only answers. Install them on this host or "
+                "adjust subagent.agent.allowed_tools.",
+                ", ".join(missing),
+            )
 
     def build_command(
         self, engine: str, prompt: str, output_last_message: Optional[str] = None
