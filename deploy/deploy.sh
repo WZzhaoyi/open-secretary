@@ -9,10 +9,14 @@
 #      (default ~/.venvs/secretary, override with SECRETARY_VENV=...) so the
 #      checkout can be re-cloned or swapped without rebuilding the environment
 #   4. Copies config.yaml.example -> config.yaml if missing
-#   5. Installs the OpenCode CLI (vibe-coding tool for remote maintenance)
-#   6. Installs the systemd unit (bounded restarts), logrotate config, and the
+#   5. Installs the systemd unit (bounded restarts), logrotate config, and the
 #      daily stale-log cleanup timer
-#   7. Starts the service only when config.yaml no longer contains placeholders
+#   6. Starts the service only when config.yaml no longer contains placeholders
+#
+# Coding CLIs for the subagent engines (claude / codex) are optional and not
+# installed here; install them separately if you want research subagents on
+# this host. Anything on ~/.local/bin or /usr/local/bin is visible to the
+# service.
 #
 # Usage — as the non-root user that should own the service (sudo required):
 #   bash deploy/deploy.sh
@@ -102,15 +106,7 @@ if grep -q "YOUR_LLM_API_KEY\|YOUR_TELEGRAM_BOT_TOKEN" "$SEC_DIR/config.yaml"; t
     CONFIG_READY=0
 fi
 
-# --- 5. OpenCode CLI ---------------------------------------------------------
-if command -v opencode >/dev/null 2>&1 || [ -x "$APP_HOME/.opencode/bin/opencode" ]; then
-    log "OpenCode already installed, skipping"
-else
-    log "Installing OpenCode CLI"
-    curl -fsSL https://opencode.ai/install | bash
-fi
-
-# --- 6. systemd units + logrotate ---------------------------------------------
+# --- 5. systemd units + logrotate ---------------------------------------------
 render() {
     sed -e "s|@APP_DIR@|$REPO_DIR|g" \
         -e "s|@APP_USER@|$APP_USER|g" \
@@ -128,13 +124,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable secretary.service secretary-logclean.timer >/dev/null
 sudo systemctl start secretary-logclean.timer
 
-# --- 7. Tests (optional) -----------------------------------------------------
+# --- 6. Tests (optional) -----------------------------------------------------
 if [ "${RUN_TESTS:-0}" = "1" ]; then
     log "Running test suite"
     (cd "$SEC_DIR" && "$VENV_DIR/bin/python" -m pytest tests -q)
 fi
 
-# --- 8. Start ----------------------------------------------------------------
+# --- 7. Start ----------------------------------------------------------------
 if [ "$CONFIG_READY" = "1" ]; then
     log "Starting secretary.service (startup self-test takes ~40s)"
     sudo systemctl restart secretary.service
@@ -154,8 +150,6 @@ cat <<EOF
               sudo systemctl reset-failed secretary && sudo systemctl start secretary
   webhook     bound to 127.0.0.1:11269 — point cloudflared at http://127.0.0.1:11269
               (tighten the VPS security group to SSH only; Cloudflare Tunnel is outbound)
-  opencode    run inside tmux for remote vibe coding:
-              cd $REPO_DIR && opencode
   runtime env $VENV_DIR (outside the source tree; re-clone/replace the checkout
               freely, then re-run deploy/deploy.sh to sync dependencies)
   upgrade     cd $REPO_DIR && git pull && bash deploy/deploy.sh && sudo systemctl restart secretary

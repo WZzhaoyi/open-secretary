@@ -9,14 +9,12 @@ import yaml
 
 # Skills directory
 SKILLS_DIR = Path(__file__).parent / "skills"
-# Global skill roots, aligned with the Agent Skills standard as implemented by
-# Claude Code and opencode. opencode scans both `skill` and `skills` under its
-# config dir (`{skill,skills}/**/SKILL.md`), so we include both spellings.
+# Global skill roots, aligned with the Agent Skills standard
+# (`skills/**/SKILL.md`). Tool-specific skill directories are deliberately not
+# hardcoded here; point `skills.paths` in config.yaml at any extra roots.
 DEFAULT_GLOBAL_SKILL_DIRS = [
     Path("~/.agents/skills"),
     Path("~/.claude/skills"),
-    Path("~/.config/opencode/skill"),
-    Path("~/.config/opencode/skills"),
 ]
 
 # Single regex used both to parse frontmatter and to strip it from the body, so
@@ -96,8 +94,9 @@ class SkillsLoader:
         Two formats are supported, matching the Agent Skills standard plus this
         project's single-file extension:
 
-        - Directory skills: any-depth ``**/SKILL.md`` (Claude Code / opencode).
-          Bundled resource files travel with the skill for progressive loading.
+        - Directory skills: any-depth ``**/SKILL.md`` (the Agent Skills
+          standard). Bundled resource files travel with the skill for
+          progressive loading.
         - File skills: top-level ``*.md`` in a root (this project's own format).
 
         Earlier roots win on name collisions, so project skills override global

@@ -233,9 +233,9 @@ def discover_definitions(
 ) -> Dict[str, SubAgentDefinition]:
     """Discover every subagent_defs/<name>/AGENT.md definition.
 
-    Convention-based discovery (à la OpenCode's agent directory): the directory
-    name is the identifier, no central registry list. A malformed definition is
-    skipped with a warning rather than failing all discovery.
+    Convention-based discovery: the directory name is the identifier, no
+    central registry list. A malformed definition is skipped with a warning
+    rather than failing all discovery.
     """
     root = Path(base_dir or (BASE_DIR / "subagent_defs"))
     definitions: Dict[str, SubAgentDefinition] = {}
