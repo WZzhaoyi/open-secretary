@@ -1,6 +1,7 @@
 """Secretary v2 runtime - Pydantic AI Agent definition + tools."""
 
 import asyncio
+import inspect
 import ipaddress
 import json
 import logging
@@ -2313,7 +2314,11 @@ async def run_agent(
 
     usage_payload: Dict[str, Any] = {}
     try:
-        usage = result.usage()
+        # pydantic-ai 1.89 exposes AgentRunResult.usage as a method; newer 1.x
+        # makes it a property whose deprecation shim warns when called.
+        # Inspect the class so both installs stay warning-free.
+        usage_attr = inspect.getattr_static(type(result), "usage", None)
+        usage = result.usage if isinstance(usage_attr, property) else result.usage()
         global _last_usage
         _last_usage = _build_usage_payload(usage, origin_channel=origin_channel)
         usage_payload = dict(_last_usage)
