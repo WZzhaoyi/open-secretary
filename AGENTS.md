@@ -20,6 +20,14 @@
   ./venv/bin/python -m pytest tests -q
   ```
 
+## Operations (service control, logs)
+
+- Before touching the service, identify how this host runs it. Check `systemctl status secretary` first: if the unit exists, the host is a systemd deployment (VPS, set up by `deploy/deploy.sh`); if not, the service is managed by `secretary_v2/manage.sh` (development machines).
+- Never blindly restart. First read the tail of `secretary_v2/logs/secretary_v2.log` and understand why the service is down or unhealthy. A failed startup self-test, an invalid `config.yaml`, or an OOM kill will fail again on restart and only consume systemd's restart budget.
+- On systemd hosts, use `systemctl` only and do not mix in `manage.sh`: `manage.sh stop` kills the process but systemd immediately restarts it, and `manage.sh start` can race the unit. The unit allows at most 5 failed starts per 10 minutes, then enters the `failed` state; recover with `sudo systemctl reset-failed secretary && sudo systemctl start secretary` only after fixing the root cause.
+- Logs: the live file is `secretary_v2/logs/secretary_v2.log`. On systemd hosts it is rotated in place by logrotate (copytruncate) and old rotations are swept by the `secretary-logclean.timer`; do not rotate or delete it manually. With `manage.sh` the file rotates only at start and grows unbounded while the process runs — treat a huge log file as expected there, not as a bug to fix by restarting.
+- The HTTP webhook binds `127.0.0.1:11269` by design; external access goes through Cloudflare Tunnel. Do not "fix" unreachability by exposing the port.
+
 ## Commits
 
 - Use Conventional Commits for commit messages, such as `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, or `chore:`.
