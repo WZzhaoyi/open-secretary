@@ -87,6 +87,7 @@ class TelegramChannel(Channel):
         # Names of all channels running alongside this one — surfaced via /status
         # so users can see the full I/O footprint (e.g. "telegram + http").
         self.peer_channel_names = list(peer_channel_names or ["telegram"])
+        self.peer_channel_health_provider = None
         self.app: Optional[Application] = None
         self._running = False
         # Reference to the Application's getUpdates HTTPX request. Holds
@@ -243,6 +244,11 @@ class TelegramChannel(Channel):
         except Exception:
             return False
 
+    def health_status(self) -> str:
+        if self._is_ready():
+            return "healthy"
+        return "starting" if self._running else "stopped"
+
     async def send(self, text: str, user_id: Optional[str] = None) -> None:
         """Send a message to Telegram. Buffers when polling is being restarted
         so messages produced during the watchdog window aren't lost."""
@@ -389,92 +395,37 @@ class TelegramChannel(Channel):
         await update.message.reply_text(t("telegram.help", self._ui_lang(update)), parse_mode="Markdown")
 
     async def _status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /status command — pulls real config + DB stats."""
-        from config import get_config
-        from memory import get_db
-        from runtime import get_last_usage
+        """Handle /status command through the shared command implementation."""
+        from channel_commands import CommandScope, build_status_text
 
-        cfg = get_config()
         lang = self._ui_lang(update)
-        db = get_db()
+        chat_id = str(update.effective_chat.id)
+        thread_id = (
+            str(update.message.message_thread_id)
+            if getattr(update.message, "message_thread_id", None) is not None
+            else None
+        )
+        scope = CommandScope(
+            channel="telegram",
+            user_id=str(update.effective_user.id),
+            conversation_id=chat_id,
+            thread_id=thread_id,
+        )
         try:
-            stats = db.get_message_stats()
-            history_msgs = db.load_pydantic_messages()
-            history_count = len(history_msgs)
-            memory_path = Path(__file__).resolve().parents[1] / "memory.md"
-            memory_status = (
-                f"{memory_path.stat().st_size} bytes"
-                if memory_path.exists()
-                else t("telegram.status.memory_missing", lang)
+            status_text = build_status_text(
+                scope=scope,
+                lang=lang,
+                peer_channel_names=self.peer_channel_names,
+                channel_health=(
+                    self.peer_channel_health_provider()
+                    if self.peer_channel_health_provider
+                    else None
+                ),
             )
         except Exception as e:
-            logger.error(f"/status: stats query failed: {e}")
-            history_count = -1
-            memory_status = t("telegram.status.read_failed", lang)
-            stats = {"total_messages": -1}
-
-        # Context usage: the provider-reported input_tokens from the last run.
-        # Exact (it rode back on the API response), zero recompute cost.
-        usage = get_last_usage()
-        window = cfg.history.context_tokens
-        if usage and usage.get("input_tokens") is not None:
-            inp = usage["input_tokens"]
-            pct = f"{inp / window * 100:.0f}%" if window else "?"
-            usage_status = t(
-                "telegram.status.usage",
-                lang,
-                input_tokens=inp,
-                window=window,
-                pct=pct,
-                at=usage.get("at", "?"),
-                origin=usage.get("origin", "?"),
-            )
-            cache_hit = usage.get("cache_hit_tokens")
-            cache_miss = usage.get("cache_miss_tokens")
-            cache_read = usage.get("cache_read_tokens") or 0
-            cache_write = usage.get("cache_write_tokens") or 0
-            cache_ratio = usage.get("cache_hit_ratio")
-            if cache_hit or cache_miss or cache_read or cache_write:
-                ratio = f"{cache_ratio * 100:.1f}%" if isinstance(cache_ratio, (int, float)) else "?"
-                cache_status = t(
-                    "telegram.status.cache_metrics",
-                    lang,
-                    cache_hit=int(cache_hit or 0),
-                    cache_miss=int(cache_miss or 0),
-                    cache_write=int(cache_write),
-                    ratio=ratio,
-                )
-            else:
-                cache_status = t("telegram.status.no_cache_metrics", lang)
-        else:
-            usage_status = t("telegram.status.no_run", lang)
-            cache_status = t("telegram.status.no_run", lang)
-
-        hist_cfg = cfg.history
-        compact_threshold = int(hist_cfg.context_tokens * hist_cfg.compress_threshold)
-        auto_compact_status = t(
-            "telegram.status.enabled" if hist_cfg.auto_compact else "telegram.status.disabled",
-            lang,
-        )
-        channels_str = ", ".join(f"`{n}`" for n in self.peer_channel_names)
-        status_text = t(
-            "telegram.status",
-            lang,
-            model=f"{cfg.llm.provider}/{cfg.llm.model}",
-            timezone=cfg.timezone,
-            channels=channels_str,
-            total_messages=stats.get("total_messages", "?"),
-            history_count=history_count,
-            usage_status=usage_status,
-            cache_status=cache_status,
-            compact_threshold=compact_threshold,
-            tail_budget=hist_cfg.tail_token_budget,
-            auto_compact_status=auto_compact_status,
-            min_messages=hist_cfg.compact_min_active_messages,
-            cooldown_minutes=hist_cfg.compact_cooldown_minutes,
-            tool_output_chars=hist_cfg.compact_tool_output_max_chars,
-            memory_status=memory_status,
-        )
+            logger.error(f"/status failed: {e}")
+            await update.message.reply_text(t("command.status.read_failed", lang))
+            return
         await update.message.reply_text(status_text, parse_mode="Markdown")
 
     async def _skills_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -497,33 +448,30 @@ class TelegramChannel(Channel):
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def _compact_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /compact command — actually run the compactor and report back."""
-        from compaction import force_compact
-        from memory import get_db
+        """Handle /compact command through the shared command implementation."""
+        from channel_commands import CommandScope, compact_conversation
 
         lang = self._ui_lang(update)
-        await update.message.reply_text(t("telegram.compact.running", lang))
+        await update.message.reply_text(t("command.compact.running", lang))
         try:
-            from runtime import build_session_key
-
             chat_id = str(update.effective_chat.id)
             thread_id = (
                 str(update.message.message_thread_id)
                 if getattr(update.message, "message_thread_id", None) is not None
                 else None
             )
-            session_key = build_session_key(
+            scope = CommandScope(
                 channel="telegram",
                 user_id=str(update.effective_user.id),
                 conversation_id=chat_id,
                 thread_id=thread_id,
             )
-            result = await force_compact(get_db(), session_key=session_key)
+            result = await compact_conversation(scope=scope, lang=lang)
         except Exception as e:
             logger.error(f"/compact failed: {e}")
-            await update.message.reply_text(t("telegram.compact.failed", lang, error=e))
+            await update.message.reply_text(t("command.compact.failed", lang, error=e))
             return
-        await update.message.reply_text(f"✅ {result}")
+        await update.message.reply_text(result)
 
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle user message."""

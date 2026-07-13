@@ -570,6 +570,7 @@ class Database:
         *,
         session_key: Optional[str] = None,
         include_legacy: bool = True,
+        loaded_row_ids: Optional[List[int]] = None,
     ) -> List[ModelMessage]:
         """Load recent pydantic-ai messages newest-first up to a token budget.
 
@@ -586,7 +587,7 @@ class Database:
         if token_budget is None:
             token_budget = get_config().history.context_tokens
 
-        selected: List[List[ModelMessage]] = []
+        selected: List[tuple[int, List[ModelMessage]]] = []
         total = 0
         offset = 0
 
@@ -630,7 +631,7 @@ class Database:
                     if selected and total + cost > token_budget:
                         should_stop = True
                         break
-                    selected.append(msgs)
+                    selected.append((row.id, msgs))
                     total += cost
 
                 if should_stop or len(rows) < batch_size:
@@ -639,9 +640,47 @@ class Database:
 
         selected.reverse()  # back to chronological order
         result: List[ModelMessage] = []
-        for msgs in selected:
+        for row_id, msgs in selected:
+            if loaded_row_ids is not None:
+                loaded_row_ids.append(row_id)
             result.extend(msgs)
         return sanitize_pydantic_messages_for_history(result)
+
+    def replace_pydantic_messages_snapshot(
+        self,
+        messages: List[ModelMessage],
+        *,
+        archive_row_ids: List[int],
+        session_key: Optional[str] = None,
+    ) -> int:
+        """Atomically archive selected rows and insert their compacted snapshot."""
+        messages = sanitize_pydantic_messages_for_history(messages)
+        if not archive_row_ids or not messages:
+            return 0
+
+        with self.get_session() as session:
+            try:
+                archived = (
+                    session.query(Message)
+                    .filter(Message.id.in_(archive_row_ids))
+                    .filter(Message.pydantic_ai_msg.isnot(None))
+                    .update({Message.pydantic_ai_msg: None}, synchronize_session=False)
+                )
+                for msg in messages:
+                    blob = bytes(ModelMessagesTypeAdapter.dump_json([msg]))
+                    session.add(
+                        Message(
+                            source="request" if msg.kind == "request" else "response",
+                            content=_preview_for_message(msg)[:500],
+                            pydantic_ai_msg=blob,
+                            session_key=session_key,
+                        )
+                    )
+                session.commit()
+                return archived
+            except Exception:
+                session.rollback()
+                raise
 
     def archive_invalid_pydantic_messages(self) -> int:
         """Sanitize active history blobs and archive rows that cannot be replayed.

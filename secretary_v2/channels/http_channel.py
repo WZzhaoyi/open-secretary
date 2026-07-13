@@ -222,6 +222,13 @@ class HTTPChannel(Channel):
         logger.info(f"HTTP channel starting on {self.bind_host}:{self.port}")
         await self._server.serve()
 
+    def health_status(self) -> str:
+        if self._server is None:
+            return "stopped"
+        if getattr(self._server, "started", False) and not self._server.should_exit:
+            return "healthy"
+        return "starting" if not self._server.should_exit else "stopped"
+
     async def stop(self) -> None:
         if self._server:
             self._server.should_exit = True

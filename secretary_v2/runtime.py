@@ -12,7 +12,7 @@ import socket
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import Hooks
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -28,8 +29,13 @@ from pydantic_ai.messages import (
     SystemPromptPart,
     ThinkingPart,
 )
+from pydantic_ai.models import ModelRequestContext
 
-from compaction import maybe_auto_persist_compact
+from compaction import (
+    _count_tokens,
+    _prune_tool_outputs_for_summary,
+    maybe_auto_persist_compact,
+)
 from config import get_config, SECRETARY_PERSONA, DB_SCHEMA_HINT
 from fileops import atomic_write_text, edit_snippet, numbered_lines, str_replace_unique
 from guardrails import (
@@ -134,10 +140,56 @@ class SecretaryDeps:
 
 
 _config = get_config()
+
+
+def _guard_model_request_context(
+    ctx: RunContext[SecretaryDeps], request_context: ModelRequestContext
+) -> ModelRequestContext:
+    """Keep every request in a tool loop inside the configured context budget."""
+    cfg = get_config()
+    reserve = cfg.llm.max_tokens + max(2048, int(cfg.history.context_tokens * 0.05))
+    input_budget = cfg.history.context_tokens - reserve
+    if input_budget <= 0:
+        raise RuntimeError(
+            "Invalid context budget: history.context_tokens must exceed "
+            "llm.max_tokens plus the request safety reserve"
+        )
+
+    before_tokens = _count_tokens(request_context.messages)
+    if before_tokens <= input_budget:
+        return request_context
+
+    max_chars = cfg.history.compact_tool_output_max_chars
+    guarded = request_context.messages
+    while max_chars > 0 and _count_tokens(guarded) > input_budget:
+        guarded = _prune_tool_outputs_for_summary(guarded, max_chars)
+        if max_chars <= 125:
+            break
+        max_chars = max(125, max_chars // 2)
+
+    after_tokens = _count_tokens(guarded)
+    if after_tokens > input_budget:
+        raise RuntimeError(
+            "Current agent run exceeded the safe model input budget "
+            f"({after_tokens} > {input_budget} estimated tokens) even after "
+            "truncating tool outputs; start a new turn or reduce tool output"
+        )
+    logger.warning(
+        "[run_agent] request context guard truncated tool outputs session=%s tokens=%s->%s budget=%s",
+        ctx.deps.session_key,
+        before_tokens,
+        after_tokens,
+        input_budget,
+    )
+    return replace(request_context, messages=guarded)
+
+
+_request_guard_hooks = Hooks(before_model_request=_guard_model_request_context)
 agent = Agent(
     model=build_model(_config),
     deps_type=SecretaryDeps,
     system_prompt=_config.system_prompt or SECRETARY_PERSONA,
+    capabilities=[_request_guard_hooks],
 )
 
 
@@ -480,7 +532,7 @@ def _language_policy(language: str) -> str:
 
 def _load_memory_md() -> str:
     """Read memory.md if it exists. Soft-cap to keep system prompt sane."""
-    memory_path = _memory_file_path()
+    memory_path = get_memory_file_path()
     if not memory_path.exists():
         return ""
     try:
@@ -510,7 +562,7 @@ def _resolve_config_path(path_value: str, *, default_path: Path) -> Path:
     return BASE_DIR / path
 
 
-def _memory_file_path() -> Path:
+def get_memory_file_path() -> Path:
     if MEMORY_FILE != DEFAULT_MEMORY_FILE:
         return MEMORY_FILE
     cfg = get_config()
@@ -520,7 +572,7 @@ def _memory_file_path() -> Path:
 
 
 def _memory_backup_path(local_day: date) -> Path:
-    memory_path = _memory_file_path()
+    memory_path = get_memory_file_path()
     suffix = memory_path.suffix
     if suffix:
         backup_name = f"{memory_path.stem}-{local_day.isoformat()}{suffix}"
@@ -545,7 +597,7 @@ def ensure_daily_memory_backup() -> Optional[Path]:
     if not getattr(memory_cfg, "backup_enabled", True):
         return None
     try:
-        memory_path = _memory_file_path()
+        memory_path = get_memory_file_path()
         if not memory_path.exists():
             return None
         content = memory_path.read_text(encoding="utf-8")
@@ -1251,7 +1303,7 @@ _file_write_lock = asyncio.Lock()
 
 def _read_memory_document() -> str:
     """Full-fidelity memory.md for editing (no injection cap), with scaffold."""
-    memory_path = _memory_file_path()
+    memory_path = get_memory_file_path()
     current = memory_path.read_text(encoding="utf-8") if memory_path.exists() else ""
     return _ensure_memory_document(current)
 
@@ -1342,7 +1394,7 @@ async def memory_str_replace(
         return "Error: old_str must be a non-empty exact snippet from memory.md"
     try:
         async with _file_write_lock:
-            memory_path = _memory_file_path()
+            memory_path = get_memory_file_path()
             text = _read_memory_document()
 
             try:
@@ -1389,7 +1441,7 @@ async def memory_insert(
         return "Error: insert_text must be non-empty"
     try:
         async with _file_write_lock:
-            memory_path = _memory_file_path()
+            memory_path = get_memory_file_path()
             text = _read_memory_document()
             lines = text.split("\n")
 
@@ -2007,10 +2059,11 @@ async def shell(
 _LLM_MAX_ATTEMPTS = 3
 _LLM_BACKOFF_BASE_SEC = 2.0
 
-# Most recent run's provider-reported token usage, surfaced by /status. A plain
-# module global is safe: runs are serialized through the task_queue, so there's
-# no concurrent writer. None until the first run completes.
+# Most recent provider-reported token usage globally and per conversation.
+# The global value remains for diagnostics/backward compatibility; /status uses
+# the scoped map so concurrent channels cannot show one another's usage.
 _last_usage: Optional[Dict[str, Any]] = None
+_last_usage_by_session: Dict[str, Dict[str, Any]] = {}
 
 
 def _usage_details(usage: Any) -> Dict[str, Any]:
@@ -2018,11 +2071,29 @@ def _usage_details(usage: Any) -> Dict[str, Any]:
     return details if isinstance(details, dict) else {}
 
 
+def _last_response_usage(result: Any) -> Optional[Any]:
+    """Return the final provider request usage, distinct from run totals."""
+    all_messages = getattr(result, "all_messages", None)
+    if not callable(all_messages):
+        return None
+    try:
+        messages = all_messages()
+    except Exception:
+        return None
+    for message in reversed(messages or []):
+        if isinstance(message, ModelResponse):
+            usage = getattr(message, "usage", None)
+            if usage is not None:
+                return usage
+    return None
+
+
 def _build_usage_payload(
     usage: Any,
     *,
     origin_channel: str,
     at: Optional[str] = None,
+    last_request_usage: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Normalize Pydantic AI usage plus DeepSeek's OpenAI-compatible extras."""
     details = _usage_details(usage)
@@ -2071,17 +2142,25 @@ def _build_usage_payload(
         "cache_miss_tokens": cache_miss_tokens,
         "cache_hit_ratio": cache_hit_ratio,
         "details": details,
+        "last_request_input_tokens": (
+            getattr(last_request_usage, "input_tokens", None)
+            if last_request_usage is not None
+            else None
+        ),
         "at": at or datetime.now(_local_tz()).isoformat(timespec="seconds"),
         "origin": origin_channel,
     }
 
 
-def get_last_usage() -> Optional[Dict[str, Any]]:
-    """Return the last completed run's token usage (input/output/total/requests
-    + timestamp + origin channel), or None if no run has finished yet.
+def get_last_usage(session_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Return the last completed run's cumulative usage and final-request input.
 
-    `input_tokens` is the real context size the provider billed for the last
-    turn — exact, zero extra cost (it rode back on the API response)."""
+    Run totals aggregate every model request, including tool loops. The
+    `last_request_input_tokens` field is the single-request context measurement
+    suitable for comparison with the configured context window.
+    """
+    if session_key is not None:
+        return _last_usage_by_session.get(session_key)
     return _last_usage
 
 
@@ -2120,6 +2199,50 @@ def _result_new_messages(result: Any) -> Optional[List[ModelMessage]]:
 
 
 async def run_agent(
+    user_text: str,
+    db: Database,
+    agent_id: str = "secretary",
+    origin_channel: str = "cli",
+    user_id: str = "default",
+    conversation_id: Optional[str] = None,
+    reply_to_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    message_metadata: Optional[Dict[str, Any]] = None,
+    skill_content: str = "",
+    channels: Optional[Dict[str, Any]] = None,
+    scheduler: Optional[Any] = None,
+    subagent_registry: Optional[Any] = None,
+) -> str:
+    """Serialize a full read/run/write cycle within one conversation."""
+    from session_locks import get_session_lock
+
+    lock_key = build_session_key(
+        agent_id=agent_id,
+        channel=origin_channel,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        thread_id=thread_id,
+        run_id="lock",
+    )
+    async with get_session_lock(lock_key):
+        return await _run_agent_unlocked(
+            user_text,
+            db,
+            agent_id=agent_id,
+            origin_channel=origin_channel,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            reply_to_id=reply_to_id,
+            thread_id=thread_id,
+            message_metadata=message_metadata,
+            skill_content=skill_content,
+            channels=channels,
+            scheduler=scheduler,
+            subagent_registry=subagent_registry,
+        )
+
+
+async def _run_agent_unlocked(
     user_text: str,
     db: Database,
     agent_id: str = "secretary",
@@ -2186,16 +2309,25 @@ async def run_agent(
         },
     )
 
+    loaded_history_row_ids: List[int] = []
     persisted_history = db.load_pydantic_messages(
         session_key=session_key,
         include_legacy=False,
+        loaded_row_ids=loaded_history_row_ids,
     )
     if not persisted_history and origin_channel != "self_test":
-        persisted_history = db.load_pydantic_messages(session_key=session_key)
+        loaded_history_row_ids = []
+        persisted_history = db.load_pydantic_messages(
+            session_key=session_key,
+            loaded_row_ids=loaded_history_row_ids,
+        )
     pre_run_compact_outcome = None
     try:
         pre_run_compact_outcome = await maybe_auto_persist_compact(
-            db, history=persisted_history, session_key=session_key
+            db,
+            history=persisted_history,
+            session_key=session_key,
+            loaded_row_ids=loaded_history_row_ids,
         )
         if (
             pre_run_compact_outcome
@@ -2319,8 +2451,13 @@ async def run_agent(
         # Inspect the class so both installs stay warning-free.
         usage_attr = inspect.getattr_static(type(result), "usage", None)
         usage = result.usage if isinstance(usage_attr, property) else result.usage()
-        global _last_usage
-        _last_usage = _build_usage_payload(usage, origin_channel=origin_channel)
+        global _last_usage, _last_usage_by_session
+        _last_usage = _build_usage_payload(
+            usage,
+            origin_channel=origin_channel,
+            last_request_usage=_last_response_usage(result),
+        )
+        _last_usage_by_session[session_key] = dict(_last_usage)
         usage_payload = dict(_last_usage)
         logger.info(
             "[run_agent] usage input=%s output=%s total=%s requests=%s cache_read=%s cache_write=%s cache_hit=%s cache_miss=%s",

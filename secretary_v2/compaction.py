@@ -16,11 +16,17 @@ import logging
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Literal, Optional
 from zoneinfo import ZoneInfo
 
 import tiktoken
-from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart, ToolReturnPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    SystemPromptPart,
+    ToolReturnPart,
+)
 from pydantic_ai_summarization import (
     SummarizationProcessor,
     format_messages_for_summary,
@@ -38,7 +44,16 @@ logger = logging.getLogger(__name__)
 _SUMMARY_ERROR_MARKER = "Error generating summary:"
 
 _token_encoding = None
-_last_auto_persist_compact_at: Optional[float] = None
+_last_auto_persist_compact_at: Dict[str, float] = {}
+_auto_compact_failures: Dict[str, "_FailureBackoff"] = {}
+_FAILURE_BACKOFF_BASE_SECONDS = 60
+_FAILURE_BACKOFF_MAX_SECONDS = 15 * 60
+
+
+@dataclass(frozen=True)
+class _FailureBackoff:
+    attempts: int
+    retry_at: float
 
 
 @dataclass
@@ -54,6 +69,22 @@ class CompactOutcome:
     before_tokens: int
     after_tokens: int
     reason: str
+
+
+@dataclass(frozen=True)
+class CompactCommandResult:
+    """Structured result for channel-independent /compact presentation."""
+
+    status: Literal[
+        "completed",
+        "not_needed",
+        "not_enough_history",
+        "failed",
+        "partial_failure",
+    ]
+    before_messages: int = 0
+    after_messages: int = 0
+    error: Optional[str] = None
 
 
 class SecretarySummarizationProcessor(SummarizationProcessor):
@@ -87,14 +118,18 @@ def estimate_tokens(text: str) -> int:
 
 
 def _count_tokens(messages) -> int:
-    """tiktoken-based token counter handed to the SummarizationProcessor.
+    """Estimate the complete request history without hiding large tool output.
 
-    Reuses the library's own message formatter so counting matches what the
-    summarizer actually sees.
+    The summarization library's formatter intentionally truncates tool returns
+    for its own prompt. It therefore cannot be used for context-window or
+    trigger decisions, which must account for the full provider request.
     """
     if not messages:
         return 0
-    return len(_get_encoding().encode(format_messages_for_summary(messages)))
+    serialized = bytes(ModelMessagesTypeAdapter.dump_json(messages)).decode(
+        "utf-8", errors="replace"
+    )
+    return len(_get_encoding().encode(serialized))
 
 
 def build_summarization_processor(force: bool = False) -> SummarizationProcessor:
@@ -268,9 +303,34 @@ async def _run_processor_compaction(
     summary_message = ModelRequest(parts=[summary_part])
     compacted = [summary_message, *preserved_messages]
     after_tokens = _count_tokens(compacted)
+    target_tokens = int(cfg.context_tokens * cfg.compress_threshold)
+    if after_tokens >= before_tokens:
+        error = (
+            "compaction did not reduce token usage "
+            f"({before_tokens} -> {after_tokens})"
+        )
+    elif reason == "auto" and after_tokens >= target_tokens:
+        error = (
+            "automatic compaction did not reach its target "
+            f"({after_tokens} >= {target_tokens} tokens)"
+        )
+    else:
+        error = None
+    if error:
+        return CompactOutcome(
+            compacted=messages,
+            changed=False,
+            failed=True,
+            error=error,
+            before_messages=len(messages),
+            after_messages=len(messages),
+            before_tokens=before_tokens,
+            after_tokens=before_tokens,
+            reason=reason,
+        )
     return CompactOutcome(
         compacted=compacted,
-        changed=len(compacted) < len(messages) or after_tokens < before_tokens,
+        changed=True,
         failed=False,
         error=None,
         before_messages=len(messages),
@@ -309,29 +369,41 @@ def _summary_failed(compacted) -> bool:
     return False
 
 
-async def force_compact(db, session_key: Optional[str] = None) -> str:
+async def force_compact(
+    db, session_key: Optional[str] = None
+) -> CompactCommandResult:
     """User-triggered /compact: summarize history and rewrite the DB snapshot.
 
     Archives the rolled-up rows and persists [summary, *tail] so subsequent
-    runs load the compacted state directly. Returns a human-readable status.
+    runs load the compacted state directly. Presentation belongs to the
+    channel-independent command layer, so this returns structured data.
     """
-    history = db.load_pydantic_messages(session_key=session_key)
+    loaded_row_ids: list[int] = []
+    history = db.load_pydantic_messages(
+        session_key=session_key,
+        loaded_row_ids=loaded_row_ids,
+    )
     if len(history) < 4:
-        return "Not enough conversation history to compact"
+        return CompactCommandResult(status="not_enough_history")
 
     outcome = await run_compaction(history, force=True, reason="manual")
     if outcome.failed:
         logger.error("[force_compact] summarization failed: %s", outcome.error)
-        return f"Compaction failed: {outcome.error}"
+        return CompactCommandResult(status="failed", error=outcome.error)
 
     if not outcome.changed:
-        return "Recent history is already within budget; no compaction needed"
+        return CompactCommandResult(status="not_needed")
 
     try:
-        archived = persist_compacted_snapshot(db, outcome, session_key=session_key)
+        archived = persist_compacted_snapshot(
+            db,
+            outcome,
+            session_key=session_key,
+            archive_row_ids=loaded_row_ids,
+        )
     except Exception as e:
         logger.error(f"[force_compact] persistence failed: {e}")
-        return f"Compaction partially completed; summary was generated but persistence failed: {e}"
+        return CompactCommandResult(status="partial_failure", error=str(e))
 
     logger.info(
         "[force_compact] archived=%s messages=%s->%s tokens=%s->%s",
@@ -341,9 +413,11 @@ async def force_compact(db, session_key: Optional[str] = None) -> str:
         outcome.before_tokens,
         outcome.after_tokens,
     )
-    return (
-        f"Compaction complete: {outcome.before_messages} messages folded into "
-        f"{outcome.after_messages} messages including summary"
+    _auto_compact_failures.pop(session_key or "__legacy__", None)
+    return CompactCommandResult(
+        status="completed",
+        before_messages=outcome.before_messages,
+        after_messages=outcome.after_messages,
     )
 
 
@@ -351,22 +425,28 @@ def persist_compacted_snapshot(
     db,
     outcome: CompactOutcome,
     session_key: Optional[str] = None,
+    archive_row_ids: Optional[list[int]] = None,
 ) -> int:
     """Archive active history and save the compacted snapshot."""
     if outcome.failed or not outcome.changed:
         return 0
-    archived = db.archive_all_pydantic_messages(session_key=session_key)
-    db.save_pydantic_messages(outcome.compacted, session_key=session_key)
-    return archived
+    if archive_row_ids is None:
+        raise ValueError("compaction persistence requires loaded row provenance")
+    return db.replace_pydantic_messages_snapshot(
+        outcome.compacted,
+        archive_row_ids=archive_row_ids,
+        session_key=session_key,
+    )
 
 
 async def maybe_auto_persist_compact(
     db,
     history: Optional[list[ModelMessage]] = None,
     session_key: Optional[str] = None,
+    loaded_row_ids: Optional[list[int]] = None,
 ) -> Optional[CompactOutcome]:
     """Persist a compacted snapshot when active history crosses one threshold."""
-    global _last_auto_persist_compact_at
+    global _last_auto_persist_compact_at, _auto_compact_failures
 
     cfg = get_config().history
     if not cfg.auto_compact:
@@ -374,31 +454,115 @@ async def maybe_auto_persist_compact(
 
     now = time.monotonic()
     cooldown_sec = cfg.compact_cooldown_minutes * 60
-    if (
-        _last_auto_persist_compact_at is not None
-        and now - _last_auto_persist_compact_at < cooldown_sec
-    ):
-        return None
+    cooldown_key = session_key or "__legacy__"
+    if cooldown_sec > 0:
+        expired_keys = [
+            key
+            for key, compacted_at in _last_auto_persist_compact_at.items()
+            if now - compacted_at >= cooldown_sec
+        ]
+        for key in expired_keys:
+            _last_auto_persist_compact_at.pop(key, None)
+    last_compact_at = _last_auto_persist_compact_at.get(cooldown_key)
 
     if history is None:
-        history = db.load_pydantic_messages(session_key=session_key)
+        if loaded_row_ids is None:
+            loaded_row_ids = []
+        history = db.load_pydantic_messages(
+            session_key=session_key,
+            loaded_row_ids=loaded_row_ids,
+        )
     if len(history) < cfg.compact_min_active_messages:
         return None
 
     tokens = _count_tokens(history)
     threshold = int(cfg.context_tokens * cfg.compress_threshold)
     if tokens < threshold:
+        _auto_compact_failures.pop(cooldown_key, None)
         return None
+
+    emergency_threshold = int(cfg.context_tokens * 0.9)
+    if last_compact_at is not None and now - last_compact_at < cooldown_sec:
+        if tokens < emergency_threshold:
+            remaining = max(0, cooldown_sec - (now - last_compact_at))
+            logger.debug(
+                "[auto_compact] cooldown skip session=%s remaining=%.0fs",
+                cooldown_key,
+                remaining,
+            )
+            return None
+        logger.warning(
+            "[auto_compact] bypassing cooldown for near-limit session=%s tokens=%s",
+            cooldown_key,
+            tokens,
+        )
+
+    failure = _auto_compact_failures.get(cooldown_key)
+    if failure is not None and now < failure.retry_at:
+        logger.debug(
+            "[auto_compact] failure backoff skip session=%s remaining=%.0fs",
+            cooldown_key,
+            failure.retry_at - now,
+        )
+        return None
+
+    def record_failure(error: str) -> None:
+        previous = _auto_compact_failures.get(cooldown_key)
+        attempts = (previous.attempts if previous else 0) + 1
+        delay = min(
+            _FAILURE_BACKOFF_BASE_SECONDS * (2 ** min(attempts - 1, 4)),
+            _FAILURE_BACKOFF_MAX_SECONDS,
+        )
+        _auto_compact_failures[cooldown_key] = _FailureBackoff(
+            attempts=attempts,
+            retry_at=now + delay,
+        )
+        logger.warning(
+            "[auto_compact] failure backoff session=%s attempts=%s retry_in=%ss error=%s",
+            cooldown_key,
+            attempts,
+            delay,
+            error,
+        )
 
     outcome = await run_compaction(history, force=True, reason="auto")
     if outcome.failed:
         logger.error("[auto_compact] summarization failed: %s", outcome.error)
+        record_failure(outcome.error or "unknown compaction failure")
         return outcome
     if not outcome.changed:
+        outcome = replace(
+            outcome,
+            failed=True,
+            error="automatic compaction did not reduce over-budget history",
+        )
+        record_failure(outcome.error)
         return outcome
 
-    archived = persist_compacted_snapshot(db, outcome, session_key=session_key)
-    _last_auto_persist_compact_at = now
+    try:
+        archived = persist_compacted_snapshot(
+            db,
+            outcome,
+            session_key=session_key,
+            archive_row_ids=loaded_row_ids,
+        )
+    except Exception as e:
+        failed_outcome = replace(
+            outcome,
+            compacted=history,
+            changed=False,
+            failed=True,
+            error=f"compaction persistence failed: {e}",
+            after_messages=len(history),
+            after_tokens=tokens,
+        )
+        record_failure(failed_outcome.error or str(e))
+        return failed_outcome
+    _auto_compact_failures.pop(cooldown_key, None)
+    if cooldown_sec > 0:
+        _last_auto_persist_compact_at[cooldown_key] = now
+    else:
+        _last_auto_persist_compact_at.pop(cooldown_key, None)
     logger.info(
         "[auto_compact] archived=%s messages=%s->%s tokens=%s->%s",
         archived,

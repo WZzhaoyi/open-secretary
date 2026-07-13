@@ -9,6 +9,8 @@ These tests use Pydantic AI's TestModel so they don't burn API tokens.
 """
 
 import asyncio
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +43,7 @@ from memory import Database
 from runtime import run_agent
 from scheduler import Scheduler
 from pydantic_ai_summarization import SummarizationProcessor
+from pydantic_ai.usage import RequestUsage
 from compaction import estimate_tokens, force_compact
 
 
@@ -69,6 +72,15 @@ class FakeRunResult:
         if self._usage_error:
             raise self._usage_error
         return FakeUsage()
+
+    def all_messages(self):
+        return [
+            ModelRequest(parts=[UserPromptPart(content=self._user_text)]),
+            ModelResponse(
+                parts=[TextPart(content=self.output)],
+                usage=RequestUsage(input_tokens=13, output_tokens=7),
+            ),
+        ]
 
 
 class FakeThinkingOnlyRunResult(FakeRunResult):
@@ -126,6 +138,54 @@ def test_config_defaults_language_to_auto(tmp_path):
 
     assert cfg.language == "auto"
     assert cfg.ui_language == "auto"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"context_tokens": 0},
+        {"compress_threshold": 1.0},
+        {"context_tokens": 100, "compress_threshold": 0.5, "tail_token_budget": 50},
+        {"compact_cooldown_minutes": -1},
+    ],
+)
+def test_history_config_rejects_invalid_compaction_budgets(kwargs):
+    with pytest.raises(ValueError):
+        HistoryConfig(**kwargs)
+
+
+def test_config_rejects_context_window_smaller_than_output_reserve(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "llm:\n  max_tokens: 4096\nhistory:\n"
+        "  context_tokens: 6000\n  compress_threshold: 0.75\n"
+        "  tail_token_budget: 1000\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="request safety reserve"):
+        Config.load(str(config_file))
+
+
+def test_startup_warns_when_anthropic_cache_is_not_adapted(caplog):
+    import main
+
+    config = SimpleNamespace(llm=SimpleNamespace(provider="anthropic"))
+    caplog.set_level("WARNING", logger="main")
+
+    main._warn_if_anthropic_cache_unconfigured(config)
+
+    assert "does not currently add Anthropic prompt-cache cache_control" in caplog.text
+
+
+def test_startup_does_not_emit_anthropic_cache_warning_for_other_providers(caplog):
+    import main
+
+    config = SimpleNamespace(llm=SimpleNamespace(provider="deepseek"))
+    caplog.set_level("WARNING", logger="main")
+
+    main._warn_if_anthropic_cache_unconfigured(config)
+
+    assert "prompt-cache cache_control" not in caplog.text
 
 
 def test_config_loads_memory_path_and_backup_switch(tmp_path):
@@ -732,7 +792,7 @@ def test_pre_run_compaction_runs_before_synthetic_context_assembly():
     """Compaction must process persisted history, never synthetic clock layers."""
     import inspect
 
-    source = inspect.getsource(runtime.run_agent)
+    source = inspect.getsource(runtime._run_agent_unlocked)
     assert source.index("maybe_auto_persist_compact") < source.index(
         "_build_context_layers"
     )
@@ -861,10 +921,12 @@ def test_telegram_status_has_no_items_or_legacy_limit_dependency():
     import inspect
     from channels.telegram_channel import TelegramChannel
 
-    source = inspect.getsource(TelegramChannel._status_command)
+    from channel_commands import build_status_text
+
+    source = inspect.getsource(build_status_text)
     assert "get_items" not in source
     assert "limit=200" not in source
-    assert "memory.md" in source
+    assert "get_memory_file_path" in source
 
 
 def test_default_schedule_prompts_follow_memory_events_design():
@@ -951,7 +1013,7 @@ async def test_force_compact_archives_and_replaces(fresh_db, fake_agent_run, mon
     monkeypatch.setattr(compaction, "build_summarization_processor", fake_processor)
 
     result = await force_compact(fresh_db)
-    assert "Compaction complete" in result, f"unexpected force_compact result: {result}"
+    assert result.status == "completed", f"unexpected force_compact result: {result}"
 
     after = fresh_db.load_pydantic_messages()
     assert len(after) < before_count, "force_compact must shrink the active history"
@@ -975,12 +1037,12 @@ async def test_auto_compaction_uses_single_threshold_and_persists(fresh_db, monk
     import compaction
 
     cfg = compaction.get_config()
-    monkeypatch.setattr(cfg.history, "context_tokens", 10)
-    monkeypatch.setattr(cfg.history, "compress_threshold", 0.1)
+    monkeypatch.setattr(cfg.history, "context_tokens", 400)
+    monkeypatch.setattr(cfg.history, "compress_threshold", 0.5)
     monkeypatch.setattr(cfg.history, "auto_compact", True)
     monkeypatch.setattr(cfg.history, "compact_min_active_messages", 4)
     monkeypatch.setattr(cfg.history, "compact_cooldown_minutes", 0)
-    monkeypatch.setattr(compaction, "_last_auto_persist_compact_at", None)
+    monkeypatch.setattr(compaction, "_last_auto_persist_compact_at", {})
 
     def fake_processor(force=False):
         return SummarizationProcessor(
@@ -998,8 +1060,17 @@ async def test_auto_compaction_uses_single_threshold_and_persists(fresh_db, monk
         for i in range(4)
     ]
     fresh_db.save_pydantic_messages(history)
+    loaded_row_ids = []
+    history = fresh_db.load_pydantic_messages(
+        token_budget=100000,
+        loaded_row_ids=loaded_row_ids,
+    )
 
-    outcome = await compaction.maybe_auto_persist_compact(fresh_db, history=history)
+    outcome = await compaction.maybe_auto_persist_compact(
+        fresh_db,
+        history=history,
+        loaded_row_ids=loaded_row_ids,
+    )
 
     assert outcome is not None
     assert outcome.changed
@@ -1009,6 +1080,176 @@ async def test_auto_compaction_uses_single_threshold_and_persists(fresh_db, monk
         "摘要" in getattr(part, "content", "")
         for part in getattr(after[0], "parts", [])
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_compaction_cooldown_is_scoped_per_session(monkeypatch):
+    """A recent compaction in session A must not suppress eligible session B."""
+    import compaction
+
+    cfg = compaction.get_config().history
+    monkeypatch.setattr(cfg, "auto_compact", True)
+    monkeypatch.setattr(cfg, "context_tokens", 100)
+    monkeypatch.setattr(cfg, "compress_threshold", 0.5)
+    monkeypatch.setattr(cfg, "compact_min_active_messages", 4)
+    monkeypatch.setattr(cfg, "compact_cooldown_minutes", 120)
+    monkeypatch.setattr(compaction, "_last_auto_persist_compact_at", {})
+    monkeypatch.setattr(compaction, "_count_tokens", lambda _history: 60)
+
+    calls = []
+
+    async def fake_run_compaction(history, force=False, reason="auto"):
+        calls.append(str(history[0]))
+        return compaction.CompactOutcome(
+            compacted=[history[-1]],
+            changed=True,
+            failed=False,
+            error=None,
+            before_messages=len(history),
+            after_messages=1,
+            before_tokens=10,
+            after_tokens=1,
+            reason=reason,
+        )
+
+    monkeypatch.setattr(compaction, "run_compaction", fake_run_compaction)
+    monkeypatch.setattr(compaction, "persist_compacted_snapshot", lambda *a, **kw: 4)
+
+    history_a = [
+        ModelRequest(parts=[UserPromptPart(content=f"A-{i}")]) for i in range(4)
+    ]
+    history_b = [
+        ModelRequest(parts=[UserPromptPart(content=f"B-{i}")]) for i in range(4)
+    ]
+
+    first_a = await compaction.maybe_auto_persist_compact(
+        object(),
+        history=history_a,
+        session_key="session-a",
+        loaded_row_ids=[1, 2, 3, 4],
+    )
+    first_b = await compaction.maybe_auto_persist_compact(
+        object(),
+        history=history_b,
+        session_key="session-b",
+        loaded_row_ids=[5, 6, 7, 8],
+    )
+    second_a = await compaction.maybe_auto_persist_compact(
+        object(),
+        history=history_a,
+        session_key="session-a",
+        loaded_row_ids=[1, 2, 3, 4],
+    )
+
+    assert first_a is not None and first_a.changed
+    assert first_b is not None and first_b.changed
+    assert second_a is None
+    assert len(calls) == 2
+    assert set(compaction._last_auto_persist_compact_at) == {"session-a", "session-b"}
+
+
+@pytest.mark.asyncio
+async def test_auto_compaction_failure_backoff_is_scoped(monkeypatch):
+    import compaction
+
+    cfg = compaction.get_config().history
+    monkeypatch.setattr(cfg, "auto_compact", True)
+    monkeypatch.setattr(cfg, "context_tokens", 10)
+    monkeypatch.setattr(cfg, "compress_threshold", 0.5)
+    monkeypatch.setattr(cfg, "compact_min_active_messages", 4)
+    monkeypatch.setattr(cfg, "compact_cooldown_minutes", 0)
+    monkeypatch.setattr(compaction, "_auto_compact_failures", {})
+    monkeypatch.setattr(compaction, "_count_tokens", lambda _history: 10)
+
+    calls = []
+
+    async def fail(history, force=False, reason="auto"):
+        calls.append(history[0].parts[0].content)
+        return compaction.CompactOutcome(
+            compacted=history,
+            changed=False,
+            failed=True,
+            error="summary unavailable",
+            before_messages=4,
+            after_messages=4,
+            before_tokens=10,
+            after_tokens=10,
+            reason=reason,
+        )
+
+    monkeypatch.setattr(compaction, "run_compaction", fail)
+    history_a = [ModelRequest(parts=[UserPromptPart(content="A")])] * 4
+    history_b = [ModelRequest(parts=[UserPromptPart(content="B")])] * 4
+
+    assert await compaction.maybe_auto_persist_compact(
+        object(), history=history_a, session_key="a", loaded_row_ids=[]
+    )
+    assert await compaction.maybe_auto_persist_compact(
+        object(), history=history_a, session_key="a", loaded_row_ids=[]
+    ) is None
+    assert await compaction.maybe_auto_persist_compact(
+        object(), history=history_b, session_key="b", loaded_row_ids=[]
+    )
+    assert calls == ["A", "B"]
+
+
+def test_compaction_snapshot_only_archives_loaded_rows(fresh_db, monkeypatch):
+    """Rows outside the replay budget must remain active and unsilently archived."""
+    import compaction
+    import memory
+
+    monkeypatch.setattr(memory, "_estimate_msg_tokens", lambda _msgs: 1)
+    session_key = "agent:secretary:telegram:conversation:bounded"
+    for text in ("oldest", "middle", "newest"):
+        fresh_db.save_pydantic_messages(
+            [ModelRequest(parts=[UserPromptPart(content=text)])],
+            session_key=session_key,
+        )
+
+    loaded_row_ids = []
+    loaded = fresh_db.load_pydantic_messages(
+        token_budget=2,
+        session_key=session_key,
+        include_legacy=False,
+        loaded_row_ids=loaded_row_ids,
+    )
+    assert "oldest" not in str(loaded)
+
+    compacted = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(
+                    content="Summary of previous conversation:\n\nrecent summary"
+                )
+            ]
+        ),
+        loaded[-1],
+    ]
+    outcome = compaction.CompactOutcome(
+        compacted=compacted,
+        changed=True,
+        failed=False,
+        error=None,
+        before_messages=len(loaded),
+        after_messages=len(compacted),
+        before_tokens=2,
+        after_tokens=1,
+        reason="test",
+    )
+
+    fresh_db.replace_pydantic_messages_snapshot(
+        outcome.compacted,
+        archive_row_ids=loaded_row_ids,
+        session_key=session_key,
+    )
+    after = fresh_db.load_pydantic_messages(
+        token_budget=100,
+        session_key=session_key,
+        include_legacy=False,
+    )
+
+    assert "oldest" in str(after)
+    assert "recent summary" in str(after)
 
 
 # ---- Fix #4: scheduler restart-survival ----
@@ -2747,8 +2988,103 @@ async def test_get_last_usage_populated_after_run(fresh_db, fake_agent_run):
     assert usage["input_tokens"] == FakeUsage.input_tokens
     assert usage["total_tokens"] == FakeUsage.input_tokens + FakeUsage.output_tokens
     assert usage["cache_read_tokens"] == 0
+    assert usage["last_request_input_tokens"] == 13
     assert usage["origin"] == "cli"
     assert "at" in usage
+
+
+@pytest.mark.asyncio
+async def test_last_usage_is_scoped_to_conversation(fresh_db, fake_agent_run):
+    await runtime.run_agent(
+        "alpha", db=fresh_db, origin_channel="telegram", conversation_id="chat-a"
+    )
+    await runtime.run_agent(
+        "beta", db=fresh_db, origin_channel="telegram", conversation_id="chat-b"
+    )
+
+    key_a = runtime.build_session_key(
+        channel="telegram", conversation_id="chat-a"
+    )
+    key_b = runtime.build_session_key(
+        channel="telegram", conversation_id="chat-b"
+    )
+    assert runtime.get_last_usage(key_a)["origin"] == "telegram"
+    assert runtime.get_last_usage(key_b)["origin"] == "telegram"
+    assert key_a != key_b
+
+
+@pytest.mark.asyncio
+async def test_run_agent_serializes_same_session(monkeypatch):
+    active = 0
+    max_active = 0
+
+    async def fake_unlocked(*args, **kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return "ok"
+
+    monkeypatch.setattr(runtime, "_run_agent_unlocked", fake_unlocked)
+    db = object()
+    await asyncio.gather(
+        runtime.run_agent("one", db=db, conversation_id="same"),
+        runtime.run_agent("two", db=db, conversation_id="same"),
+    )
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_compaction_uses_same_session_lock(monkeypatch):
+    from channel_commands import CommandScope, compact_conversation
+    from compaction import CompactCommandResult
+    from session_locks import get_session_lock
+    import compaction
+
+    scope = CommandScope(channel="telegram", user_id="u", conversation_id="chat")
+    called = asyncio.Event()
+
+    async def fake_force_compact(*args, **kwargs):
+        called.set()
+        return CompactCommandResult(status="not_needed")
+
+    monkeypatch.setattr(compaction, "force_compact", fake_force_compact)
+    async with get_session_lock(scope.session_key()):
+        task = asyncio.create_task(compact_conversation(scope=scope, lang="en"))
+        await asyncio.sleep(0)
+        assert not called.is_set()
+    assert await task == "ℹ️ Recent history is already within budget; no compaction needed"
+
+
+def test_single_run_request_guard_truncates_oversized_tool_output(monkeypatch):
+    cfg = runtime.get_config()
+    monkeypatch.setattr(cfg.history, "context_tokens", 10000)
+    monkeypatch.setattr(cfg.llm, "max_tokens", 1000)
+    monkeypatch.setattr(cfg.history, "compact_tool_output_max_chars", 1000)
+
+    @dataclass
+    class RequestContext:
+        messages: list
+
+    messages = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="large_result",
+                    tool_call_id="call-1",
+                    content="x" * 100000,
+                )
+            ]
+        )
+    ]
+    request = RequestContext(messages=messages)
+    ctx = SimpleNamespace(deps=SimpleNamespace(session_key="guard-test"))
+
+    guarded = runtime._guard_model_request_context(ctx, request)
+
+    assert guarded is not request
+    assert len(guarded.messages[0].parts[0].content) < 100000
 
 
 def test_usage_payload_uses_pydantic_cache_fields():
@@ -2789,13 +3125,149 @@ def test_usage_payload_adapts_deepseek_details():
 def test_telegram_status_surfaces_cache_metrics():
     """Telegram /status should show recent cache usage when available."""
     import inspect
-    from channels.telegram_channel import TelegramChannel
+    from channel_commands import build_status_text
 
-    source = inspect.getsource(TelegramChannel._status_command)
-    assert "telegram.status" in source
-    assert "telegram.status.cache_metrics" in source
+    source = inspect.getsource(build_status_text)
+    assert "command.status" in source
+    assert "command.status.cache_metrics" in source
     assert "cache_hit_tokens" in source
     assert "cache_write_tokens" in source
+
+
+def test_status_and_compact_business_logic_is_channel_independent():
+    """Channel adapters may extract identity and send, but must not own command logic."""
+    import inspect
+    from channels.feishu_channel import FeishuChannel
+    from channels.telegram_channel import TelegramChannel
+
+    status_sources = (
+        inspect.getsource(TelegramChannel._status_command),
+        inspect.getsource(FeishuChannel._status_command),
+    )
+    compact_sources = (
+        inspect.getsource(TelegramChannel._compact_command),
+        inspect.getsource(FeishuChannel._compact_command),
+    )
+
+    assert all("build_status_text" in source for source in status_sources)
+    assert all("get_last_usage" not in source for source in status_sources)
+    assert all("load_pydantic_messages" not in source for source in status_sources)
+    assert all("compact_conversation" in source for source in compact_sources)
+    assert all("force_compact" not in source for source in compact_sources)
+
+
+def test_status_uses_current_session_custom_memory_and_last_request_usage(
+    fresh_db, tmp_path, monkeypatch
+):
+    from channel_commands import CommandScope, build_status_text
+    from config import get_config
+    import memory
+
+    alpha = runtime.build_session_key(
+        channel="telegram", user_id="a", conversation_id="chat-a"
+    )
+    beta = runtime.build_session_key(
+        channel="telegram", user_id="b", conversation_id="chat-b"
+    )
+    fresh_db.save_pydantic_messages(
+        [ModelRequest(parts=[UserPromptPart(content="alpha")])], session_key=alpha
+    )
+    fresh_db.save_pydantic_messages(
+        [ModelRequest(parts=[UserPromptPart(content="beta")])], session_key=beta
+    )
+    monkeypatch.setattr(memory, "_db_instance", fresh_db)
+
+    memory_file = tmp_path / "custom-memory.md"
+    memory_file.write_text("custom memory", encoding="utf-8")
+    monkeypatch.setattr(get_config().memory, "path", str(memory_file))
+    monkeypatch.setattr(
+        runtime,
+        "_last_usage_by_session",
+        {alpha: {
+            "input_tokens": 150,
+            "last_request_input_tokens": 30,
+            "requests": 5,
+            "cache_hit_tokens": 100,
+            "cache_miss_tokens": 50,
+            "cache_read_tokens": 100,
+            "cache_write_tokens": 0,
+            "cache_hit_ratio": 2 / 3,
+            "at": "now",
+            "origin": "telegram",
+        }},
+    )
+
+    text = build_status_text(
+        scope=CommandScope(
+            channel="telegram", user_id="a", conversation_id="chat-a"
+        ),
+        lang="en",
+        peer_channel_names=["telegram", "http"],
+    )
+
+    assert "2 / 1" in text
+    assert "30 /" in text
+    assert "150 /" not in text
+    assert f"{memory_file.stat().st_size} bytes" in text
+
+
+@pytest.mark.asyncio
+async def test_compact_command_returns_localized_structured_result(
+    fresh_db, monkeypatch
+):
+    from channel_commands import CommandScope, compact_conversation
+    from compaction import CompactCommandResult
+    import compaction
+    import memory
+
+    monkeypatch.setattr(memory, "_db_instance", fresh_db)
+
+    async def fake_force_compact(db, session_key=None):
+        return CompactCommandResult(status="failed", error="boom")
+
+    monkeypatch.setattr(compaction, "force_compact", fake_force_compact)
+    text = await compact_conversation(
+        scope=CommandScope(
+            channel="feishu",
+            user_id="sender",
+            conversation_id="chat",
+            thread_id="topic-7",
+        ),
+        lang="zh",
+    )
+
+    assert text == "❌ 压缩失败：boom"
+    assert "完成" not in text
+
+
+@pytest.mark.asyncio
+async def test_feishu_commands_preserve_topic_scope(monkeypatch):
+    from channels.feishu_channel import FeishuChannel
+
+    async def handler(_message):
+        return "ok"
+
+    channel = FeishuChannel(
+        app_id="id",
+        app_secret="secret",
+        default_chat_id="chat",
+        message_handler=handler,
+    )
+    captured = {}
+
+    async def fake_compact(chat_id, scope):
+        captured["chat_id"] = chat_id
+        captured["scope"] = scope
+
+    monkeypatch.setattr(channel, "_compact_command", fake_compact)
+    conversation = type("Conversation", (), {"thread_id": "topic-7"})()
+    msg = type("Message", (), {"conversation": conversation})()
+
+    await channel._handle_command("compact", msg, "chat", "sender")
+
+    assert captured["chat_id"] == "chat"
+    assert captured["scope"].thread_id == "topic-7"
+    assert captured["scope"].session_key().endswith(":thread:topic-7")
 
 
 @pytest.mark.asyncio

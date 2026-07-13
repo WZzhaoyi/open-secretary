@@ -19,6 +19,10 @@ class LLMConfig:
     thinking: str = ""
     extra_body: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.max_tokens < 0:
+            raise ValueError("llm.max_tokens must be non-negative")
+
 
 @dataclass
 class TelegramConfig:
@@ -96,6 +100,27 @@ class HistoryConfig:
     compact_min_active_messages: int = 4
     compact_cooldown_minutes: int = 120
     compact_tool_output_max_chars: int = 4000
+
+    def __post_init__(self) -> None:
+        if self.context_tokens <= 0:
+            raise ValueError("history.context_tokens must be greater than 0")
+        if not 0 < self.compress_threshold < 1:
+            raise ValueError("history.compress_threshold must be between 0 and 1")
+        if self.tail_token_budget < 0:
+            raise ValueError("history.tail_token_budget must be non-negative")
+        threshold_tokens = int(self.context_tokens * self.compress_threshold)
+        if self.tail_token_budget >= threshold_tokens:
+            raise ValueError(
+                "history.tail_token_budget must be smaller than the compaction threshold"
+            )
+        if self.max_events < 0:
+            raise ValueError("history.max_events must be non-negative")
+        if self.compact_min_active_messages < 1:
+            raise ValueError("history.compact_min_active_messages must be at least 1")
+        if self.compact_cooldown_minutes < 0:
+            raise ValueError("history.compact_cooldown_minutes must be non-negative")
+        if self.compact_tool_output_max_chars < 0:
+            raise ValueError("history.compact_tool_output_max_chars must be non-negative")
 
 
 @dataclass
@@ -193,6 +218,16 @@ class Config:
     language: str = "auto"
     ui_language: str = "auto"
     system_prompt: str = ""
+
+    def __post_init__(self) -> None:
+        reserve = self.llm.max_tokens + max(
+            2048, int(self.history.context_tokens * 0.05)
+        )
+        if reserve >= self.history.context_tokens:
+            raise ValueError(
+                "history.context_tokens must exceed llm.max_tokens plus the "
+                "5% (minimum 2048 token) request safety reserve"
+            )
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":

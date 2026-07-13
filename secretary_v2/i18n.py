@@ -33,29 +33,37 @@ MESSAGES = {
             "*Commands:*\n"
             "/start - Start\n"
             "/help - Show help\n"
-            "/status - Show system status\n\n"
+            "/status - Show system status\n"
+            "/skills - List available skills\n"
+            "/compact - Compact this conversation's history\n\n"
             "Tell me what you want to do in natural language."
         ),
-        "telegram.status.memory_missing": "not created",
-        "telegram.status.read_failed": "read failed",
-        "telegram.status.usage": "{input_tokens:,} / {window:,} tokens ({pct}), {at} from `{origin}`",
-        "telegram.status.no_run": "no completed run yet",
-        "telegram.status.cache_metrics": (
+        "command.status.memory_missing": "not created",
+        "command.status.read_failed": "read failed",
+        "command.status.usage": "{input_tokens:,} / {window:,} tokens ({pct}), {at} from `{origin}`",
+        "command.status.run_usage": (
+            "{input_tokens:,} cumulative input tokens across {requests} requests, "
+            "{at} from `{origin}`"
+        ),
+        "command.status.no_run": "no completed run yet",
+        "command.status.cache_metrics": (
             "hit/read `{cache_hit:,}`, miss `{cache_miss:,}`, "
             "write `{cache_write:,}`, hit rate `{ratio}`"
         ),
-        "telegram.status.no_cache_metrics": "last run did not return cache metrics",
-        "telegram.status.enabled": "enabled",
-        "telegram.status.disabled": "disabled",
-        "telegram.status": (
+        "command.status.no_cache_metrics": "last run did not return cache metrics",
+        "command.status.enabled": "enabled",
+        "command.status.disabled": "disabled",
+        "command.status.health_unknown": "unavailable",
+        "command.status": (
             "📊 *System Status*\n\n"
             "🟢 Service is running\n"
             "🤖 Model: `{model}`\n"
             "⏰ Timezone: `{timezone}`\n"
             "📡 Channels: {channels}\n"
-            "💬 Messages (DB total / replayable now): {total_messages} / {history_count}\n"
-            "🧮 Last context usage: {usage_status}\n"
-            "🧊 Last cache: {cache_status}\n"
+            "🩺 Channel health: {channel_health}\n"
+            "💬 Messages (DB total / replayable in this conversation): {total_messages} / {history_count}\n"
+            "🧮 Latest request context: {usage_status}\n"
+            "🧊 Last run cache total: {cache_status}\n"
             "🗜️ Compaction: threshold `{compact_threshold:,}` tokens, tail `{tail_budget:,}` tokens\n"
             "🧷 Auto compaction: `{auto_compact_status}`, minimum `{min_messages}` messages, "
             "cooldown `{cooldown_minutes}` minutes, tool output `{tool_output_chars}` chars\n"
@@ -64,8 +72,12 @@ MESSAGES = {
         "telegram.skills.empty": "📦 *No available skills*",
         "telegram.skills.title": "📦 *Available Skills* ({count})\n",
         "telegram.skills.no_triggers": "no triggers",
-        "telegram.compact.running": "⏳ Compacting history...",
-        "telegram.compact.failed": "❌ Compaction failed: {error}",
+        "command.compact.running": "⏳ Compacting history...",
+        "command.compact.failed": "❌ Compaction failed: {error}",
+        "command.compact.completed": "✅ Compaction complete: {before} → {after} messages",
+        "command.compact.not_needed": "ℹ️ Recent history is already within budget; no compaction needed",
+        "command.compact.not_enough_history": "ℹ️ Not enough conversation history to compact",
+        "command.compact.partial_failure": "❌ Compaction persistence failed: {error}",
         "telegram.message.error": "Sorry, an error occurred while processing your message. Please try again later.",
     },
     "zh": {
@@ -89,29 +101,37 @@ MESSAGES = {
             "*命令：*\n"
             "/start - 开始使用\n"
             "/help - 显示帮助\n"
-            "/status - 查看系统状态\n\n"
+            "/status - 查看系统状态\n"
+            "/skills - 查看可用技能\n"
+            "/compact - 压缩当前会话历史\n\n"
             "直接用自然语言告诉我你想做什么就行！"
         ),
-        "telegram.status.memory_missing": "未创建",
-        "telegram.status.read_failed": "读取失败",
-        "telegram.status.usage": "{input_tokens:,} / {window:,} tokens ({pct})，{at} 来自 `{origin}`",
-        "telegram.status.no_run": "尚无完成的 run",
-        "telegram.status.cache_metrics": (
+        "command.status.memory_missing": "未创建",
+        "command.status.read_failed": "读取失败",
+        "command.status.usage": "{input_tokens:,} / {window:,} tokens ({pct})，{at} 来自 `{origin}`",
+        "command.status.run_usage": (
+            "{input_tokens:,} 个累计输入 tokens（{requests} 次请求），"
+            "{at} 来自 `{origin}`"
+        ),
+        "command.status.no_run": "尚无完成的 run",
+        "command.status.cache_metrics": (
             "hit/read `{cache_hit:,}`，miss `{cache_miss:,}`，"
             "write `{cache_write:,}`，hit rate `{ratio}`"
         ),
-        "telegram.status.no_cache_metrics": "上轮未返回缓存指标",
-        "telegram.status.enabled": "开启",
-        "telegram.status.disabled": "关闭",
-        "telegram.status": (
+        "command.status.no_cache_metrics": "上轮未返回缓存指标",
+        "command.status.enabled": "开启",
+        "command.status.disabled": "关闭",
+        "command.status.health_unknown": "暂不可用",
+        "command.status": (
             "📊 *系统状态*\n\n"
             "🟢 服务运行中\n"
             "🤖 模型：`{model}`\n"
             "⏰ 时区：`{timezone}`\n"
             "📡 Channels: {channels}\n"
-            "💬 历史消息（DB 总数 / 当前可重放）：{total_messages} / {history_count}\n"
-            "🧮 上轮上下文占用：{usage_status}\n"
-            "🧊 上轮缓存：{cache_status}\n"
+            "🩺 Channel 健康：{channel_health}\n"
+            "💬 历史消息（DB 总数 / 当前会话可重放）：{total_messages} / {history_count}\n"
+            "🧮 最近一次请求上下文：{usage_status}\n"
+            "🧊 上轮 run 累计缓存：{cache_status}\n"
             "🗜️ 压缩策略：阈值 `{compact_threshold:,}` tokens，tail `{tail_budget:,}` tokens\n"
             "🧷 自动压缩：`{auto_compact_status}`，最少 `{min_messages}` 条，"
             "冷却 `{cooldown_minutes}` 分钟，工具输出 `{tool_output_chars}` chars\n"
@@ -120,8 +140,12 @@ MESSAGES = {
         "telegram.skills.empty": "📦 *暂无可用技能*",
         "telegram.skills.title": "📦 *可用技能*（{count} 个）\n",
         "telegram.skills.no_triggers": "无触发词",
-        "telegram.compact.running": "⏳ 正在压缩历史…",
-        "telegram.compact.failed": "❌ 压缩失败：{error}",
+        "command.compact.running": "⏳ 正在压缩历史…",
+        "command.compact.failed": "❌ 压缩失败：{error}",
+        "command.compact.completed": "✅ 压缩完成：{before} → {after} 条消息",
+        "command.compact.not_needed": "ℹ️ 最近历史已在预算内，无需压缩",
+        "command.compact.not_enough_history": "ℹ️ 当前会话历史不足，无法压缩",
+        "command.compact.partial_failure": "❌ 压缩快照保存失败：{error}",
         "telegram.message.error": "抱歉，处理消息时出错。请稍后再试。",
     },
 }

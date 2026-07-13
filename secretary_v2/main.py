@@ -45,11 +45,23 @@ CHAT_CHANNELS = {"telegram", "feishu"}
 LOG_PATH = Path(__file__).resolve().parent / "logs" / "secretary_v2.log"
 
 
+def _warn_if_anthropic_cache_unconfigured(config) -> None:
+    """Make the current Anthropic cache limitation explicit at startup."""
+    if (config.llm.provider or "").strip().lower() != "anthropic":
+        return
+    logger.warning(
+        "Anthropic API selected: Secretary does not currently add Anthropic "
+        "prompt-cache cache_control settings. The service will continue without "
+        "Anthropic prompt caching; cache metrics may remain zero."
+    )
+
+
 class SecretaryApp:
     """Secretary v2 application."""
 
     def __init__(self, channel_type: str = "cli", single_message: str = None):
         self.config = get_config()
+        _warn_if_anthropic_cache_unconfigured(self.config)
         self._configured_default_outgoing = self.config.channels.default_outgoing
         self._last_chat_channel_name = None
         # In single-channel dev modes, force the scheduler/agent to deliver
@@ -151,6 +163,26 @@ class SecretaryApp:
                 response_channel=self._resolve_webhook_response_channel,
                 event_recorder=self.db.create_event,
             )
+
+        self._active_channel_names = active
+        for channel in self.channels.values():
+            if hasattr(channel, "peer_channel_health_provider"):
+                channel.peer_channel_health_provider = self._channel_health_summary
+
+    def _channel_health_summary(self) -> str:
+        """Render a concise, non-blocking health hint for active channels."""
+        symbols = {
+            "healthy": "✅",
+            "starting": "⏳",
+            "stopped": "⚠️",
+            "unknown": "❔",
+        }
+        items = []
+        for name in self._active_channel_names:
+            channel = self.channels.get(name)
+            state = channel.health_status() if channel is not None else "stopped"
+            items.append(f"`{name}` {symbols.get(state, '❔')}")
+        return ", ".join(items) or "—"
 
     def _resolve_webhook_response_channel(self):
         """Resolve webhook replies at send time.

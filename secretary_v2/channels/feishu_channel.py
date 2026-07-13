@@ -86,6 +86,7 @@ class FeishuChannel(Channel):
         self.allow_chat_ids = set(allow_chat_ids or [])
         self.allow_sender_ids = set(allow_sender_ids or [])
         self.peer_channel_names = list(peer_channel_names or ["feishu"])
+        self.peer_channel_health_provider = None
         self._sdk_channel_factory = sdk_channel_factory
         self._http_client_factory = http_client_factory
         self._sdk_channel: Any = None
@@ -255,6 +256,11 @@ class FeishuChannel(Channel):
 
     def _is_ready(self) -> bool:
         return bool(self._running and self._ready and self._sdk_channel is not None)
+
+    def health_status(self) -> str:
+        if self._is_ready():
+            return "healthy"
+        return "starting" if self._running else "stopped"
 
     async def _send_chunks_now(self, chunks: list[str], target_chat_id: str) -> None:
         for chunk in chunks:
@@ -448,7 +454,7 @@ class FeishuChannel(Channel):
 
         command = self._parse_command(text)
         if command:
-            await self._handle_command(command, chat_id)
+            await self._handle_command(command, msg, chat_id, sender_id)
             return
 
         source_message_id = getattr(msg, "message_id", None)
@@ -486,7 +492,17 @@ class FeishuChannel(Channel):
             if not await self._reply_to_message(error_text, source_message_id):
                 await self.send(error_text, chat_id)
 
-    async def _handle_command(self, command: str, chat_id: str) -> None:
+    async def _handle_command(
+        self, command: str, msg: Any, chat_id: str, sender_id: str
+    ) -> None:
+        from channel_commands import CommandScope
+
+        scope = CommandScope(
+            channel="feishu",
+            user_id=sender_id,
+            conversation_id=chat_id,
+            thread_id=getattr(getattr(msg, "conversation", None), "thread_id", None),
+        )
         if command == "start":
             await self.send(t("telegram.start", self._ui_lang()), chat_id)
             return
@@ -494,97 +510,33 @@ class FeishuChannel(Channel):
             await self.send(t("telegram.help", self._ui_lang()), chat_id)
             return
         if command == "status":
-            await self._status_command(chat_id)
+            await self._status_command(chat_id, scope)
             return
         if command == "skills":
             await self._skills_command(chat_id)
             return
         if command == "compact":
-            await self._compact_command(chat_id)
+            await self._compact_command(chat_id, scope)
 
-    async def _status_command(self, chat_id: str) -> None:
-        from config import get_config
-        from memory import get_db
-        from runtime import get_last_usage
+    async def _status_command(self, chat_id: str, scope) -> None:
+        from channel_commands import build_status_text
 
-        cfg = get_config()
         lang = self._ui_lang()
-        db = get_db()
         try:
-            stats = db.get_message_stats()
-            history_msgs = db.load_pydantic_messages()
-            history_count = len(history_msgs)
-            memory_path = Path(__file__).resolve().parents[1] / "memory.md"
-            memory_status = (
-                f"{memory_path.stat().st_size} bytes"
-                if memory_path.exists()
-                else t("telegram.status.memory_missing", lang)
+            status_text = build_status_text(
+                scope=scope,
+                lang=lang,
+                peer_channel_names=self.peer_channel_names,
+                channel_health=(
+                    self.peer_channel_health_provider()
+                    if self.peer_channel_health_provider
+                    else None
+                ),
             )
         except Exception as e:
-            logger.error(f"Feishu /status stats query failed: {e}")
-            history_count = -1
-            memory_status = t("telegram.status.read_failed", lang)
-            stats = {"total_messages": -1}
-
-        usage = get_last_usage()
-        window = cfg.history.context_tokens
-        if usage and usage.get("input_tokens") is not None:
-            inp = usage["input_tokens"]
-            pct = f"{inp / window * 100:.0f}%" if window else "?"
-            usage_status = t(
-                "telegram.status.usage",
-                lang,
-                input_tokens=inp,
-                window=window,
-                pct=pct,
-                at=usage.get("at", "?"),
-                origin=usage.get("origin", "?"),
-            )
-            cache_hit = usage.get("cache_hit_tokens")
-            cache_miss = usage.get("cache_miss_tokens")
-            cache_write = usage.get("cache_write_tokens") or 0
-            cache_ratio = usage.get("cache_hit_ratio")
-            if cache_hit or cache_miss or cache_write:
-                ratio = f"{cache_ratio * 100:.1f}%" if isinstance(cache_ratio, (int, float)) else "?"
-                cache_status = t(
-                    "telegram.status.cache_metrics",
-                    lang,
-                    cache_hit=int(cache_hit or 0),
-                    cache_miss=int(cache_miss or 0),
-                    cache_write=int(cache_write),
-                    ratio=ratio,
-                )
-            else:
-                cache_status = t("telegram.status.no_cache_metrics", lang)
-        else:
-            usage_status = t("telegram.status.no_run", lang)
-            cache_status = t("telegram.status.no_run", lang)
-
-        hist_cfg = cfg.history
-        compact_threshold = int(hist_cfg.context_tokens * hist_cfg.compress_threshold)
-        auto_compact_status = t(
-            "telegram.status.enabled" if hist_cfg.auto_compact else "telegram.status.disabled",
-            lang,
-        )
-        channels_str = ", ".join(f"`{n}`" for n in self.peer_channel_names)
-        status_text = t(
-            "telegram.status",
-            lang,
-            model=f"{cfg.llm.provider}/{cfg.llm.model}",
-            timezone=cfg.timezone,
-            channels=channels_str,
-            total_messages=stats.get("total_messages", "?"),
-            history_count=history_count,
-            usage_status=usage_status,
-            cache_status=cache_status,
-            compact_threshold=compact_threshold,
-            tail_budget=hist_cfg.tail_token_budget,
-            auto_compact_status=auto_compact_status,
-            min_messages=hist_cfg.compact_min_active_messages,
-            cooldown_minutes=hist_cfg.compact_cooldown_minutes,
-            tool_output_chars=hist_cfg.compact_tool_output_max_chars,
-            memory_status=memory_status,
-        )
+            logger.error(f"Feishu /status failed: {e}")
+            await self.send(t("command.status.read_failed", lang), chat_id)
+            return
         await self.send(status_text, chat_id)
 
     async def _skills_command(self, chat_id: str) -> None:
@@ -602,26 +554,18 @@ class FeishuChannel(Channel):
             lines.append(f"- {name} - {triggers}")
         await self.send("\n".join(lines), chat_id)
 
-    async def _compact_command(self, chat_id: str) -> None:
-        from compaction import force_compact
-        from memory import get_db
+    async def _compact_command(self, chat_id: str, scope) -> None:
+        from channel_commands import compact_conversation
 
         lang = self._ui_lang()
-        await self.send(t("telegram.compact.running", lang), chat_id)
+        await self.send(t("command.compact.running", lang), chat_id)
         try:
-            from runtime import build_session_key
-
-            session_key = build_session_key(
-                channel="feishu",
-                user_id=chat_id,
-                conversation_id=chat_id,
-            )
-            result = await force_compact(get_db(), session_key=session_key)
+            result = await compact_conversation(scope=scope, lang=lang)
         except Exception as e:
             logger.error(f"Feishu /compact failed: {e}")
-            await self.send(t("telegram.compact.failed", lang, error=e), chat_id)
+            await self.send(t("command.compact.failed", lang, error=e), chat_id)
             return
-        await self.send(f"Compaction complete: {result}", chat_id)
+        await self.send(result, chat_id)
 
     def _message_allowed(self, msg: Any, chat_id: str, sender_id: str) -> bool:
         if self.allow_chat_ids and chat_id not in self.allow_chat_ids:

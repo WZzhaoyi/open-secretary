@@ -39,6 +39,10 @@ class Channel(ABC):
 
     name: str
 
+    def health_status(self) -> str:
+        """Return a small, side-effect-free liveness state for /status."""
+        return "unknown"
+
     @abstractmethod
     async def start(self) -> None:
         """Start the channel."""
