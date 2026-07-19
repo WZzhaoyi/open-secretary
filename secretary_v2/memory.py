@@ -73,9 +73,13 @@ def _response_has_actionable_part(msg: ModelResponse) -> bool:
     return False
 
 
-def _strip_thinking_from_response(msg: ModelResponse) -> Optional[ModelResponse]:
-    """Remove thinking parts and drop responses that would be invalid history."""
-    parts = [part for part in msg.parts if not isinstance(part, ThinkingPart)]
+def _sanitize_response_for_history(msg: ModelResponse) -> Optional[ModelResponse]:
+    """Keep usable reasoning while rejecting responses that cannot be replayed."""
+    parts = [
+        part
+        for part in msg.parts
+        if not isinstance(part, ThinkingPart) or bool(part.content.strip())
+    ]
     if not parts:
         return None
     cleaned = msg if len(parts) == len(msg.parts) else replace(msg, parts=parts)
@@ -182,7 +186,7 @@ def _strip_non_replayable_messages(
     sanitized: List[ModelMessage] = []
     for msg in messages:
         if isinstance(msg, ModelResponse):
-            cleaned = _strip_thinking_from_response(msg)
+            cleaned = _sanitize_response_for_history(msg)
             if cleaned is None:
                 logger.warning(
                     "Skipping non-actionable model response with parts=%s",
@@ -200,10 +204,10 @@ def sanitize_pydantic_messages_for_history(
 ) -> List[ModelMessage]:
     """Return only model messages safe to persist and replay as history.
 
-    DeepSeek/OpenAI-compatible chat history cannot contain an assistant message
-    that has reasoning/thinking but no visible content or tool_calls. We also
-    avoid persisting thinking parts in otherwise valid responses so historical
-    replay stays provider-portable and cannot regress into content=None turns.
+    Assistant responses with neither visible content nor tool_calls cannot be
+    replayed safely, so thinking-only responses are rejected. Non-empty reasoning
+    is retained when the same response has visible text or tool_calls; content=None
+    remains valid when tool_calls are present.
 
     OpenAI-compatible history also requires every assistant tool-call response
     to be followed by tool-return messages for all tool_call_id values before
@@ -687,8 +691,8 @@ class Database:
 
         Rows that become empty after sanitization have their BLOB nulled so
         load_pydantic_messages skips them while the human-readable audit preview
-        remains in `content`. Rows that only needed thinking parts removed are
-        rewritten with the sanitized blob.
+        remains in `content`. Rows that only needed empty thinking parts removed
+        are rewritten with the sanitized blob.
         """
         changed = 0
         with self.get_session() as session:
@@ -956,6 +960,24 @@ class Database:
                 .limit(limit)
                 .all()
             )
+
+    def get_agent_events_since(
+        self,
+        since: datetime,
+        *,
+        event_type: Optional[str] = None,
+        origin: Optional[str] = None,
+    ) -> List[AgentEvent]:
+        """Return observability events since a UTC-naive timestamp."""
+        with self.get_session() as session:
+            query = session.query(AgentEvent).filter(AgentEvent.created_at >= since)
+            if event_type is not None:
+                query = query.filter(AgentEvent.type == event_type)
+            if origin is not None:
+                query = query.filter(AgentEvent.origin == origin)
+            return query.order_by(
+                AgentEvent.created_at.desc(), AgentEvent.id.desc()
+            ).all()
 
     def execute_query(self, sql: str, params: Optional[List] = None) -> List[Dict]:
         """Execute a read-only query."""

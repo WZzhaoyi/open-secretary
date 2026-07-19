@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import json
 import logging
 from pathlib import Path
 from typing import Iterable, Optional
@@ -45,6 +47,127 @@ def _replayable_history(db, session_key: str):
     return history
 
 
+def _cache_counts(metrics) -> tuple[int, int]:
+    hit = metrics.get("cache_hit_tokens", 0)
+    miss = metrics.get("cache_miss_tokens", 0)
+    return (
+        int(hit) if isinstance(hit, (int, float)) else 0,
+        int(miss) if isinstance(miss, (int, float)) else 0,
+    )
+
+
+def _format_request_cache_status(usage, lang: str) -> str:
+    request_metrics = usage.get("request_cache_metrics")
+    if not isinstance(request_metrics, list):
+        return t("command.status.no_request_cache_metrics", lang)
+
+    samples = []
+    for metrics in request_metrics:
+        if not isinstance(metrics, dict):
+            continue
+        hit, miss = _cache_counts(metrics)
+        if hit + miss > 0:
+            samples.append((hit, miss))
+    if not samples:
+        return t("command.status.no_request_cache_metrics", lang)
+
+    first_hit, first_miss = samples[0]
+    first_ratio = first_hit / (first_hit + first_miss)
+    first = t(
+        "command.status.cache_segment",
+        lang,
+        cache_hit=first_hit,
+        cache_miss=first_miss,
+        ratio=f"{first_ratio * 100:.1f}%",
+    )
+    if len(samples) == 1:
+        return t("command.status.cache_first_only", lang, first=first)
+
+    follow_hit = sum(hit for hit, _ in samples[1:])
+    follow_miss = sum(miss for _, miss in samples[1:])
+    follow_ratio = follow_hit / (follow_hit + follow_miss)
+    follow = t(
+        "command.status.cache_segment",
+        lang,
+        cache_hit=follow_hit,
+        cache_miss=follow_miss,
+        ratio=f"{follow_ratio * 100:.1f}%",
+    )
+    return t(
+        "command.status.cache_request_split",
+        lang,
+        first=first,
+        follow=follow,
+        follow_count=len(samples) - 1,
+    )
+
+
+def _cache_window_totals(events, *, since: datetime, origin: Optional[str] = None):
+    runs = hit = miss = 0
+    for event in events:
+        if event.created_at is None or event.created_at < since:
+            continue
+        if origin is not None and event.origin != origin:
+            continue
+        try:
+            payload = json.loads(event.payload_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        sample_hit, sample_miss = _cache_counts(usage)
+        if sample_hit + sample_miss <= 0:
+            continue
+        runs += 1
+        hit += sample_hit
+        miss += sample_miss
+    return runs, hit, miss
+
+
+def _format_cache_window(sample, lang: str) -> str:
+    runs, hit, miss = sample
+    if runs <= 0 or hit + miss <= 0:
+        return t("command.status.no_cache_window_metrics", lang)
+    return t(
+        "command.status.cache_window_metrics",
+        lang,
+        runs=runs,
+        ratio=f"{hit / (hit + miss) * 100:.1f}%",
+    )
+
+
+def _rolling_cache_status(db, *, channel: str, lang: str) -> str:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    since_24h = now - timedelta(hours=24)
+    since_7d = now - timedelta(days=7)
+    events = db.get_agent_events_since(
+        since_7d,
+        event_type="run_finished",
+    )
+    return t(
+        "command.status.cache_rolling",
+        lang,
+        channel=channel,
+        all_24h=_format_cache_window(
+            _cache_window_totals(events, since=since_24h),
+            lang,
+        ),
+        channel_24h=_format_cache_window(
+            _cache_window_totals(events, since=since_24h, origin=channel),
+            lang,
+        ),
+        all_7d=_format_cache_window(
+            _cache_window_totals(events, since=since_7d),
+            lang,
+        ),
+        channel_7d=_format_cache_window(
+            _cache_window_totals(events, since=since_7d, origin=channel),
+            lang,
+        ),
+    )
+
+
 def build_status_text(
     *,
     scope: CommandScope,
@@ -75,7 +198,22 @@ def build_status_text(
         memory_status = t("command.status.read_failed", lang)
         stats = {"total_messages": -1}
 
+    try:
+        rolling_cache_status = _rolling_cache_status(
+            db,
+            channel=scope.channel,
+            lang=lang,
+        )
+    except Exception as e:
+        logger.error("Failed to build rolling cache metrics: %s", e)
+        rolling_cache_status = t("command.status.read_failed", lang)
+
     usage = get_last_usage(session_key=session_key)
+    request_cache_status = (
+        _format_request_cache_status(usage, lang)
+        if usage
+        else t("command.status.no_run", lang)
+    )
     window = cfg.history.context_tokens
     if usage:
         request_input = usage.get("last_request_input_tokens")
@@ -148,6 +286,8 @@ def build_status_text(
         history_count=history_count,
         usage_status=usage_status,
         cache_status=cache_status,
+        request_cache_status=request_cache_status,
+        rolling_cache_status=rolling_cache_status,
         compact_threshold=compact_threshold,
         tail_budget=hist_cfg.tail_token_budget,
         auto_compact_status=auto_compact_status,

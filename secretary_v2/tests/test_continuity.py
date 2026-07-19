@@ -540,14 +540,39 @@ def test_save_pydantic_messages_skips_thinking_only_response(fresh_db):
     assert fresh_db.get_messages(limit=10) == []
 
 
-def test_save_pydantic_messages_strips_thinking_from_valid_response(fresh_db):
-    """Visible text/tool-call history is kept, but reasoning content is dropped."""
+def test_save_pydantic_messages_keeps_thinking_with_visible_response(fresh_db):
+    """Usable reasoning is persisted when the response has visible content."""
     fresh_db.save_pydantic_messages(
         [
             ModelResponse(
                 parts=[
                     ThinkingPart(
                         content="internal reasoning",
+                        id="reasoning_content",
+                        provider_name="deepseek",
+                    ),
+                    TextPart(content="visible"),
+                ],
+                provider_name="deepseek",
+            )
+        ]
+    )
+
+    loaded = fresh_db.load_pydantic_messages()
+    assert len(loaded) == 1
+    assert [part.part_kind for part in loaded[0].parts] == ["thinking", "text"]
+    assert loaded[0].parts[0].content == "internal reasoning"
+    assert loaded[0].parts[1].content == "visible"
+
+
+def test_save_pydantic_messages_drops_empty_thinking_from_valid_response(fresh_db):
+    """Empty reasoning is removed without discarding an otherwise valid response."""
+    fresh_db.save_pydantic_messages(
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content="   ",
                         id="reasoning_content",
                         provider_name="deepseek",
                     ),
@@ -678,12 +703,18 @@ def test_load_pydantic_messages_keeps_complete_tool_call_chain(fresh_db):
         [
             ModelResponse(
                 parts=[
+                    ThinkingPart(
+                        content="query the database first",
+                        id="reasoning_content",
+                        provider_name="deepseek",
+                    ),
                     ToolCallPart(
                         tool_name="db_query",
                         args={"sql": "select 1"},
                         tool_call_id="call_ok",
-                    )
-                ]
+                    ),
+                ],
+                provider_name="deepseek",
             ),
             ModelRequest(
                 parts=[
@@ -701,7 +732,8 @@ def test_load_pydantic_messages_keeps_complete_tool_call_chain(fresh_db):
     loaded = fresh_db.load_pydantic_messages()
 
     assert [msg.kind for msg in loaded] == ["response", "request", "response"]
-    assert loaded[0].parts[0].part_kind == "tool-call"
+    assert [part.part_kind for part in loaded[0].parts] == ["thinking", "tool-call"]
+    assert loaded[0].parts[0].content == "query the database first"
     assert loaded[1].parts[0].part_kind == "tool-return"
     assert loaded[2].parts[0].content == "final answer"
 
@@ -3122,6 +3154,59 @@ def test_usage_payload_adapts_deepseek_details():
     assert payload["details"]["prompt_cache_hit_tokens"] == 80
 
 
+def test_usage_payload_records_per_request_cache_metrics():
+    """Run totals retain a chronological cache breakdown for each provider request."""
+    class TotalUsage:
+        input_tokens = 300
+        output_tokens = 20
+        requests = 2
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        details = {"prompt_cache_hit_tokens": 170, "prompt_cache_miss_tokens": 130}
+
+    class FirstUsage:
+        input_tokens = 120
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        details = {"prompt_cache_hit_tokens": 20, "prompt_cache_miss_tokens": 100}
+
+    class FollowUsage:
+        input_tokens = 180
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        details = {"prompt_cache_hit_tokens": 150, "prompt_cache_miss_tokens": 30}
+
+    payload = runtime._build_usage_payload(
+        TotalUsage(),
+        origin_channel="test",
+        at="now",
+        last_request_usage=FollowUsage(),
+        request_usages=[FirstUsage(), FollowUsage()],
+    )
+
+    assert payload["last_request_input_tokens"] == 180
+    assert payload["request_cache_metrics"] == [
+        {
+            "request": 1,
+            "input_tokens": 120,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_hit_tokens": 20,
+            "cache_miss_tokens": 100,
+            "cache_hit_ratio": 1 / 6,
+        },
+        {
+            "request": 2,
+            "input_tokens": 180,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_hit_tokens": 150,
+            "cache_miss_tokens": 30,
+            "cache_hit_ratio": 5 / 6,
+        },
+    ]
+
+
 def test_telegram_status_surfaces_cache_metrics():
     """Telegram /status should show recent cache usage when available."""
     import inspect
@@ -3176,6 +3261,26 @@ def test_status_uses_current_session_custom_memory_and_last_request_usage(
         [ModelRequest(parts=[UserPromptPart(content="beta")])], session_key=beta
     )
     monkeypatch.setattr(memory, "_db_instance", fresh_db)
+    fresh_db.create_agent_event(
+        event_type="run_finished",
+        origin="telegram",
+        payload={
+            "usage": {
+                "cache_hit_tokens": 60,
+                "cache_miss_tokens": 40,
+            }
+        },
+    )
+    fresh_db.create_agent_event(
+        event_type="run_finished",
+        origin="http",
+        payload={
+            "usage": {
+                "cache_hit_tokens": 0,
+                "cache_miss_tokens": 100,
+            }
+        },
+    )
 
     memory_file = tmp_path / "custom-memory.md"
     memory_file.write_text("custom memory", encoding="utf-8")
@@ -3192,6 +3297,18 @@ def test_status_uses_current_session_custom_memory_and_last_request_usage(
             "cache_read_tokens": 100,
             "cache_write_tokens": 0,
             "cache_hit_ratio": 2 / 3,
+            "request_cache_metrics": [
+                {
+                    "request": 1,
+                    "cache_hit_tokens": 80,
+                    "cache_miss_tokens": 40,
+                },
+                {
+                    "request": 2,
+                    "cache_hit_tokens": 20,
+                    "cache_miss_tokens": 10,
+                },
+            ],
             "at": "now",
             "origin": "telegram",
         }},
@@ -3209,6 +3326,10 @@ def test_status_uses_current_session_custom_memory_and_last_request_usage(
     assert "30 /" in text
     assert "150 /" not in text
     assert f"{memory_file.stat().st_size} bytes" in text
+    assert "first request: hit `80`, miss `40`" in text
+    assert "follow-ups (1): hit `20`, miss `10`" in text
+    assert "24h all `30.0%`" in text
+    assert "`telegram` `60.0%`" in text
 
 
 @pytest.mark.asyncio

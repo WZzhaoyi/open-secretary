@@ -2088,21 +2088,21 @@ def _last_response_usage(result: Any) -> Optional[Any]:
     return None
 
 
-def _build_usage_payload(
-    usage: Any,
-    *,
-    origin_channel: str,
-    at: Optional[str] = None,
-    last_request_usage: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """Normalize Pydantic AI usage plus DeepSeek's OpenAI-compatible extras."""
+def _response_usages(messages: Optional[List[ModelMessage]]) -> List[Any]:
+    """Return provider usage for each model request in chronological order."""
+    if not messages:
+        return []
+    return [
+        message.usage
+        for message in messages
+        if isinstance(message, ModelResponse) and message.usage is not None
+    ]
+
+
+def _cache_metrics_from_usage(usage: Any) -> Dict[str, Any]:
+    """Normalize cache counters from one aggregate or per-request usage object."""
     details = _usage_details(usage)
     input_tokens = getattr(usage, "input_tokens", None)
-    output_tokens = getattr(usage, "output_tokens", None)
-    total_tokens = getattr(usage, "total_tokens", None)
-    if total_tokens is None and input_tokens is not None and output_tokens is not None:
-        total_tokens = input_tokens + output_tokens
-
     cache_read_tokens = getattr(usage, "cache_read_tokens", 0) or 0
     cache_write_tokens = getattr(usage, "cache_write_tokens", 0) or 0
     prompt_cache_hit_tokens = details.get("prompt_cache_hit_tokens")
@@ -2130,17 +2130,48 @@ def _build_usage_payload(
         if isinstance(cache_denom, (int, float)) and cache_denom > 0
         else None
     )
+    return {
+        "input_tokens": input_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cache_hit_tokens": cache_hit_tokens,
+        "cache_miss_tokens": cache_miss_tokens,
+        "cache_hit_ratio": cache_hit_ratio,
+    }
+
+
+def _build_usage_payload(
+    usage: Any,
+    *,
+    origin_channel: str,
+    at: Optional[str] = None,
+    last_request_usage: Optional[Any] = None,
+    request_usages: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize Pydantic AI usage plus DeepSeek's OpenAI-compatible extras."""
+    details = _usage_details(usage)
+    input_tokens = getattr(usage, "input_tokens", None)
+    output_tokens = getattr(usage, "output_tokens", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+
+    cache_metrics = _cache_metrics_from_usage(usage)
+    normalized_request_usages = request_usages or []
+    if not normalized_request_usages and last_request_usage is not None:
+        normalized_request_usages = [last_request_usage]
+    request_cache_metrics = [
+        {"request": index, **_cache_metrics_from_usage(request_usage)}
+        for index, request_usage in enumerate(normalized_request_usages, start=1)
+    ]
 
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
         "requests": getattr(usage, "requests", None),
-        "cache_read_tokens": cache_read_tokens,
-        "cache_write_tokens": cache_write_tokens,
-        "cache_hit_tokens": cache_hit_tokens,
-        "cache_miss_tokens": cache_miss_tokens,
-        "cache_hit_ratio": cache_hit_ratio,
+        **cache_metrics,
+        "request_cache_metrics": request_cache_metrics,
         "details": details,
         "last_request_input_tokens": (
             getattr(last_request_usage, "input_tokens", None)
@@ -2451,16 +2482,19 @@ async def _run_agent_unlocked(
         # Inspect the class so both installs stay warning-free.
         usage_attr = inspect.getattr_static(type(result), "usage", None)
         usage = result.usage if isinstance(usage_attr, property) else result.usage()
+        last_request_usage = _last_response_usage(result)
+        request_usages = _response_usages(_result_new_messages(result))
         global _last_usage, _last_usage_by_session
         _last_usage = _build_usage_payload(
             usage,
             origin_channel=origin_channel,
-            last_request_usage=_last_response_usage(result),
+            last_request_usage=last_request_usage,
+            request_usages=request_usages,
         )
         _last_usage_by_session[session_key] = dict(_last_usage)
         usage_payload = dict(_last_usage)
         logger.info(
-            "[run_agent] usage input=%s output=%s total=%s requests=%s cache_read=%s cache_write=%s cache_hit=%s cache_miss=%s",
+            "[run_agent] usage input=%s output=%s total=%s requests=%s cache_read=%s cache_write=%s cache_hit=%s cache_miss=%s cache_requests=%s",
             _last_usage["input_tokens"],
             _last_usage["output_tokens"],
             _last_usage["total_tokens"],
@@ -2469,6 +2503,7 @@ async def _run_agent_unlocked(
             _last_usage["cache_write_tokens"],
             _last_usage["cache_hit_tokens"],
             _last_usage["cache_miss_tokens"],
+            json.dumps(_last_usage["request_cache_metrics"], separators=(",", ":")),
         )
     except Exception as e:
         logger.debug(f"[run_agent] usage unavailable: {e}")
