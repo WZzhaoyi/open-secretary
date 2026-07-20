@@ -370,7 +370,10 @@ def _summary_failed(compacted) -> bool:
 
 
 async def force_compact(
-    db, session_key: Optional[str] = None
+    db,
+    session_key: Optional[str] = None,
+    created_after: Optional[datetime] = None,
+    include_legacy: bool = True,
 ) -> CompactCommandResult:
     """User-triggered /compact: summarize history and rewrite the DB snapshot.
 
@@ -381,6 +384,8 @@ async def force_compact(
     loaded_row_ids: list[int] = []
     history = db.load_pydantic_messages(
         session_key=session_key,
+        include_legacy=include_legacy,
+        created_after=created_after,
         loaded_row_ids=loaded_row_ids,
     )
     if len(history) < 4:

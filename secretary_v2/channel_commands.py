@@ -36,13 +36,18 @@ class CommandScope:
         )
 
 
-def _replayable_history(db, session_key: str):
+def _replayable_history(db, scope: CommandScope):
     """Mirror run_agent's session/legacy history selection exactly."""
+    from runtime import history_created_after_for_channel
+
+    session_key = scope.session_key()
+    created_after = history_created_after_for_channel(scope.channel)
     history = db.load_pydantic_messages(
         session_key=session_key,
         include_legacy=False,
+        created_after=created_after,
     )
-    if not history:
+    if not history and created_after is None:
         history = db.load_pydantic_messages(session_key=session_key)
     return history
 
@@ -185,7 +190,7 @@ def build_status_text(
     session_key = scope.session_key()
     try:
         stats = db.get_message_stats()
-        history_count = len(_replayable_history(db, session_key))
+        history_count = len(_replayable_history(db, scope))
         memory_path: Path = get_memory_file_path()
         memory_status = (
             f"{memory_path.stat().st_size} bytes"
@@ -302,11 +307,19 @@ async def compact_conversation(*, scope: CommandScope, lang: str) -> str:
     """Compact the scoped conversation and render a localized result."""
     from compaction import force_compact
     from memory import get_db
+    from runtime import history_created_after_for_channel
     from session_locks import get_session_lock
 
     session_key = scope.session_key()
+    created_after = history_created_after_for_channel(scope.channel)
+    compact_kwargs = {"session_key": session_key}
+    if created_after is not None:
+        compact_kwargs.update(
+            created_after=created_after,
+            include_legacy=False,
+        )
     async with get_session_lock(session_key):
-        result = await force_compact(get_db(), session_key=session_key)
+        result = await force_compact(get_db(), **compact_kwargs)
     if result.status == "completed":
         return t(
             "command.compact.completed",

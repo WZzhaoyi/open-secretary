@@ -226,6 +226,37 @@ def build_session_key(
     return key
 
 
+def history_created_after_for_channel(
+    channel: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Return a naive-UTC soft retention cutoff for channel history replay.
+
+    Webhook history uses local calendar days so the replay prefix changes at
+    most once per local day. A zero-day setting disables the cutoff. Other
+    channels keep their existing token-budget-only behavior.
+    """
+    cfg = get_config()
+    days = cfg.history.webhook_retention_days
+    if channel != "http" or days <= 0:
+        return None
+
+    tz = ZoneInfo(cfg.timezone)
+    local_now = now or datetime.now(tz)
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=tz)
+    else:
+        local_now = local_now.astimezone(tz)
+    local_cutoff = local_now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    ) - timedelta(days=days - 1)
+    return local_cutoff.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 # Path to the user+agent shared long-term memory scratchpad.
 # Injection cap and write soft-cap share one constant so the agent can never
 # durably write memory that the prompt injection silently drops.
@@ -782,6 +813,12 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
         runtime_parts.append(
             "### Webhook Delivery Contract\n"
             "- This run came from an HTTP webhook, not a scheduled task.\n"
+            "- Reconcile the webhook payload with relevant facts in `memory.md` before "
+            "analyzing it. Unless the current payload explicitly updates a fact, "
+            "`memory.md` is authoritative over conflicting or older conversation history.\n"
+            "- Do not infer current holdings from tracked/watchlist items or stale history; "
+            "only describe an item as a current holding when `memory.md` or the current "
+            "payload says it is one.\n"
             "- Analyze the webhook payload and put the user-visible reply in final output; "
             "the application will forward that final output to the configured response channel.\n"
             "- Do not call `send_message` to answer the current webhook, and do not write `NO_ACTION` "
@@ -2341,12 +2378,21 @@ async def _run_agent_unlocked(
     )
 
     loaded_history_row_ids: List[int] = []
+    history_created_after = history_created_after_for_channel(
+        origin_channel,
+        now=datetime.fromisoformat(deps.current_time),
+    )
     persisted_history = db.load_pydantic_messages(
         session_key=session_key,
         include_legacy=False,
+        created_after=history_created_after,
         loaded_row_ids=loaded_history_row_ids,
     )
-    if not persisted_history and origin_channel != "self_test":
+    if (
+        not persisted_history
+        and origin_channel != "self_test"
+        and history_created_after is None
+    ):
         loaded_history_row_ids = []
         persisted_history = db.load_pydantic_messages(
             session_key=session_key,

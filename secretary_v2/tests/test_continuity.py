@@ -10,6 +10,7 @@ These tests use Pydantic AI's TestModel so they don't burn API tokens.
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -39,7 +40,7 @@ from config import (
     SearchConfig,
     SkillsConfig,
 )
-from memory import Database
+from memory import Database, Message
 from runtime import run_agent
 from scheduler import Scheduler
 from pydantic_ai_summarization import SummarizationProcessor
@@ -147,6 +148,7 @@ def test_config_defaults_language_to_auto(tmp_path):
         {"compress_threshold": 1.0},
         {"context_tokens": 100, "compress_threshold": 0.5, "tail_token_budget": 50},
         {"compact_cooldown_minutes": -1},
+        {"webhook_retention_days": -1},
     ],
 )
 def test_history_config_rejects_invalid_compaction_budgets(kwargs):
@@ -395,6 +397,27 @@ async def test_run_agent_isolates_history_by_session_key(fresh_db, monkeypatch):
     )
 
 
+def test_http_history_cutoff_uses_local_calendar_days(monkeypatch):
+    from config import get_config
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg.history, "webhook_retention_days", 5)
+    monkeypatch.setattr(cfg, "timezone", "Asia/Shanghai")
+    now = datetime(
+        2026,
+        7,
+        20,
+        16,
+        37,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+
+    assert runtime.history_created_after_for_channel("http", now=now) == datetime(
+        2026, 7, 15, 16
+    )
+    assert runtime.history_created_after_for_channel("telegram", now=now) is None
+
+
 @pytest.mark.asyncio
 async def test_run_agent_uses_legacy_history_only_for_empty_session(fresh_db, monkeypatch):
     captured = []
@@ -419,6 +442,31 @@ async def test_run_agent_uses_legacy_history_only_for_empty_session(fresh_db, mo
     assert "legacy global context" in str(captured[0])
     assert "legacy global context" not in str(captured[1])
     assert "first isolated turn" in str(captured[1])
+
+
+@pytest.mark.asyncio
+async def test_http_retention_does_not_fall_back_to_legacy_history(
+    fresh_db, monkeypatch
+):
+    captured = []
+    fresh_db.save_pydantic_messages(
+        [ModelRequest(parts=[UserPromptPart(content="legacy global context")])]
+    )
+
+    async def _fake_run(user_text, *args, **kwargs):
+        captured.append(kwargs["message_history"])
+        return FakeRunResult(user_text, "ok")
+
+    monkeypatch.setattr(runtime.agent, "run", _fake_run)
+    await run_agent(
+        "first webhook turn",
+        db=fresh_db,
+        origin_channel="http",
+        user_id="webhook_user",
+        conversation_id="webhook_user",
+    )
+
+    assert "legacy global context" not in str(captured[0])
 
 
 @pytest.mark.asyncio
@@ -501,6 +549,55 @@ async def test_run_agent_runtime_tail_is_temporary(fresh_db, monkeypatch):
     assert persisted
     assert "Trusted Runtime Context" not in str(persisted)
     assert "hello" in str(persisted)
+
+
+@pytest.mark.asyncio
+async def test_http_run_prioritizes_memory_facts_over_stale_history(
+    fresh_db, tmp_path, monkeypatch
+):
+    captured = {}
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text(
+        "# Long-term memory\n\n- Current holdings: dividend ETF only\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
+
+    session_key = runtime.build_session_key(
+        channel="http",
+        user_id="webhook_user",
+        conversation_id="webhook_user",
+    )
+    fresh_db.save_pydantic_messages(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content="Old history: CR Land is a holding")]
+            ),
+            ModelResponse(parts=[TextPart(content="Tracking CR Land as a holding")]),
+        ],
+        session_key=session_key,
+        channel="http",
+    )
+
+    async def _fake_run(user_text, *args, **kwargs):
+        captured["history"] = kwargs["message_history"]
+        return FakeRunResult(user_text, "ok")
+
+    monkeypatch.setattr(runtime.agent, "run", _fake_run)
+    await run_agent(
+        "New market data",
+        db=fresh_db,
+        origin_channel="http",
+        user_id="webhook_user",
+        conversation_id="webhook_user",
+    )
+
+    history = captured["history"]
+    assert "Old history: CR Land is a holding" in str(history[:-1])
+    runtime_tail = str(history[-1])
+    assert "Current holdings: dividend ETF only" in runtime_tail
+    assert "`memory.md` is authoritative" in runtime_tail
+    assert "Do not infer current holdings from tracked/watchlist items" in runtime_tail
 
 
 @pytest.mark.asyncio
@@ -923,6 +1020,47 @@ def test_load_pydantic_messages_uses_token_budget_and_id_order(fresh_db, monkeyp
         if hasattr(part, "content")
     ]
     assert contents == ["middle", "newest"]
+
+
+def test_load_pydantic_messages_time_window_keeps_complete_turns(fresh_db):
+    session_key = "agent:secretary:http:conversation:webhook_user"
+    fresh_db.save_pydantic_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(content="old request")]),
+            ModelResponse(parts=[TextPart(content="orphan old response")]),
+            ModelRequest(parts=[UserPromptPart(content="recent request")]),
+            ModelResponse(parts=[TextPart(content="recent response")]),
+        ],
+        session_key=session_key,
+        channel="http",
+    )
+    cutoff = datetime(2026, 7, 16)
+    with fresh_db.get_session() as session:
+        rows = session.query(Message).order_by(Message.id).all()
+        rows[0].created_at = cutoff - timedelta(seconds=2)
+        rows[1].created_at = cutoff + timedelta(seconds=1)
+        rows[2].created_at = cutoff + timedelta(seconds=2)
+        rows[3].created_at = cutoff + timedelta(seconds=3)
+        recent_row_ids = [rows[2].id, rows[3].id]
+        session.commit()
+
+    loaded_row_ids = []
+    loaded = fresh_db.load_pydantic_messages(
+        session_key=session_key,
+        include_legacy=False,
+        created_after=cutoff,
+        loaded_row_ids=loaded_row_ids,
+    )
+    contents = [
+        part.content
+        for message in loaded
+        for part in getattr(message, "parts", [])
+        if isinstance(part, (UserPromptPart, TextPart))
+    ]
+
+    assert contents == ["recent request", "recent response"]
+    assert loaded_row_ids == recent_row_ids
+    assert len(fresh_db.get_messages(limit=10)) == 4
 
 
 def test_load_pydantic_messages_loads_in_batches(fresh_db, monkeypatch):
@@ -1485,6 +1623,8 @@ async def test_dynamic_context_warns_recorded_webhook_not_to_duplicate_event():
     assert "distinct actionable follow-up" in text
     assert "Webhook Delivery Contract" in text
     assert "not a scheduled task" in text
+    assert "`memory.md` is authoritative" in text
+    assert "Do not infer current holdings from tracked/watchlist items" in text
     assert "put the user-visible reply in final output" in text
     assert "Do not call `send_message` to answer the current webhook" in text
 

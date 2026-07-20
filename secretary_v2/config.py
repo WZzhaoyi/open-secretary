@@ -95,6 +95,7 @@ class HistoryConfig:
     context_tokens: int = 100000
     compress_threshold: float = 0.75
     tail_token_budget: int = 20000
+    webhook_retention_days: int = 5
     max_events: int = 10
     auto_compact: bool = True
     compact_min_active_messages: int = 4
@@ -113,6 +114,8 @@ class HistoryConfig:
             raise ValueError(
                 "history.tail_token_budget must be smaller than the compaction threshold"
             )
+        if self.webhook_retention_days < 0:
+            raise ValueError("history.webhook_retention_days must be non-negative")
         if self.max_events < 0:
             raise ValueError("history.max_events must be non-negative")
         if self.compact_min_active_messages < 1:

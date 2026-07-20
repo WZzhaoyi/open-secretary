@@ -148,6 +148,9 @@ history:
   context_tokens: 256000
   compress_threshold: 0.55
   tail_token_budget: 20000
+  # HTTP webhook conversations replay only these recent local calendar days.
+  # Older rows remain in SQLite; 0 disables the read-time retention window.
+  webhook_retention_days: 5
   max_events: 10
   auto_compact: true
   compact_min_active_messages: 4

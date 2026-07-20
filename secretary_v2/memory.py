@@ -31,7 +31,9 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     ThinkingPart,
+    UserPromptPart,
 )
 
 from config import get_config
@@ -41,6 +43,7 @@ logger = logging.getLogger(__name__)
 Base = declarative_base()
 
 _token_encoding = None
+_SUMMARY_MARKER = "Summary of previous conversation:"
 
 
 def _estimate_msg_tokens(msgs: List[ModelMessage]) -> int:
@@ -60,6 +63,28 @@ def _estimate_msg_tokens(msgs: List[ModelMessage]) -> int:
             elif content is not None:
                 total += len(_token_encoding.encode(str(content)))
     return total
+
+
+def _trim_to_complete_turn(messages: List[ModelMessage]) -> List[ModelMessage]:
+    """Drop a time-window fragment until a replay-safe conversation boundary.
+
+    Rows from one agent run are persisted separately. A timestamp cutoff can
+    therefore land between the initial user request and its response/tool loop.
+    Start at the next real user request, while allowing a compacted summary to
+    remain the first replayed message.
+    """
+    for index, message in enumerate(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        if any(isinstance(part, UserPromptPart) for part in message.parts):
+            return messages[index:]
+        if any(
+            isinstance(part, SystemPromptPart)
+            and _SUMMARY_MARKER in part.content
+            for part in message.parts
+        ):
+            return messages[index:]
+    return []
 
 
 def _response_has_actionable_part(msg: ModelResponse) -> bool:
@@ -574,6 +599,7 @@ class Database:
         *,
         session_key: Optional[str] = None,
         include_legacy: bool = True,
+        created_after: Optional[datetime] = None,
         loaded_row_ids: Optional[List[int]] = None,
     ) -> List[ModelMessage]:
         """Load recent pydantic-ai messages newest-first up to a token budget.
@@ -585,8 +611,10 @@ class Database:
         included even if it alone exceeds the budget.
 
         Pre-run compaction is the real safety net — this budget only bounds how
-        much we deserialize and feed it. Rows without a pydantic_ai_msg payload
-        (legacy plain-text rows, or rows archived by /compact) are skipped.
+        much we deserialize and feed it. ``created_after`` is a read-time soft
+        retention boundary; older rows remain stored. Rows without a
+        pydantic_ai_msg payload (legacy plain-text rows, or rows archived by
+        /compact) are skipped.
         """
         if token_budget is None:
             token_budget = get_config().history.context_tokens
@@ -600,6 +628,8 @@ class Database:
                 query = session.query(Message.id, Message.pydantic_ai_msg).filter(
                     Message.pydantic_ai_msg.isnot(None)
                 )
+                if created_after is not None:
+                    query = query.filter(Message.created_at >= created_after)
                 if session_key is not None:
                     if include_legacy:
                         query = query.filter(
@@ -644,10 +674,17 @@ class Database:
 
         selected.reverse()  # back to chronological order
         result: List[ModelMessage] = []
-        for row_id, msgs in selected:
-            if loaded_row_ids is not None:
-                loaded_row_ids.append(row_id)
+        for _, msgs in selected:
             result.extend(msgs)
+        if created_after is not None:
+            result = _trim_to_complete_turn(result)
+        if loaded_row_ids is not None:
+            retained_message_ids = {id(message) for message in result}
+            loaded_row_ids.extend(
+                row_id
+                for row_id, msgs in selected
+                if any(id(message) in retained_message_ids for message in msgs)
+            )
         return sanitize_pydantic_messages_for_history(result)
 
     def replace_pydantic_messages_snapshot(
