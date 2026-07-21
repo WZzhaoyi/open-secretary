@@ -51,6 +51,20 @@ MESSAGES = {
             "write `{cache_write:,}`, hit rate `{ratio}`"
         ),
         "command.status.no_cache_metrics": "last run did not return cache metrics",
+        "command.status.cache_segment": (
+            "hit `{cache_hit:,}`, miss `{cache_miss:,}`, hit rate `{ratio}`"
+        ),
+        "command.status.cache_first_only": "first request: {first}",
+        "command.status.cache_request_split": (
+            "first request: {first}; follow-ups ({follow_count}): {follow}"
+        ),
+        "command.status.no_request_cache_metrics": "per-request metrics unavailable",
+        "command.status.cache_window_metrics": "`{ratio}` over `{runs}` runs",
+        "command.status.no_cache_window_metrics": "no samples",
+        "command.status.cache_rolling": (
+            "24h all {all_24h}, `{channel}` {channel_24h}; "
+            "7d all {all_7d}, `{channel}` {channel_7d}"
+        ),
         "command.status.enabled": "enabled",
         "command.status.disabled": "disabled",
         "command.status.health_unknown": "unavailable",
@@ -64,6 +78,8 @@ MESSAGES = {
             "💬 Messages (DB total / replayable in this conversation): {total_messages} / {history_count}\n"
             "🧮 Latest request context: {usage_status}\n"
             "🧊 Last run cache total: {cache_status}\n"
+            "🧩 Last run request split: {request_cache_status}\n"
+            "📈 Rolling cache: {rolling_cache_status}\n"
             "🗜️ Compaction: threshold `{compact_threshold:,}` tokens, tail `{tail_budget:,}` tokens\n"
             "🧷 Auto compaction: `{auto_compact_status}`, minimum `{min_messages}` messages, "
             "cooldown `{cooldown_minutes}` minutes, tool output `{tool_output_chars}` chars\n"
@@ -119,6 +135,20 @@ MESSAGES = {
             "write `{cache_write:,}`，hit rate `{ratio}`"
         ),
         "command.status.no_cache_metrics": "上轮未返回缓存指标",
+        "command.status.cache_segment": (
+            "hit `{cache_hit:,}`，miss `{cache_miss:,}`，hit rate `{ratio}`"
+        ),
+        "command.status.cache_first_only": "首请求：{first}",
+        "command.status.cache_request_split": (
+            "首请求：{first}；后续请求（{follow_count} 次）：{follow}"
+        ),
+        "command.status.no_request_cache_metrics": "暂无逐请求指标",
+        "command.status.cache_window_metrics": "`{ratio}`（`{runs}` 个 runs）",
+        "command.status.no_cache_window_metrics": "暂无样本",
+        "command.status.cache_rolling": (
+            "24h 全局 {all_24h}，`{channel}` {channel_24h}；"
+            "7d 全局 {all_7d}，`{channel}` {channel_7d}"
+        ),
         "command.status.enabled": "开启",
         "command.status.disabled": "关闭",
         "command.status.health_unknown": "暂不可用",
@@ -132,6 +162,8 @@ MESSAGES = {
             "💬 历史消息（DB 总数 / 当前会话可重放）：{total_messages} / {history_count}\n"
             "🧮 最近一次请求上下文：{usage_status}\n"
             "🧊 上轮 run 累计缓存：{cache_status}\n"
+            "🧩 上轮 run 分请求缓存：{request_cache_status}\n"
+            "📈 滚动缓存：{rolling_cache_status}\n"
             "🗜️ 压缩策略：阈值 `{compact_threshold:,}` tokens，tail `{tail_budget:,}` tokens\n"
             "🧷 自动压缩：`{auto_compact_status}`，最少 `{min_messages}` 条，"
             "冷却 `{cooldown_minutes}` 分钟，工具输出 `{tool_output_chars}` chars\n"

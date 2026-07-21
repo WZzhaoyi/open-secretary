@@ -226,6 +226,37 @@ def build_session_key(
     return key
 
 
+def history_created_after_for_channel(
+    channel: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Return a naive-UTC soft retention cutoff for channel history replay.
+
+    Webhook history uses local calendar days so the replay prefix changes at
+    most once per local day. A zero-day setting disables the cutoff. Other
+    channels keep their existing token-budget-only behavior.
+    """
+    cfg = get_config()
+    days = cfg.history.webhook_retention_days
+    if channel != "http" or days <= 0:
+        return None
+
+    tz = ZoneInfo(cfg.timezone)
+    local_now = now or datetime.now(tz)
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=tz)
+    else:
+        local_now = local_now.astimezone(tz)
+    local_cutoff = local_now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    ) - timedelta(days=days - 1)
+    return local_cutoff.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 # Path to the user+agent shared long-term memory scratchpad.
 # Injection cap and write soft-cap share one constant so the agent can never
 # durably write memory that the prompt injection silently drops.
@@ -782,6 +813,12 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
         runtime_parts.append(
             "### Webhook Delivery Contract\n"
             "- This run came from an HTTP webhook, not a scheduled task.\n"
+            "- Reconcile the webhook payload with relevant facts in `memory.md` before "
+            "analyzing it. Unless the current payload explicitly updates a fact, "
+            "`memory.md` is authoritative over conflicting or older conversation history.\n"
+            "- Do not infer current holdings from tracked/watchlist items or stale history; "
+            "only describe an item as a current holding when `memory.md` or the current "
+            "payload says it is one.\n"
             "- Analyze the webhook payload and put the user-visible reply in final output; "
             "the application will forward that final output to the configured response channel.\n"
             "- Do not call `send_message` to answer the current webhook, and do not write `NO_ACTION` "
@@ -2088,21 +2125,21 @@ def _last_response_usage(result: Any) -> Optional[Any]:
     return None
 
 
-def _build_usage_payload(
-    usage: Any,
-    *,
-    origin_channel: str,
-    at: Optional[str] = None,
-    last_request_usage: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """Normalize Pydantic AI usage plus DeepSeek's OpenAI-compatible extras."""
+def _response_usages(messages: Optional[List[ModelMessage]]) -> List[Any]:
+    """Return provider usage for each model request in chronological order."""
+    if not messages:
+        return []
+    return [
+        message.usage
+        for message in messages
+        if isinstance(message, ModelResponse) and message.usage is not None
+    ]
+
+
+def _cache_metrics_from_usage(usage: Any) -> Dict[str, Any]:
+    """Normalize cache counters from one aggregate or per-request usage object."""
     details = _usage_details(usage)
     input_tokens = getattr(usage, "input_tokens", None)
-    output_tokens = getattr(usage, "output_tokens", None)
-    total_tokens = getattr(usage, "total_tokens", None)
-    if total_tokens is None and input_tokens is not None and output_tokens is not None:
-        total_tokens = input_tokens + output_tokens
-
     cache_read_tokens = getattr(usage, "cache_read_tokens", 0) or 0
     cache_write_tokens = getattr(usage, "cache_write_tokens", 0) or 0
     prompt_cache_hit_tokens = details.get("prompt_cache_hit_tokens")
@@ -2130,17 +2167,48 @@ def _build_usage_payload(
         if isinstance(cache_denom, (int, float)) and cache_denom > 0
         else None
     )
+    return {
+        "input_tokens": input_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cache_hit_tokens": cache_hit_tokens,
+        "cache_miss_tokens": cache_miss_tokens,
+        "cache_hit_ratio": cache_hit_ratio,
+    }
+
+
+def _build_usage_payload(
+    usage: Any,
+    *,
+    origin_channel: str,
+    at: Optional[str] = None,
+    last_request_usage: Optional[Any] = None,
+    request_usages: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize Pydantic AI usage plus DeepSeek's OpenAI-compatible extras."""
+    details = _usage_details(usage)
+    input_tokens = getattr(usage, "input_tokens", None)
+    output_tokens = getattr(usage, "output_tokens", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+
+    cache_metrics = _cache_metrics_from_usage(usage)
+    normalized_request_usages = request_usages or []
+    if not normalized_request_usages and last_request_usage is not None:
+        normalized_request_usages = [last_request_usage]
+    request_cache_metrics = [
+        {"request": index, **_cache_metrics_from_usage(request_usage)}
+        for index, request_usage in enumerate(normalized_request_usages, start=1)
+    ]
 
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
         "requests": getattr(usage, "requests", None),
-        "cache_read_tokens": cache_read_tokens,
-        "cache_write_tokens": cache_write_tokens,
-        "cache_hit_tokens": cache_hit_tokens,
-        "cache_miss_tokens": cache_miss_tokens,
-        "cache_hit_ratio": cache_hit_ratio,
+        **cache_metrics,
+        "request_cache_metrics": request_cache_metrics,
         "details": details,
         "last_request_input_tokens": (
             getattr(last_request_usage, "input_tokens", None)
@@ -2310,12 +2378,21 @@ async def _run_agent_unlocked(
     )
 
     loaded_history_row_ids: List[int] = []
+    history_created_after = history_created_after_for_channel(
+        origin_channel,
+        now=datetime.fromisoformat(deps.current_time),
+    )
     persisted_history = db.load_pydantic_messages(
         session_key=session_key,
         include_legacy=False,
+        created_after=history_created_after,
         loaded_row_ids=loaded_history_row_ids,
     )
-    if not persisted_history and origin_channel != "self_test":
+    if (
+        not persisted_history
+        and origin_channel != "self_test"
+        and history_created_after is None
+    ):
         loaded_history_row_ids = []
         persisted_history = db.load_pydantic_messages(
             session_key=session_key,
@@ -2451,16 +2528,19 @@ async def _run_agent_unlocked(
         # Inspect the class so both installs stay warning-free.
         usage_attr = inspect.getattr_static(type(result), "usage", None)
         usage = result.usage if isinstance(usage_attr, property) else result.usage()
+        last_request_usage = _last_response_usage(result)
+        request_usages = _response_usages(_result_new_messages(result))
         global _last_usage, _last_usage_by_session
         _last_usage = _build_usage_payload(
             usage,
             origin_channel=origin_channel,
-            last_request_usage=_last_response_usage(result),
+            last_request_usage=last_request_usage,
+            request_usages=request_usages,
         )
         _last_usage_by_session[session_key] = dict(_last_usage)
         usage_payload = dict(_last_usage)
         logger.info(
-            "[run_agent] usage input=%s output=%s total=%s requests=%s cache_read=%s cache_write=%s cache_hit=%s cache_miss=%s",
+            "[run_agent] usage input=%s output=%s total=%s requests=%s cache_read=%s cache_write=%s cache_hit=%s cache_miss=%s cache_requests=%s",
             _last_usage["input_tokens"],
             _last_usage["output_tokens"],
             _last_usage["total_tokens"],
@@ -2469,6 +2549,7 @@ async def _run_agent_unlocked(
             _last_usage["cache_write_tokens"],
             _last_usage["cache_hit_tokens"],
             _last_usage["cache_miss_tokens"],
+            json.dumps(_last_usage["request_cache_metrics"], separators=(",", ":")),
         )
     except Exception as e:
         logger.debug(f"[run_agent] usage unavailable: {e}")

@@ -31,7 +31,9 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     ThinkingPart,
+    UserPromptPart,
 )
 
 from config import get_config
@@ -41,6 +43,7 @@ logger = logging.getLogger(__name__)
 Base = declarative_base()
 
 _token_encoding = None
+_SUMMARY_MARKER = "Summary of previous conversation:"
 
 
 def _estimate_msg_tokens(msgs: List[ModelMessage]) -> int:
@@ -62,6 +65,28 @@ def _estimate_msg_tokens(msgs: List[ModelMessage]) -> int:
     return total
 
 
+def _trim_to_complete_turn(messages: List[ModelMessage]) -> List[ModelMessage]:
+    """Drop a time-window fragment until a replay-safe conversation boundary.
+
+    Rows from one agent run are persisted separately. A timestamp cutoff can
+    therefore land between the initial user request and its response/tool loop.
+    Start at the next real user request, while allowing a compacted summary to
+    remain the first replayed message.
+    """
+    for index, message in enumerate(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        if any(isinstance(part, UserPromptPart) for part in message.parts):
+            return messages[index:]
+        if any(
+            isinstance(part, SystemPromptPart)
+            and _SUMMARY_MARKER in part.content
+            for part in message.parts
+        ):
+            return messages[index:]
+    return []
+
+
 def _response_has_actionable_part(msg: ModelResponse) -> bool:
     """True when a response can be replayed as assistant content/tool_calls."""
     for part in msg.parts:
@@ -73,9 +98,13 @@ def _response_has_actionable_part(msg: ModelResponse) -> bool:
     return False
 
 
-def _strip_thinking_from_response(msg: ModelResponse) -> Optional[ModelResponse]:
-    """Remove thinking parts and drop responses that would be invalid history."""
-    parts = [part for part in msg.parts if not isinstance(part, ThinkingPart)]
+def _sanitize_response_for_history(msg: ModelResponse) -> Optional[ModelResponse]:
+    """Keep usable reasoning while rejecting responses that cannot be replayed."""
+    parts = [
+        part
+        for part in msg.parts
+        if not isinstance(part, ThinkingPart) or bool(part.content.strip())
+    ]
     if not parts:
         return None
     cleaned = msg if len(parts) == len(msg.parts) else replace(msg, parts=parts)
@@ -182,7 +211,7 @@ def _strip_non_replayable_messages(
     sanitized: List[ModelMessage] = []
     for msg in messages:
         if isinstance(msg, ModelResponse):
-            cleaned = _strip_thinking_from_response(msg)
+            cleaned = _sanitize_response_for_history(msg)
             if cleaned is None:
                 logger.warning(
                     "Skipping non-actionable model response with parts=%s",
@@ -200,10 +229,10 @@ def sanitize_pydantic_messages_for_history(
 ) -> List[ModelMessage]:
     """Return only model messages safe to persist and replay as history.
 
-    DeepSeek/OpenAI-compatible chat history cannot contain an assistant message
-    that has reasoning/thinking but no visible content or tool_calls. We also
-    avoid persisting thinking parts in otherwise valid responses so historical
-    replay stays provider-portable and cannot regress into content=None turns.
+    Assistant responses with neither visible content nor tool_calls cannot be
+    replayed safely, so thinking-only responses are rejected. Non-empty reasoning
+    is retained when the same response has visible text or tool_calls; content=None
+    remains valid when tool_calls are present.
 
     OpenAI-compatible history also requires every assistant tool-call response
     to be followed by tool-return messages for all tool_call_id values before
@@ -570,6 +599,7 @@ class Database:
         *,
         session_key: Optional[str] = None,
         include_legacy: bool = True,
+        created_after: Optional[datetime] = None,
         loaded_row_ids: Optional[List[int]] = None,
     ) -> List[ModelMessage]:
         """Load recent pydantic-ai messages newest-first up to a token budget.
@@ -581,8 +611,10 @@ class Database:
         included even if it alone exceeds the budget.
 
         Pre-run compaction is the real safety net — this budget only bounds how
-        much we deserialize and feed it. Rows without a pydantic_ai_msg payload
-        (legacy plain-text rows, or rows archived by /compact) are skipped.
+        much we deserialize and feed it. ``created_after`` is a read-time soft
+        retention boundary; older rows remain stored. Rows without a
+        pydantic_ai_msg payload (legacy plain-text rows, or rows archived by
+        /compact) are skipped.
         """
         if token_budget is None:
             token_budget = get_config().history.context_tokens
@@ -596,6 +628,8 @@ class Database:
                 query = session.query(Message.id, Message.pydantic_ai_msg).filter(
                     Message.pydantic_ai_msg.isnot(None)
                 )
+                if created_after is not None:
+                    query = query.filter(Message.created_at >= created_after)
                 if session_key is not None:
                     if include_legacy:
                         query = query.filter(
@@ -640,10 +674,17 @@ class Database:
 
         selected.reverse()  # back to chronological order
         result: List[ModelMessage] = []
-        for row_id, msgs in selected:
-            if loaded_row_ids is not None:
-                loaded_row_ids.append(row_id)
+        for _, msgs in selected:
             result.extend(msgs)
+        if created_after is not None:
+            result = _trim_to_complete_turn(result)
+        if loaded_row_ids is not None:
+            retained_message_ids = {id(message) for message in result}
+            loaded_row_ids.extend(
+                row_id
+                for row_id, msgs in selected
+                if any(id(message) in retained_message_ids for message in msgs)
+            )
         return sanitize_pydantic_messages_for_history(result)
 
     def replace_pydantic_messages_snapshot(
@@ -687,8 +728,8 @@ class Database:
 
         Rows that become empty after sanitization have their BLOB nulled so
         load_pydantic_messages skips them while the human-readable audit preview
-        remains in `content`. Rows that only needed thinking parts removed are
-        rewritten with the sanitized blob.
+        remains in `content`. Rows that only needed empty thinking parts removed
+        are rewritten with the sanitized blob.
         """
         changed = 0
         with self.get_session() as session:
@@ -956,6 +997,24 @@ class Database:
                 .limit(limit)
                 .all()
             )
+
+    def get_agent_events_since(
+        self,
+        since: datetime,
+        *,
+        event_type: Optional[str] = None,
+        origin: Optional[str] = None,
+    ) -> List[AgentEvent]:
+        """Return observability events since a UTC-naive timestamp."""
+        with self.get_session() as session:
+            query = session.query(AgentEvent).filter(AgentEvent.created_at >= since)
+            if event_type is not None:
+                query = query.filter(AgentEvent.type == event_type)
+            if origin is not None:
+                query = query.filter(AgentEvent.origin == origin)
+            return query.order_by(
+                AgentEvent.created_at.desc(), AgentEvent.id.desc()
+            ).all()
 
     def execute_query(self, sql: str, params: Optional[List] = None) -> List[Dict]:
         """Execute a read-only query."""
