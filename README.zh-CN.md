@@ -46,6 +46,20 @@ cd secretary_v2
 
 `manage.sh` 会启动 `python main.py --channel all`，运行所有已配置的非 CLI 渠道：Telegram、飞书/Lark 和 HTTP。
 
+### 存档并重建数据库（systemd 部署）
+
+如需完整存档现有 SQLite 数据库、按当前结构从头建库，并且只保留
+`status='open'` 的 `events` 与全部 `scheduled_tasks`，运行：
+
+```bash
+bash deploy/rebuild-database.sh --yes
+```
+
+脚本会停止 `secretary.service`，将带时间戳的完整旧库保存到
+`secretary_v2/archive/`，校验存档和新库，然后启动服务并等待启动自检通过。
+使用 `--no-start` 可让原本运行中的服务在完成后保持停止；运行环境不在
+`~/.venvs/secretary` 时可设置 `SECRETARY_VENV` 或 `SECRETARY_PYTHON`。
+
 ## Telegram 命令
 
 | 命令 | 说明 |

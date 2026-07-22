@@ -46,6 +46,21 @@ cd secretary_v2
 
 `manage.sh` starts `python main.py --channel all`, which runs every configured non-CLI channel: Telegram, Feishu/Lark, and HTTP.
 
+### Archive and rebuild the database (systemd deployment)
+
+To archive the complete SQLite database, recreate the current schema, and keep
+only `events` rows whose status is `open` plus every `scheduled_tasks` row:
+
+```bash
+bash deploy/rebuild-database.sh --yes
+```
+
+The script stops `secretary.service`, writes a timestamped database under
+`secretary_v2/archive/`, validates the archive and rebuilt database, then starts
+the service and waits for its startup self-test. Use `--no-start` to leave a
+previously running service stopped. Set `SECRETARY_VENV` or `SECRETARY_PYTHON`
+when the runtime is not in `~/.venvs/secretary`.
+
 ## Telegram Commands
 
 | Command | Description |
