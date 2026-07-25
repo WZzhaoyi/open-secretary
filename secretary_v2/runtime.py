@@ -1115,6 +1115,23 @@ async def market_calendar(
         return f"Error: market_calendar failed: {e}"
 
 
+_CONTEXT_VISIBILITY_UPDATE_RE = re.compile(
+    r"^\s*UPDATE\s+(?P<table>messages|events)\s+"
+    r"SET\s+context_visible\s*=\s*(?:0|1|\?|:[A-Za-z_][A-Za-z0-9_]*)\s+"
+    r"WHERE\s+.+?;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_context_visibility_only_update(sql: str, table: str) -> bool:
+    """Allow a guarded visibility-only UPDATE on an otherwise protected table."""
+    statement = sql.strip()
+    if ";" in statement.rstrip(";"):
+        return False
+    match = _CONTEXT_VISIBILITY_UPDATE_RE.fullmatch(statement)
+    return bool(match and match.group("table").upper() == table.upper())
+
+
 @agent.tool
 async def db_execute(
     ctx: RunContext[SecretaryDeps], sql: str, params: Optional[List] = None
@@ -1156,6 +1173,8 @@ async def db_execute(
     }
     for table in protected_tables:
         if re.search(rf"\b{table}\b", redacted_sql):
+            if table == "MESSAGES" and _is_context_visibility_only_update(sql, table):
+                continue
             decision = permission_denied(
                 "db_execute",
                 table.lower(),

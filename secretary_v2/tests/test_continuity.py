@@ -418,6 +418,57 @@ def test_http_history_cutoff_uses_local_calendar_days(monkeypatch):
     assert runtime.history_created_after_for_channel("telegram", now=now) is None
 
 
+def test_context_visibility_hides_messages_without_deleting_them(fresh_db):
+    fresh_db.save_pydantic_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(content="hidden historical request")]),
+            ModelResponse(parts=[TextPart(content="hidden historical response")]),
+        ]
+    )
+
+    affected = fresh_db.execute_statement(
+        "UPDATE messages SET context_visible = 0 WHERE context_visible = 1"
+    )
+
+    assert affected == 2
+    assert fresh_db.load_pydantic_messages() == []
+    rows = fresh_db.get_messages(limit=10)
+    assert len(rows) == 2
+    assert {row.context_visible for row in rows} == {0}
+
+
+def test_context_visibility_never_replays_a_partial_turn(fresh_db):
+    fresh_db.save_pydantic_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(content="hidden request boundary")]),
+            ModelResponse(parts=[TextPart(content="orphan response boundary")]),
+        ]
+    )
+    request_id = min(row.id for row in fresh_db.get_messages(limit=10))
+    fresh_db.execute_statement(
+        "UPDATE messages SET context_visible = 0 WHERE id = ?", [request_id]
+    )
+
+    assert fresh_db.load_pydantic_messages() == []
+    assert len(fresh_db.get_messages(limit=10)) == 2
+
+
+def test_context_visibility_filters_automatic_event_queries(fresh_db):
+    hidden = fresh_db.create_event("note", "hidden event", status="logged")
+    visible = fresh_db.create_event("note", "visible event", status="logged")
+    fresh_db.execute_statement(
+        "UPDATE events SET context_visible = 0 WHERE id = ?", [hidden.id]
+    )
+
+    automatic = fresh_db.get_events_excluding_statuses([], limit=10)
+
+    assert [event.id for event in automatic] == [visible.id]
+    assert {event.id for event in fresh_db.get_events(limit=10)} == {
+        hidden.id,
+        visible.id,
+    }
+
+
 @pytest.mark.asyncio
 async def test_run_agent_uses_legacy_history_only_for_empty_session(fresh_db, monkeypatch):
     captured = []
@@ -1129,7 +1180,11 @@ def test_default_schedule_prompts_follow_memory_events_design():
         or "short bullets" in consolidation_prompt
     )
     assert "status != 'open'" in consolidation_prompt
-    assert "DELETE FROM events WHERE created_at <" in consolidation_prompt
+    assert "context_visible=1" in consolidation_prompt
+    assert "datetime('now','-7 days')" in consolidation_prompt
+    assert "UPDATE events SET context_visible=0" in consolidation_prompt
+    assert "UPDATE messages SET context_visible=0" in consolidation_prompt
+    assert "Never DELETE historical rows" in consolidation_prompt
     assert "send_message" in consolidation_prompt
     assert (
         "不调 send_message" in consolidation_prompt
@@ -2127,6 +2182,29 @@ async def test_db_execute_blocks_protected_runtime_tables(fresh_db):
         "UPDATE events SET status = 'promoted' WHERE 1 = 0",
     )
     assert "Statement executed successfully" in result
+
+    fresh_db.save_pydantic_messages(
+        [ModelRequest(parts=[UserPromptPart(content="visibility candidate")])]
+    )
+    result = await db_execute(
+        ctx,
+        "UPDATE messages SET context_visible = 0 WHERE context_visible = 1",
+    )
+    assert "Statement executed successfully" in result
+    assert fresh_db.load_pydantic_messages() == []
+    assert fresh_db.get_messages(limit=1)[0].context_visible == 0
+
+    result = await db_execute(
+        ctx,
+        "UPDATE messages SET content = 'changed' WHERE 1 = 0",
+    )
+    assert result.startswith("PERMISSION_DENIED")
+
+    result = await db_execute(
+        ctx,
+        "UPDATE messages SET context_visible = 0, content = 'changed' WHERE 1 = 0",
+    )
+    assert result.startswith("PERMISSION_DENIED")
 
     events = [
         event

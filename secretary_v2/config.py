@@ -405,6 +405,7 @@ DB_SCHEMA_HINT = """## 数据库表结构
 - session_key: TEXT (来源局部会话，用于回查上下文)
 - source_message_id: TEXT (平台原始消息 id，可空)
 - metadata_json: TEXT (conversation_id/thread_id/sender_id/reply_to_id 等 JSON 元数据)
+- context_visible: INTEGER NOT NULL DEFAULT 1（是否自动注入上下文；0 仅退出上下文，不删除数据）
 
 注：长期记忆（偏好、计划、需要持续跟踪的事项等）不在数据库里，而在 memory.md。
 events 表只记有时点的事件流水，供定时任务做未回复检查等。
@@ -427,6 +428,11 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 - sender_id: TEXT
 - reply_to_id: TEXT
 - metadata_json: TEXT
+- context_visible: INTEGER NOT NULL DEFAULT 1（是否参与对话历史重放）
+
+注：自动上下文和历史重放只读取 `context_visible=1` 的 events/messages；`db_query`
+仍可查询全部原始记录。`db_execute` 对 messages 只放行带 WHERE 的单字段
+`context_visible` UPDATE，其他写入仍受保护。
 
 ### agent_events 表（agent 行为审计 / 系统复盘）
 - id: INTEGER PRIMARY KEY AUTOINCREMENT
@@ -472,7 +478,7 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 1. **load_skill** - 按名称读取可用技能索引中的完整 skill 说明
 2. **db_query** - 读数据库（SELECT/PRAGMA）
 3. **record_event** - 写 events 业务事件/提醒/回复，自动带来源 channel 与 session_key
-4. **db_execute** - 复杂维护 SQL；不要修改系统表、调度表、消息表或子任务表
+4. **db_execute** - 复杂维护 SQL；消息表仅允许带 WHERE 的单字段 `context_visible` UPDATE，不要修改其他系统表、调度表、消息字段或子任务表
 5. **memory_view** - 带行号查看 memory.md（编辑前必须先看，以最新磁盘内容为锚点）
 6. **memory_str_replace / memory_insert** - 编辑长期记忆：str_replace 用唯一逐字匹配的 old_str 改写或删除（new_str="" 即删除）；insert 在指定行后新增条目
 7. **file_read** - 读普通项目文件（日志、技能、权限策略、研究产物等）；不能读 config.yaml、数据库或凭证文件

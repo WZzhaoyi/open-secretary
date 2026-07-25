@@ -257,6 +257,9 @@ class Event(Base):
     session_key = Column(String, nullable=True, index=True)
     source_message_id = Column(String, nullable=True)
     metadata_json = Column(Text, nullable=True)
+    context_visible = Column(
+        Integer, nullable=False, default=1, server_default="1", index=True
+    )
 
 
 class Message(Base):
@@ -279,6 +282,9 @@ class Message(Base):
     sender_id = Column(String, nullable=True)
     reply_to_id = Column(String, nullable=True)
     metadata_json = Column(Text, nullable=True)
+    context_visible = Column(
+        Integer, nullable=False, default=1, server_default="1", index=True
+    )
 
 
 class ScheduledTask(Base):
@@ -370,6 +376,7 @@ class Database:
                 "session_key": "TEXT",
                 "source_message_id": "TEXT",
                 "metadata_json": "TEXT",
+                "context_visible": "INTEGER NOT NULL DEFAULT 1",
             },
         )
         self._ensure_columns(
@@ -383,6 +390,7 @@ class Database:
                 "sender_id": "TEXT",
                 "reply_to_id": "TEXT",
                 "metadata_json": "TEXT",
+                "context_visible": "INTEGER NOT NULL DEFAULT 1",
             },
         )
         self._backfill_event_summaries()
@@ -492,28 +500,34 @@ class Database:
     def get_events_excluding_statuses(
         self, excluded_statuses: List[str], limit: int = 50
     ) -> List[Event]:
-        """Get recent events while omitting closed/noisy status buckets."""
+        """Get context-visible recent events while omitting status buckets."""
         with self.get_session() as session:
-            query = session.query(Event)
+            query = session.query(Event).filter(Event.context_visible == 1)
             if excluded_statuses:
                 query = query.filter(Event.status.notin_(excluded_statuses))
             return query.order_by(Event.created_at.desc()).limit(limit).all()
 
     def get_events_by_status(self, status: str, limit: int = 200) -> List[Event]:
-        """Get events by attention status, newest first."""
+        """Get context-visible events by attention status, newest first."""
         with self.get_session() as session:
             return (
                 session.query(Event)
                 .filter(Event.status == status)
+                .filter(Event.context_visible == 1)
                 .order_by(Event.created_at.desc())
                 .limit(limit)
                 .all()
             )
 
     def count_events_by_status(self, status: str) -> int:
-        """Count events by attention status."""
+        """Count context-visible events by attention status."""
         with self.get_session() as session:
-            return session.query(Event).filter(Event.status == status).count()
+            return (
+                session.query(Event)
+                .filter(Event.status == status)
+                .filter(Event.context_visible == 1)
+                .count()
+            )
 
     # Message operations
     def save_message(self, source: str, content: str,
@@ -612,9 +626,9 @@ class Database:
 
         Pre-run compaction is the real safety net — this budget only bounds how
         much we deserialize and feed it. ``created_after`` is a read-time soft
-        retention boundary; older rows remain stored. Rows without a
-        pydantic_ai_msg payload (legacy plain-text rows, or rows archived by
-        /compact) are skipped.
+        retention boundary; older rows remain stored. Rows with
+        ``context_visible=0`` or without a pydantic_ai_msg payload (legacy
+        plain-text rows, or rows archived by /compact) are skipped.
         """
         if token_budget is None:
             token_budget = get_config().history.context_tokens
@@ -622,11 +636,28 @@ class Database:
         selected: List[tuple[int, List[ModelMessage]]] = []
         total = 0
         offset = 0
+        visibility_boundary = False
 
         with self.get_session() as session:
+            hidden_query = session.query(Message.id).filter(
+                Message.context_visible == 0
+            )
+            if session_key is not None:
+                if include_legacy:
+                    hidden_query = hidden_query.filter(
+                        (Message.session_key == session_key)
+                        | (Message.session_key.is_(None))
+                    )
+                else:
+                    hidden_query = hidden_query.filter(
+                        Message.session_key == session_key
+                    )
+            visibility_boundary = hidden_query.first() is not None
+
             while True:
                 query = session.query(Message.id, Message.pydantic_ai_msg).filter(
-                    Message.pydantic_ai_msg.isnot(None)
+                    Message.pydantic_ai_msg.isnot(None),
+                    Message.context_visible == 1,
                 )
                 if created_after is not None:
                     query = query.filter(Message.created_at >= created_after)
@@ -676,7 +707,10 @@ class Database:
         result: List[ModelMessage] = []
         for _, msgs in selected:
             result.extend(msgs)
-        if created_after is not None:
+        # A time cutoff or context-visibility update can hide only the first
+        # part of a persisted run. Advance to a replay-safe request boundary
+        # without changing legacy response-only histories that have no cutoff.
+        if created_after is not None or visibility_boundary:
             result = _trim_to_complete_turn(result)
         if loaded_row_ids is not None:
             retained_message_ids = {id(message) for message in result}

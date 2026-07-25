@@ -217,18 +217,21 @@ schedules:
     cron: 0 4 * * 0
     enabled: true
     prompt: |-
-      Long-term memory consolidation: a weekly silent promote-then-prune maintenance task.
+      Long-term memory consolidation: a weekly silent promote-then-hide maintenance task.
       1. Call memory_view to inspect the current memory.md with line numbers.
-      2. Use db_query to inspect recent event patterns: SELECT id,type,status,content,created_at FROM events WHERE created_at >= datetime('now','-30 days') ORDER BY created_at ASC
-      3. Use db_query to inspect old events that can be pruned: SELECT id,type,status,content,created_at FROM events WHERE created_at < datetime('now','-30 days') AND status != 'open' ORDER BY created_at ASC
+      2. Use db_query to inspect this week's visible event patterns: SELECT id,type,status,content,created_at FROM events WHERE context_visible=1 AND created_at >= datetime('now','-7 days') ORDER BY created_at ASC
+      3. Use db_query to inspect older visible events before they leave automatic context: SELECT id,type,status,content,created_at FROM events WHERE context_visible=1 AND created_at < datetime('now','-7 days') AND status != 'open' ORDER BY created_at ASC
       4. Write only long-term valuable information into memory.md: stable preferences, collaboration agreements, tracked plans/projects/trading rules, and important decisions with their reasons.
       5. memory.md has a 50 KB injection cap, but the goal is to keep it concise, ideally under 40 KB.
       6. Follow the memory.md rules from secretary-core when choosing sections and updating content.
       7. Keep Markdown token-efficient: preserve the existing structure, prefer short bullets, and avoid deep nesting, long paragraphs, repeated headings, template comments, filler, or chat-log style notes.
       8. For old events whose long-term value has been promoted into memory.md, use db_execute to set status='promoted', for example: UPDATE events SET status='promoted' WHERE id IN (...)
-      9. Do not change status='open' events that still need a user response or active attention.
-      10. Finally, use db_execute to clean old activity-log rows: DELETE FROM events WHERE created_at < datetime('now','-30 days') AND status IN ('logged','resolved','promoted')
-      11. This is silent maintenance: do not call send_message. Whether or not memory.md or events changed, the final visible assistant message must be exactly: NO_ACTION. Do not put NO_ACTION only in reasoning/thinking/reasoning_content. Do not write a maintenance report, summary, table, or natural-language explanation.
+      9. Do not change status='open' events that still need a user response or active attention; they must remain context_visible=1 regardless of age.
+      10. Only after memory.md promotion is complete, use db_execute to remove old non-open events and messages from automatic context without deleting them:
+          UPDATE events SET context_visible=0 WHERE context_visible=1 AND created_at < datetime('now','-7 days') AND status != 'open'
+          UPDATE messages SET context_visible=0 WHERE context_visible=1 AND created_at < datetime('now','-7 days')
+      11. context_visible=0 is reversible and affects only automatic context assembly. Never DELETE historical rows; db_query can still inspect all records when explicitly needed.
+      12. This is silent maintenance: do not call send_message. Whether or not memory.md or events changed, the final visible assistant message must be exactly: NO_ACTION. Do not put NO_ACTION only in reasoning/thinking/reasoning_content. Do not write a maintenance report, summary, table, or natural-language explanation.
     protected: true
   system_review:
     cron: 30 17 * * 0
