@@ -1151,10 +1151,13 @@ def test_telegram_status_has_no_items_or_legacy_limit_dependency():
 
 
 def test_default_schedule_prompts_follow_memory_events_design():
-    """Scheduled prompts should point at memory.md/events, not the removed items table."""
+    """Scheduled prompts query durable context without forcing bookkeeping events."""
     from config import get_config
 
     schedules = get_config().schedules
+    briefing_prompt = schedules["morning_briefing"].prompt
+    trend_prompt = schedules["morning_trend_scan"].prompt
+    review_prompt = schedules["review_reminder"].prompt
     stale_prompt = schedules["stale_check"].prompt
     consolidation_prompt = schedules["memory_consolidation"].prompt
     pending_prompt = schedules["pending_response_check"].prompt
@@ -1163,6 +1166,8 @@ def test_default_schedule_prompts_follow_memory_events_design():
     assert "memory.md" in stale_prompt
     assert "from items" not in stale_prompt.lower()
     assert "get_items" not in stale_prompt
+    assert "open events" in stale_prompt.lower()
+    assert "do not create any event" in stale_prompt.lower()
     assert "status='open'" in stale_prompt
     # NB: cron schedule times are user preferences living in the gitignored
     # config.yaml, not part of this design contract — asserting exact values
@@ -1170,6 +1175,24 @@ def test_default_schedule_prompts_follow_memory_events_design():
     # scheduled prompts point at memory.md/events instead of the removed
     # items table.
     assert "status='open'" in pending_prompt
+    local_day_filter = "date(created_at,'+8 hours') = date('now','+8 hours')"
+    assert local_day_filter in briefing_prompt
+    assert local_day_filter in review_prompt
+    assert "market_calendar" in trend_prompt
+    assert "Do not claim live prices or market moves" in trend_prompt
+    assert "source_channel='scheduled'" in pending_prompt
+    assert "Resolve every older duplicate" in pending_prompt
+    assert "Do not create any event for this check" in pending_prompt
+    for proactive_prompt in (
+        briefing_prompt,
+        trend_prompt,
+        review_prompt,
+        stale_prompt,
+    ):
+        normalized = proactive_prompt.lower()
+        assert "create an event" not in normalized
+        assert "create a new event" not in normalized
+        assert "db_execute to create" not in normalized
     assert "memory_view" in consolidation_prompt
     assert "secretary-core" in consolidation_prompt
     assert "memory.md rules" in consolidation_prompt
@@ -1188,13 +1211,14 @@ def test_default_schedule_prompts_follow_memory_events_design():
     assert "send_message" in consolidation_prompt
     assert (
         "不调 send_message" in consolidation_prompt
-        or "do not call send_message" in consolidation_prompt
+        or "do not call send_message" in consolidation_prompt.lower()
     )
     assert "NO_ACTION" in consolidation_prompt
     assert (
         "不要写维护报告" in consolidation_prompt
-        or "Do not write a maintenance report" in consolidation_prompt
+        or "write a maintenance report" in consolidation_prompt
     )
+    assert len(consolidation_prompt) < 1800
     assert schedules["system_review"].cron == "30 17 * * 0"
     assert "agent_events" in system_review_prompt
     assert "origin='scheduled'" in system_review_prompt
@@ -1207,6 +1231,10 @@ def test_default_schedule_prompts_follow_memory_events_design():
     assert "type='send_message'" in system_review_prompt
     assert "status='open'" in system_review_prompt
     assert "subagent_step_finished" in system_review_prompt
+    assert "sent_count=0 alone is not an anomaly" in system_review_prompt
+    assert "do not call any tools" not in system_review_prompt.lower()
+    assert "do not call send_message or mutation tools" in system_review_prompt.lower()
+    assert len(system_review_prompt) < 3000
     assert (
         "不要写入 memory.md" in system_review_prompt
         or "Do not write to memory.md" in system_review_prompt
