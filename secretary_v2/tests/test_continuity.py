@@ -3230,6 +3230,47 @@ async def test_run_agent_retries_on_transient_error(fresh_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_agent_retries_content_filter_once(fresh_db, monkeypatch):
+    """A content-filter response gets one identical retry without a prompt change."""
+    from pydantic_ai.exceptions import ContentFilterError
+
+    calls = []
+
+    async def filtered_then_recovers(prompt, *args, **kwargs):
+        calls.append((prompt, kwargs.get("message_history")))
+        if len(calls) == 1:
+            raise ContentFilterError("simulated content filter", body="[]")
+        return FakeRunResult(prompt, "recovered")
+
+    monkeypatch.setattr(runtime.agent, "run", filtered_then_recovers)
+
+    reply = await runtime.run_agent("hi", db=fresh_db)
+
+    assert reply == "recovered"
+    assert len(calls) == 2
+    assert calls[1] == calls[0]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stops_after_one_content_filter_retry(fresh_db, monkeypatch):
+    """Repeated content filtering stops after the single retry."""
+    from pydantic_ai.exceptions import ContentFilterError
+
+    calls = {"n": 0}
+
+    async def always_filtered(*args, **kwargs):
+        calls["n"] += 1
+        raise ContentFilterError("simulated content filter", body="[]")
+
+    monkeypatch.setattr(runtime.agent, "run", always_filtered)
+
+    with pytest.raises(ContentFilterError):
+        await runtime.run_agent("hi", db=fresh_db)
+
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
 async def test_run_agent_logs_usage(fresh_db, monkeypatch, caplog):
     """Provider usage is observable without changing the response path."""
     async def fake_run(user_text, *args, **kwargs):

@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import Hooks
+from pydantic_ai.exceptions import ContentFilterError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -2113,6 +2114,7 @@ async def shell(
 # LLM call retry policy. Re-throws non-transient errors immediately so we don't
 # mask bad-request / auth issues behind retries.
 _LLM_MAX_ATTEMPTS = 3
+_CONTENT_FILTER_MAX_ATTEMPTS = 2
 _LLM_BACKOFF_BASE_SEC = 2.0
 
 # Most recent provider-reported token usage globally and per conversation.
@@ -2461,10 +2463,18 @@ async def _run_agent_unlocked(
                 )
             except Exception as e:
                 last_exc = e
-                if attempt >= _LLM_MAX_ATTEMPTS or not _is_transient_llm_error(e):
+                is_content_filter = isinstance(e, ContentFilterError)
+                is_transient = _is_transient_llm_error(e)
+                max_attempts = (
+                    _CONTENT_FILTER_MAX_ATTEMPTS
+                    if is_content_filter
+                    else _LLM_MAX_ATTEMPTS
+                )
+                should_retry = is_content_filter or is_transient
+                if attempt >= max_attempts or not should_retry:
                     logger.error(
-                        f"Agent run failed (attempt {attempt}/{_LLM_MAX_ATTEMPTS}, "
-                        f"transient={_is_transient_llm_error(e)}): {e}"
+                        f"Agent run failed (attempt {attempt}/{max_attempts}, "
+                        f"transient={is_transient}): {e}"
                     )
                     _record_agent_event(
                         db,
@@ -2474,15 +2484,21 @@ async def _run_agent_unlocked(
                         subject=type(e).__name__,
                         payload={
                             "attempt": attempt,
-                            "max_attempts": _LLM_MAX_ATTEMPTS,
-                            "transient": _is_transient_llm_error(e),
+                            "max_attempts": max_attempts,
+                            "transient": is_transient,
                             "error": str(e),
                         },
                     )
                     raise
+                if is_content_filter:
+                    logger.warning(
+                        f"Agent run content filter (attempt {attempt}/{max_attempts}): "
+                        f"{type(e).__name__}: {e}; retrying once"
+                    )
+                    continue
                 backoff = _LLM_BACKOFF_BASE_SEC * (2 ** (attempt - 1))
                 logger.warning(
-                    f"Agent run transient failure (attempt {attempt}/{_LLM_MAX_ATTEMPTS}): "
+                    f"Agent run transient failure (attempt {attempt}/{max_attempts}): "
                     f"{type(e).__name__}: {e}; retrying in {backoff}s"
                 )
                 await asyncio.sleep(backoff)
