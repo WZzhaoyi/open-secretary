@@ -229,6 +229,38 @@ def test_log_redaction_masks_telegram_bot_token():
     assert "bot123456:***67890/sendMessage" in redacted
 
 
+def test_telegram_polling_noise_filter_drops_only_getupdates_ok():
+    import logging as _logging
+    from logging_utils import TelegramPollingNoiseFilter
+
+    flt = TelegramPollingNoiseFilter()
+
+    def rec(level, name, msg):
+        r = _logging.LogRecord(
+            name=name, level=level, pathname="", lineno=0,
+            msg=msg, args=None, exc_info=None,
+        )
+        return flt.filter(r)
+
+    # Dropped: routine healthy long-poll
+    assert not rec(_logging.INFO, "httpx",
+                   'HTTP Request: POST https://api.telegram.org/bot123:***tail/getUpdates "HTTP/1.1 200 OK"')
+    # Kept: non-2xx poll surfaces the failure
+    assert rec(_logging.INFO, "httpx",
+               'HTTP Request: POST https://api.telegram.org/bot123:***tail/getUpdates "HTTP/1.1 500 Internal Server Error"')
+    # Kept: other Telegram endpoints (startup / sends)
+    assert rec(_logging.INFO, "httpx",
+               'HTTP Request: POST https://api.telegram.org/bot123:***tail/sendMessage "HTTP/1.1 200 OK"')
+    assert rec(_logging.INFO, "httpx",
+               'HTTP Request: GET https://api.telegram.org/bot123:***tail/getMe "HTTP/1.1 200 OK"')
+    # Kept: non-Telegram httpx traffic (DeepSeek, Feishu API, ...)
+    assert rec(_logging.INFO, "httpx",
+               'HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"')
+    # Kept: non-INFO levels keep all signal
+    assert rec(_logging.WARNING, "httpx",
+               'HTTP Request: POST https://api.telegram.org/bot123:***tail/getUpdates "HTTP/1.1 200 OK"')
+
+
 def test_no_action_marker_is_internal_channel_response():
     from channels.base import is_no_action_response
     from config import SECRETARY_PERSONA
