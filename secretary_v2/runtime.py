@@ -563,7 +563,7 @@ def _language_policy(language: str) -> str:
 
 
 def _load_memory_md() -> str:
-    """Read memory.md if it exists. Soft-cap to keep system prompt sane."""
+    """Read memory.md if it exists. Character-cap to keep the prompt sane."""
     memory_path = get_memory_file_path()
     if not memory_path.exists():
         return ""
@@ -572,14 +572,15 @@ def _load_memory_md() -> str:
     except Exception as e:
         logger.warning(f"Failed to read memory.md: {e}")
         return ""
-    # 50KB cap: same as file_read tool, prevents a runaway memory.md from
+    # 50,000-character cap: prevents a runaway memory.md from
     # blowing up every prompt. The truncation must be visible to the model,
     # otherwise entries past the cap look like they were never written.
     if len(text) > MEMORY_SOFT_CAP_CHARS:
         return (
             text[:MEMORY_SOFT_CAP_CHARS]
-            + "\n\n[memory.md truncated at 50KB — entries beyond this point are "
-            "not visible. Prune stale entries with memory_str_replace.]"
+            + "\n\n[memory.md truncated at 50,000 characters — entries beyond "
+            "this point are not visible. Prune stale entries with "
+            "memory_str_replace.]"
         )
     return text
 
@@ -1428,7 +1429,18 @@ async def memory_view(
             return f"Error: invalid view_range {view_range}; memory.md has {len(lines)} lines"
 
     numbered = numbered_lines(lines[start - 1 : end], start)
-    return "Contents of memory.md with line numbers:\n" + "\n".join(numbered)
+    warning_chars = get_config().maintenance.memory_warning_chars
+    size_summary = (
+        f"memory.md size: {len(text)} characters, "
+        f"{len(text.encode('utf-8'))} UTF-8 bytes; configured consolidation "
+        f"threshold: {warning_chars} characters; hard injection/write cap: "
+        f"{MEMORY_SOFT_CAP_CHARS} characters."
+    )
+    return (
+        size_summary
+        + "\nContents of memory.md with line numbers:\n"
+        + "\n".join(numbered)
+    )
 
 
 @agent.tool
@@ -1817,7 +1829,11 @@ async def schedule_task(
     sched = ctx.deps.scheduler
 
     if action == "list":
-        tasks = db.get_scheduled_tasks(enabled_only=False)
+        tasks = [
+            task
+            for task in db.get_scheduled_tasks(enabled_only=False)
+            if task.handler == "agent"
+        ]
         if not tasks:
             return "No scheduled tasks found"
         return "\n".join(
@@ -1858,6 +1874,9 @@ async def schedule_task(
     if action == "update":
         if not task_id:
             return "Error: task_id is required for update"
+        existing = db.get_scheduled_task(task_id)
+        if existing is None or existing.handler != "agent" or existing.protected:
+            return f"Task '{task_id}' not found or is protected"
         updates: Dict[str, Any] = {}
         if cron:
             updates["cron"] = cron
@@ -1896,6 +1915,9 @@ async def schedule_task(
     if action == "delete":
         if not task_id:
             return "Error: task_id is required for delete"
+        existing = db.get_scheduled_task(task_id)
+        if existing is None or existing.handler != "agent":
+            return f"Task '{task_id}' not found or is protected"
         try:
             ok = db.delete_scheduled_task(task_id)
             if not ok:

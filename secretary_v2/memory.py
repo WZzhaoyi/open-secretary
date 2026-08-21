@@ -21,7 +21,16 @@ def _event_summary(content: str, summary: Optional[str] = None, max_chars: int =
         return compact
     return compact[: max_chars - 1].rstrip() + "…"
 
-from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, BLOB, text
+from sqlalchemy import (
+    BLOB,
+    Column,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    text,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sqlalchemy.pool import StaticPool
 
@@ -296,6 +305,11 @@ class ScheduledTask(Base):
     prompt = Column(Text, nullable=False)
     enabled = Column(Integer, default=1)
     protected = Column(Integer, default=0)
+    handler = Column(String, nullable=False, default="agent", server_default="agent")
+    builtin_task = Column(String, nullable=True)
+    last_attempt = Column(DateTime, nullable=True)
+    last_success = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
     last_run = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
 
@@ -391,6 +405,16 @@ class Database:
                 "reply_to_id": "TEXT",
                 "metadata_json": "TEXT",
                 "context_visible": "INTEGER NOT NULL DEFAULT 1",
+            },
+        )
+        self._ensure_columns(
+            "scheduled_tasks",
+            {
+                "handler": "TEXT NOT NULL DEFAULT 'agent'",
+                "builtin_task": "TEXT",
+                "last_attempt": "DATETIME",
+                "last_success": "DATETIME",
+                "last_error": "TEXT",
             },
         )
         self._backfill_event_summaries()
@@ -852,6 +876,58 @@ class Database:
             total = session.query(Message).count()
             return {"total_messages": total}
 
+    def archive_messages_before(self, before: datetime) -> int:
+        """Hide messages before cutoff without deleting their audit rows."""
+        with self.get_session() as session:
+            affected = (
+                session.query(Message)
+                .filter(Message.context_visible == 1)
+                .filter(Message.created_at < before)
+                .update({Message.context_visible: 0}, synchronize_session=False)
+            )
+            session.commit()
+            return affected
+
+    def get_maintenance_backlog(
+        self,
+        message_before: datetime,
+        *,
+        event_before: Optional[datetime] = None,
+    ) -> Dict[str, int]:
+        """Return visible message and non-open event counts before cutoffs."""
+        event_before = event_before or message_before
+        with self.get_session() as session:
+            old_messages = (
+                session.query(Message)
+                .filter(Message.context_visible == 1)
+                .filter(Message.created_at < message_before)
+                .count()
+            )
+            old_archivable_events = (
+                session.query(Event)
+                .filter(Event.context_visible == 1)
+                .filter(Event.status.in_(["resolved", "promoted"]))
+                .filter(Event.created_at < event_before)
+                .count()
+            )
+            return {
+                "old_messages": old_messages,
+                "old_archivable_events": old_archivable_events,
+            }
+
+    def archive_closed_events_before(self, before: datetime) -> int:
+        """Hide resolved/promoted events before cutoff without deleting history."""
+        with self.get_session() as session:
+            affected = (
+                session.query(Event)
+                .filter(Event.context_visible == 1)
+                .filter(Event.status.in_(["resolved", "promoted"]))
+                .filter(Event.created_at < before)
+                .update({Event.context_visible: 0}, synchronize_session=False)
+            )
+            session.commit()
+            return affected
+
     def delete_messages_before(self, before: datetime) -> int:
         """Delete messages before a given time."""
         with self.get_session() as session:
@@ -862,8 +938,16 @@ class Database:
             return count
 
     # Scheduled task operations
-    def create_scheduled_task(self, task_id: str, cron: str,
-                              prompt: str, protected: bool = False) -> ScheduledTask:
+    def create_scheduled_task(
+        self,
+        task_id: str,
+        cron: str,
+        prompt: str,
+        protected: bool = False,
+        *,
+        handler: str = "agent",
+        builtin_task: Optional[str] = None,
+    ) -> ScheduledTask:
         """Create a scheduled task."""
         with self.get_session() as session:
             task = ScheduledTask(
@@ -871,11 +955,18 @@ class Database:
                 cron=cron,
                 prompt=prompt,
                 protected=1 if protected else 0,
+                handler=handler,
+                builtin_task=builtin_task,
             )
             session.add(task)
             session.commit()
             session.refresh(task)
             return task
+
+    def get_scheduled_task(self, task_id: str) -> Optional[ScheduledTask]:
+        """Get one scheduled task by id."""
+        with self.get_session() as session:
+            return session.get(ScheduledTask, task_id)
 
     def get_scheduled_tasks(self, enabled_only: bool = True) -> List[ScheduledTask]:
         """Get scheduled tasks."""

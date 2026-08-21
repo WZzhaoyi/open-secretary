@@ -74,6 +74,28 @@ class MemoryConfig:
 
 
 @dataclass
+class MaintenanceConfig:
+    message_hide_after_days: int = 7
+    event_archive_after_days: int = 7
+    memory_warning_chars: int = 40000
+    health_lookback_days: int = 7
+
+    def __post_init__(self) -> None:
+        if self.message_hide_after_days < 1:
+            raise ValueError(
+                "maintenance.message_hide_after_days must be at least 1"
+            )
+        if self.event_archive_after_days < 1:
+            raise ValueError(
+                "maintenance.event_archive_after_days must be at least 1"
+            )
+        if self.memory_warning_chars < 1:
+            raise ValueError("maintenance.memory_warning_chars must be at least 1")
+        if self.health_lookback_days < 1:
+            raise ValueError("maintenance.health_lookback_days must be at least 1")
+
+
+@dataclass
 class SkillsConfig:
     max_size: int = 50000
     max_loaded: int = 5
@@ -203,6 +225,21 @@ class ScheduleConfig:
     enabled: bool = True
     prompt: str = ""
     protected: bool = False
+    handler: str = "agent"
+    task: str = ""
+
+    def __post_init__(self) -> None:
+        self.handler = str(self.handler or "agent").strip().lower()
+        self.task = str(self.task or "").strip()
+        if self.handler not in {"agent", "builtin"}:
+            raise ValueError("schedule handler must be 'agent' or 'builtin'")
+        if self.handler == "builtin":
+            if not self.task:
+                raise ValueError("builtin schedules require a task name")
+            if str(self.prompt or "").strip():
+                raise ValueError("builtin schedules cannot define an agent prompt")
+        elif self.task:
+            raise ValueError("agent schedules cannot define a builtin task")
 
 
 @dataclass
@@ -216,6 +253,7 @@ class Config:
     subagent: SubagentConfig
     schedules: Dict[str, ScheduleConfig]
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    maintenance: MaintenanceConfig = field(default_factory=MaintenanceConfig)
     market_calendar: MarketCalendarConfig = field(default_factory=MarketCalendarConfig)
     timezone: str = "Asia/Shanghai"
     language: str = "auto"
@@ -273,6 +311,10 @@ class Config:
             path=memory_data.get("path", "memory.md"),
             backup_enabled=bool(memory_data.get("backup_enabled", True)),
         )
+        # Parse deterministic maintenance config
+        maintenance_data = config_data.get("maintenance", {}) or {}
+        maintenance = MaintenanceConfig(**maintenance_data)
+
 
         # Parse skills config
         skills_data = config_data.get("skills", {})
@@ -312,6 +354,7 @@ class Config:
             channels=channels,
             database=database,
             memory=memory,
+            maintenance=maintenance,
             skills=skills,
             search=search,
             history=history,
@@ -380,7 +423,7 @@ final output: NO_ACTION
 **反例（错误，不要这样做）**：final output 写"已发送。"、"所有提醒已回复"、"今日无重要事项"等任何自然语言 —— 都不会送达用户，只会被当作合规失败记录。
 
 任务类别：
-- pending_response_check / stale_check / morning_briefing / system_review：命中条件才走路径 A，否则路径 B
+- pending_response_check / stale_check / morning_briefing：命中条件才走路径 A，否则路径 B
 - review_reminder / morning_trend_scan：始终走路径 A
 - memory_consolidation：始终走路径 B（静默维护 memory.md 与 events，不通知用户）
 
@@ -470,7 +513,12 @@ events 表只记有时点的事件流水，供定时任务做未回复检查等�
 - prompt: TEXT (触发提示词)
 - enabled: INTEGER (是否启用)
 - protected: INTEGER (是否受保护)
-- last_run: TEXT (上次运行时间)
+- handler: TEXT (agent | builtin)
+- builtin_task: TEXT (仅配置文件可引用的代码内注册任务)
+- last_attempt: TEXT (最近尝试时间)
+- last_success: TEXT (最近成功时间)
+- last_error: TEXT (最近失败)
+- last_run: TEXT (兼容字段，等同最近成功时间)
 - created_at: DATETIME
 
 ## 工具使用指南

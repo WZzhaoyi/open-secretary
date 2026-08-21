@@ -87,6 +87,7 @@ class SecretaryApp:
         self.scheduler = Scheduler(
             db=self.db,
             task_handler=self._handle_scheduled_message,
+            builtin_notifier=self._send_builtin_notification,
         )
         self.subagent_registry = SubAgentRegistry(
             db=self.db,
@@ -383,6 +384,16 @@ class SecretaryApp:
                 )
         except Exception as e:
             logger.error(f"Failed to deliver research notification: {e}")
+
+    async def _send_builtin_notification(self, text: str) -> None:
+        """Deliver a built-in task alert without routing through the agent."""
+        target_name = self.config.channels.default_outgoing
+        channel_obj = self.channels.get(target_name)
+        if channel_obj is None:
+            raise RuntimeError(
+                f"built-in notification channel {target_name!r} is unavailable"
+            )
+        await channel_obj.send(text, user_id=None)
 
     def _channels_to_start(self):
         """Decide which channels to actually start based on --channel.

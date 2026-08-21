@@ -1228,49 +1228,41 @@ def test_default_schedule_prompts_follow_memory_events_design():
     assert "memory_view" in consolidation_prompt
     assert "secretary-core" in consolidation_prompt
     assert "memory.md rules" in consolidation_prompt
-    assert "50KB" in consolidation_prompt or "50 KB" in consolidation_prompt
-    assert "40KB" in consolidation_prompt or "40 KB" in consolidation_prompt
-    assert (
-        "短 bullet" in consolidation_prompt
-        or "short bullets" in consolidation_prompt
-    )
+    assert "character count reported by memory_view" in consolidation_prompt
+    assert "configured consolidation threshold" in consolidation_prompt
+    assert "hard cap as absolute" in consolidation_prompt
+    assert "short bullets" in consolidation_prompt
+    assert "Merge duplicate or overlapping bullets" in consolidation_prompt
+    assert "Remove entries explicitly superseded" in consolidation_prompt
+    assert "Age alone is never evidence" in consolidation_prompt
+    assert "prefer the latest explicit user statement" in consolidation_prompt
+    assert "memory_str_replace" in consolidation_prompt
+    assert "memory_insert only for genuinely new" in consolidation_prompt
+    assert "status='promoted' only when" in consolidation_prompt
+    assert "status='logged' event to status='resolved'" in consolidation_prompt
+    assert "Never bulk-update unseen events" in consolidation_prompt
+    assert "never change status='open' events" in consolidation_prompt
     assert "status != 'open'" in consolidation_prompt
     assert "context_visible=1" in consolidation_prompt
     assert "datetime('now','-7 days')" in consolidation_prompt
-    assert "UPDATE events SET context_visible=0" in consolidation_prompt
-    assert "UPDATE messages SET context_visible=0" in consolidation_prompt
+    assert "UPDATE events SET context_visible=0" not in consolidation_prompt
+    assert "UPDATE messages SET context_visible=0" not in consolidation_prompt
     assert "Never DELETE historical rows" in consolidation_prompt
-    assert "send_message" in consolidation_prompt
-    assert (
-        "不调 send_message" in consolidation_prompt
-        or "do not call send_message" in consolidation_prompt.lower()
-    )
+    assert "do not call send_message" in consolidation_prompt.lower()
     assert "NO_ACTION" in consolidation_prompt
-    assert (
-        "不要写维护报告" in consolidation_prompt
-        or "write a maintenance report" in consolidation_prompt
-    )
-    assert len(consolidation_prompt) < 1800
-    assert schedules["system_review"].cron == "30 17 * * 0"
-    assert "agent_events" in system_review_prompt
-    assert "origin='scheduled'" in system_review_prompt
-    assert "subject NOT LIKE" in system_review_prompt
-    assert "date('now','+8 hours')" in system_review_prompt
-    assert "date later than local_today" in system_review_prompt
-    assert "WITH RECURSIVE days(day)" in system_review_prompt
-    assert "Never invent dates outside those returned rows" in system_review_prompt
-    assert "type='run_failed'" in system_review_prompt
-    assert "type='send_message'" in system_review_prompt
-    assert "status='open'" in system_review_prompt
-    assert "subagent_step_finished" in system_review_prompt
-    assert "sent_count=0 alone is not an anomaly" in system_review_prompt
-    assert "do not call any tools" not in system_review_prompt.lower()
-    assert "do not call send_message or mutation tools" in system_review_prompt.lower()
-    assert len(system_review_prompt) < 3000
-    assert (
-        "不要写入 memory.md" in system_review_prompt
-        or "Do not write to memory.md" in system_review_prompt
-    )
+    assert len(consolidation_prompt) < 3000
+
+    context_task = schedules["context_maintenance"]
+    assert context_task.handler == "builtin"
+    assert context_task.task == "context_maintenance"
+    assert context_task.prompt == ""
+    assert context_task.protected
+
+    system_task = schedules["system_review"]
+    assert system_task.handler == "builtin"
+    assert system_task.task == "system_health_review"
+    assert system_review_prompt == ""
+    assert system_task.protected
 
 
 @pytest.mark.asyncio
@@ -1603,6 +1595,204 @@ async def test_scheduler_uses_config_timezone(fresh_db, monkeypatch):
 
     sched = Scheduler(db=fresh_db, task_handler=noop)
     assert str(sched._scheduler.timezone) == "America/New_York"
+
+
+def test_builtin_schedule_config_requires_registered_task_shape():
+    from config import ScheduleConfig
+
+    configured = ScheduleConfig(
+        cron="0 4 * * 0",
+        handler="builtin",
+        task="memory_maintenance",
+    )
+    assert configured.prompt == ""
+    assert configured.handler == "builtin"
+
+    with pytest.raises(ValueError, match="require a task name"):
+        ScheduleConfig(cron="0 4 * * 0", handler="builtin")
+
+    with pytest.raises(ValueError, match="cannot define an agent prompt"):
+        ScheduleConfig(
+            cron="0 4 * * 0",
+            handler="builtin",
+            task="memory_maintenance",
+            prompt="ask the agent",
+        )
+
+
+@pytest.mark.asyncio
+async def test_builtin_schedule_bypasses_agent_and_records_success(
+    fresh_db, monkeypatch
+):
+    from builtin_tasks import BuiltinTaskResult
+    from config import ScheduleConfig, get_config
+
+    agent_calls = []
+    builtin_calls = []
+
+    async def builtin_notifier(_text):
+        return None
+
+    async def agent_handler(message):
+        agent_calls.append(message)
+        return "agent result"
+
+    async def builtin_handler(ctx):
+        builtin_calls.append((ctx.task_id, ctx.notify))
+        return BuiltinTaskResult(details={"rows": 3})
+
+    cfg = get_config()
+    monkeypatch.setattr(
+        cfg,
+        "schedules",
+        {
+            "native_task": ScheduleConfig(
+                cron="0 4 * * 0",
+                handler="builtin",
+                task="test_builtin",
+            )
+        },
+    )
+    sched = Scheduler(
+        db=fresh_db,
+        task_handler=agent_handler,
+        builtin_tasks={"test_builtin": builtin_handler},
+        builtin_notifier=builtin_notifier,
+    )
+
+    await sched._sync_config_to_db()
+    await sched._sync_db_to_scheduler()
+    job = next(job for job in sched.get_jobs() if job.id == "native_task")
+    result = await job.func(*job.args)
+
+    assert result == BuiltinTaskResult(details={"rows": 3})
+    assert builtin_calls == [("native_task", builtin_notifier)]
+    assert agent_calls == []
+
+    task = fresh_db.get_scheduled_task("native_task")
+    assert task.last_attempt is not None
+    assert task.last_success is not None
+    assert task.last_run == task.last_success
+    assert task.last_error is None
+    assert {
+        event.type for event in fresh_db.get_agent_events()
+    } >= {"scheduled_task_started", "scheduled_task_succeeded"}
+
+
+@pytest.mark.asyncio
+async def test_scheduler_executes_all_tasks_serially(fresh_db):
+    from builtin_tasks import BuiltinTaskResult
+
+    active = 0
+    max_active = 0
+
+    async def builtin_handler(_ctx):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return BuiltinTaskResult()
+
+    for task_id in ("native_a", "native_b"):
+        fresh_db.create_scheduled_task(
+            task_id,
+            "0 4 * * 0",
+            "",
+            protected=True,
+            handler="builtin",
+            builtin_task="test_builtin",
+        )
+
+    sched = Scheduler(
+        db=fresh_db,
+        task_handler=lambda _message: None,
+        builtin_tasks={"test_builtin": builtin_handler},
+    )
+    await asyncio.gather(
+        sched._execute_task("native_a", "", "builtin", "test_builtin"),
+        sched._execute_task("native_b", "", "builtin", "test_builtin"),
+    )
+
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_builtin_failure_does_not_advance_last_success(fresh_db):
+    async def failing_builtin(_ctx):
+        raise RuntimeError("maintenance failed")
+
+    async def agent_handler(_message):
+        return "unused"
+
+    fresh_db.create_scheduled_task(
+        "native_failure",
+        "0 4 * * 0",
+        "",
+        protected=True,
+        handler="builtin",
+        builtin_task="test_failure",
+    )
+    sched = Scheduler(
+        db=fresh_db,
+        task_handler=agent_handler,
+        builtin_tasks={"test_failure": failing_builtin},
+    )
+
+    result = await sched._execute_task(
+        "native_failure",
+        "",
+        "builtin",
+        "test_failure",
+    )
+
+    assert result is None
+    task = fresh_db.get_scheduled_task("native_failure")
+    assert task.last_attempt is not None
+    assert task.last_success is None
+    assert task.last_run is None
+    assert "maintenance failed" in task.last_error
+    assert fresh_db.get_agent_events()[0].type == "scheduled_task_failed"
+
+
+@pytest.mark.asyncio
+async def test_agent_schedule_tool_cannot_see_or_mutate_builtin(fresh_db):
+    from runtime import SecretaryDeps, schedule_task
+
+    class _Ctx:
+        def __init__(self, deps):
+            self.deps = deps
+
+    fresh_db.create_scheduled_task(
+        "native_hidden",
+        "0 4 * * 0",
+        "",
+        protected=True,
+        handler="builtin",
+        builtin_task="test_builtin",
+    )
+    fresh_db.create_scheduled_task(
+        "agent_visible",
+        "0 9 * * *",
+        "agent prompt",
+    )
+    ctx = _Ctx(SecretaryDeps(db=fresh_db))
+
+    listed = await schedule_task(ctx, "list")
+    assert "agent_visible" in listed
+    assert "native_hidden" not in listed
+
+    update_result = await schedule_task(
+        ctx,
+        "update",
+        task_id="native_hidden",
+        cron="0 5 * * 0",
+    )
+    delete_result = await schedule_task(ctx, "delete", task_id="native_hidden")
+
+    assert "not found or is protected" in update_result
+    assert "not found or is protected" in delete_result
+    assert fresh_db.get_scheduled_task("native_hidden") is not None
 
 
 # ---- memory.md mechanism ----
@@ -2163,6 +2353,9 @@ async def test_memory_view_shows_line_numbers_and_range(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "MEMORY_FILE", memory_file)
 
     full = await memory_view(None)
+    assert "memory.md size: 23 characters, 47 UTF-8 bytes" in full
+    assert "configured consolidation threshold: 40000 characters" in full
+    assert "hard injection/write cap: 50000 characters" in full
     assert "    1\t# 长期记忆" in full
     assert "    4\t- 喜欢喝茶" in full
 

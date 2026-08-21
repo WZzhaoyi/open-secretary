@@ -48,6 +48,11 @@ TASK_COLUMNS = (
     "prompt",
     "enabled",
     "protected",
+    "handler",
+    "builtin_task",
+    "last_attempt",
+    "last_success",
+    "last_error",
     "last_run",
     "created_at",
 )

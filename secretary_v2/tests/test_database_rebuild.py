@@ -47,10 +47,19 @@ def test_rebuild_retains_only_open_events_and_scheduled_tasks(tmp_path):
     database.save_message(source="user", content="old conversation")
     database.create_scheduled_task("enabled", "0 8 * * *", "enabled prompt")
     database.create_scheduled_task(
-        "disabled", "30 9 * * 1-5", "disabled prompt", protected=True
+        "disabled",
+        "30 9 * * 1-5",
+        "",
+        protected=True,
+        handler="builtin",
+        builtin_task="maintenance",
     )
     database.update_scheduled_task(
-        "disabled", enabled=0, last_run=datetime(2026, 7, 20, 1, 2, 3)
+        "disabled",
+        enabled=0,
+        last_run=datetime(2026, 7, 20, 1, 2, 3),
+        last_attempt=datetime(2026, 7, 20, 1, 0, 0),
+        last_success=datetime(2026, 7, 20, 1, 2, 3),
     )
     database.engine.dispose()
 
@@ -89,10 +98,17 @@ def test_rebuild_retains_only_open_events_and_scheduled_tasks(tmp_path):
     ]
     assert _rows(
         database_path,
-        "SELECT id, enabled, protected, last_run FROM scheduled_tasks ORDER BY id",
+        "SELECT id, enabled, protected, handler, builtin_task, last_run, "
+        "last_attempt, last_success, last_error "
+        "FROM scheduled_tasks ORDER BY id",
     ) == [
-        ("disabled", 0, 1, "2026-07-20 01:02:03.000000"),
-        ("enabled", 1, 0, None),
+        (
+            "disabled", 0, 1, "builtin", "maintenance",
+            "2026-07-20 01:02:03.000000",
+            "2026-07-20 01:00:00.000000",
+            "2026-07-20 01:02:03.000000", None,
+        ),
+        ("enabled", 1, 0, "agent", None, None, None, None, None),
     ]
     for table in ("messages", "agent_events", "subagent_runs"):
         assert _rows(database_path, f"SELECT count(*) FROM {table}") == [(0,)]

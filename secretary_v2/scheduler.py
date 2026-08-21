@@ -1,44 +1,31 @@
 """Secretary v2 scheduler.
 
 Persistence model: the secretary's `scheduled_tasks` SQL table is the source of
-truth for our domain (prompt, protected, enabled, last_run). On startup we sync
+truth for our domain (handler, prompt/task, protected, enabled, execution
+status). On startup we sync
 ALL DB tasks into APScheduler's in-memory jobstore — not just the ones in
 config.yaml — so tasks created at runtime via the schedule_task tool survive
 restarts. APScheduler's own jobstore stays in-memory; durability comes from us.
 """
 
+import asyncio
 import logging
-import re
-from typing import Awaitable, Callable, Optional
+import uuid
+from typing import Awaitable, Callable, Mapping, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+from cron_utils import build_cron_trigger
+from builtin_tasks import (
+    BUILTIN_TASKS,
+    BuiltinTaskContext,
+    BuiltinTaskHandler,
+    BuiltinTaskResult,
+)
 
 from channels.base import IncomingMessage
 from config import get_config
 from memory import Database, _utcnow
 
-# APScheduler uses 0=Mon..6=Sun for day_of_week (see apscheduler.triggers.cron.
-# expressions.WEEKDAYS), while standard Unix cron uses 0=Sun..6=Sat (7 also Sun).
-# Without translation, `1-5` silently means Tue-Sat instead of the intended
-# Mon-Fri — that exact bug skipped 2026-05-11 (Mon) morning_trend_scan and made
-# it fire on Saturdays instead. We translate digits in the day_of_week field
-# only (other fields use numbers normally) and only when they're standalone
-# weekday tokens (not step values like `*/2`).
-_UNIX_DOW_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-
-def _translate_unix_dow(field: str) -> str:
-    """Map digits 0-7 in a cron day_of_week field to APScheduler symbolic names.
-
-    The negative lookbehind `(?<!/)` skips digits that follow `/` (step values),
-    so `*/2` and `1-5/2` are preserved correctly.
-    """
-    return re.sub(
-        r"(?<!/)\b[0-7]\b",
-        lambda m: _UNIX_DOW_NAMES[int(m.group(0))],
-        field,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +37,18 @@ class Scheduler:
         self,
         db: Database,
         task_handler: Callable[[IncomingMessage], Awaitable[Optional[str]]],
+        builtin_tasks: Optional[Mapping[str, BuiltinTaskHandler]] = None,
+        builtin_notifier: Optional[Callable[[str], Awaitable[None]]] = None,
     ):
         self.db = db
         self.task_handler = task_handler
         self._config = get_config()
         self._scheduler = AsyncIOScheduler(timezone=self._config.timezone)
+        self._builtin_tasks = dict(
+            BUILTIN_TASKS if builtin_tasks is None else builtin_tasks
+        )
+        self._builtin_notifier = builtin_notifier
+        self._execution_lock = asyncio.Lock()
         self._running = False
 
     # ---- lifecycle ----
@@ -93,18 +87,30 @@ class Scheduler:
         """
         existing = {t.id: t for t in self.db.get_scheduled_tasks(enabled_only=False)}
         for task_id, task_cfg in self._config.schedules.items():
+            if (
+                task_cfg.handler == "builtin"
+                and task_cfg.task not in self._builtin_tasks
+            ):
+                raise ValueError(f"unknown builtin task in config: {task_cfg.task!r}")
             if task_id in existing:
                 # Refresh in-place so yaml edits take effect on next start.
                 self.db.update_scheduled_task(
                     task_id,
                     cron=task_cfg.cron,
                     prompt=task_cfg.prompt,
+                    handler=task_cfg.handler,
+                    builtin_task=task_cfg.task or None,
                     enabled=1 if task_cfg.enabled else 0,
                     protected=1,
                 )
             else:
                 self.db.create_scheduled_task(
-                    task_id, task_cfg.cron, task_cfg.prompt, protected=True
+                    task_id,
+                    task_cfg.cron,
+                    task_cfg.prompt,
+                    protected=True,
+                    handler=task_cfg.handler,
+                    builtin_task=task_cfg.task or None,
                 )
                 logger.info(f"Imported config-declared task: {task_id}")
 
@@ -130,7 +136,13 @@ class Scheduler:
         tasks = self.db.get_scheduled_tasks(enabled_only=True)
         for task in tasks:
             try:
-                self._add_job_internal(task.id, task.cron, task.prompt)
+                self._add_job_internal(
+                    task.id,
+                    task.cron,
+                    task.prompt,
+                    handler=task.handler,
+                    builtin_task=task.builtin_task,
+                )
             except Exception as e:
                 logger.error(f"Failed to load task {task.id}: {e}")
 
@@ -138,7 +150,7 @@ class Scheduler:
 
     def add_job(self, task_id: str, cron: str, prompt: str) -> None:
         """Add the apscheduler job. Caller is responsible for the DB row."""
-        self._add_job_internal(task_id, cron, prompt)
+        self._add_job_internal(task_id, cron, prompt, handler="agent")
         logger.info(f"Scheduled job added: {task_id} ({cron})")
 
     def update_job(
@@ -156,7 +168,13 @@ class Scheduler:
         if not task.enabled:
             self.remove_job(task_id)
             return
-        self._add_job_internal(task.id, task.cron, task.prompt)
+        self._add_job_internal(
+            task.id,
+            task.cron,
+            task.prompt,
+            handler=task.handler,
+            builtin_task=task.builtin_task,
+        )
         logger.info(f"Scheduled job updated: {task_id}")
 
     def remove_job(self, task_id: str) -> None:
@@ -171,29 +189,71 @@ class Scheduler:
 
     # ---- internals ----
 
-    def _add_job_internal(self, task_id: str, cron: str, prompt: str) -> None:
-        parts = cron.split()
-        if len(parts) != 5:
-            raise ValueError(f"cron must have 5 fields, got {len(parts)}: {cron!r}")
-        dow = _translate_unix_dow(parts[4])
-        trigger = CronTrigger(
-            minute=parts[0],
-            hour=parts[1],
-            day=parts[2],
-            month=parts[3],
-            day_of_week=dow,
-            timezone=self._config.timezone,
-        )
+    def _add_job_internal(
+        self,
+        task_id: str,
+        cron: str,
+        prompt: str,
+        *,
+        handler: str,
+        builtin_task: Optional[str] = None,
+    ) -> None:
+        if handler not in {"agent", "builtin"}:
+            raise ValueError(f"unsupported schedule handler: {handler!r}")
+        if handler == "builtin":
+            if not builtin_task:
+                raise ValueError(f"builtin schedule {task_id!r} has no task name")
+            if builtin_task not in self._builtin_tasks:
+                raise ValueError(f"unknown builtin task: {builtin_task!r}")
+        trigger = build_cron_trigger(cron, self._config.timezone)
         self._scheduler.add_job(
             self._execute_task,
             trigger=trigger,
             id=task_id,
-            args=[task_id, prompt],
+            args=[task_id, prompt, handler, builtin_task],
             replace_existing=True,
+            coalesce=True,
+            max_instances=1,
         )
 
-    async def _execute_task(self, task_id: str, prompt: str):
-        logger.info(f"Triggering scheduled task: {task_id}")
+    async def _execute_task(
+        self,
+        task_id: str,
+        prompt: str,
+        handler: str = "agent",
+        builtin_task: Optional[str] = None,
+    ):
+        async with self._execution_lock:
+            return await self._execute_task_serial(
+                task_id,
+                prompt,
+                handler=handler,
+                builtin_task=builtin_task,
+            )
+
+    async def _execute_task_serial(
+        self,
+        task_id: str,
+        prompt: str,
+        *,
+        handler: str,
+        builtin_task: Optional[str],
+    ):
+        logger.info("Triggering scheduled task: %s (handler=%s)", task_id, handler)
+        attempt_id = f"scheduled_{uuid.uuid4().hex[:12]}"
+        attempted_at = _utcnow()
+        self.db.update_scheduled_task(
+            task_id,
+            last_attempt=attempted_at,
+            last_error=None,
+        )
+        self.db.create_agent_event(
+            "scheduled_task_started",
+            origin="scheduled",
+            run_id=attempt_id,
+            subject=task_id,
+            payload={"task_id": task_id, "handler": handler, "task": builtin_task},
+        )
         message = IncomingMessage(
             text=prompt,
             channel="scheduled",
@@ -205,10 +265,69 @@ class Scheduler:
             },
         )
         try:
-            response = await self.task_handler(message)
-            self.db.update_scheduled_task(task_id, last_run=_utcnow())
-            logger.info(f"Task {task_id} done")
+            result_details = {}
+            if handler == "builtin":
+                builtin_handler = self._builtin_tasks.get(builtin_task or "")
+                if builtin_handler is None:
+                    raise RuntimeError(f"unknown builtin task: {builtin_task!r}")
+                result = await builtin_handler(
+                    BuiltinTaskContext(
+                        task_id=task_id,
+                        db=self.db,
+                        notify=self._builtin_notifier,
+                    )
+                )
+                if not isinstance(result, BuiltinTaskResult):
+                    raise RuntimeError(
+                        f"builtin task {builtin_task!r} returned an invalid result"
+                    )
+                outcome = result.status
+                result_details = result.details
+                response = result
+            elif handler == "agent":
+                response = await self.task_handler(message)
+                if response is None:
+                    raise RuntimeError("scheduled agent task returned no result")
+                outcome = "succeeded"
+            else:
+                raise RuntimeError(f"unsupported schedule handler: {handler!r}")
+
+            succeeded_at = _utcnow()
+            self.db.update_scheduled_task(
+                task_id,
+                last_run=succeeded_at,
+                last_success=succeeded_at,
+                last_error=None,
+            )
+            self.db.create_agent_event(
+                "scheduled_task_succeeded",
+                origin="scheduled",
+                run_id=attempt_id,
+                subject=task_id,
+                payload={
+                    "task_id": task_id,
+                    "handler": handler,
+                    "task": builtin_task,
+                    "outcome": outcome,
+                    "details": result_details,
+                },
+            )
+            logger.info("Task %s done (outcome=%s)", task_id, outcome)
             return response
         except Exception as e:
-            logger.error(f"Task {task_id} failed: {e}")
+            error = f"{type(e).__name__}: {e}"
+            self.db.update_scheduled_task(task_id, last_error=error)
+            self.db.create_agent_event(
+                "scheduled_task_failed",
+                origin="scheduled",
+                run_id=attempt_id,
+                subject=task_id,
+                payload={
+                    "task_id": task_id,
+                    "handler": handler,
+                    "task": builtin_task,
+                    "error": error,
+                },
+            )
+            logger.exception("Task %s failed", task_id)
             return None

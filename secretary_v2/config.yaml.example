@@ -61,6 +61,13 @@ memory:
   # When enabled, the app writes one snapshot per local date next to memory.path
   # before memory changes, e.g. memory-2026-06-29.md.
   backup_enabled: true
+# Deterministic built-in maintenance policy.
+maintenance:
+  message_hide_after_days: 7
+  event_archive_after_days: 7
+  memory_warning_chars: 40000
+  health_lookback_days: 7
+
 
 # Skill loading
 skills:
@@ -158,6 +165,9 @@ history:
   compact_tool_output_max_chars: 4000
 
 # Scheduled tasks use 5-field cron syntax in the configured timezone.
+# handler defaults to agent and executes prompt through the secretary agent.
+# Configuration-only built-ins use handler: builtin plus a code-registered task
+# name; they cannot define prompt and are not exposed through schedule_task.
 schedules:
   morning_briefing:
     cron: 0 8 * * *
@@ -219,78 +229,39 @@ schedules:
     cron: 0 4 * * 0
     enabled: true
     prompt: |-
-      Weekly silent memory consolidation: promote durable knowledge, then hide old context.
-      1. Call memory_view to inspect memory.md with line numbers.
+      Weekly silent memory lifecycle consolidation: reconcile existing memory, then promote durable knowledge.
+      1. Call memory_view to inspect the complete current memory.md with line numbers.
       2. Query recent visible events:
          SELECT id,type,status,content,created_at FROM events WHERE context_visible=1 AND created_at >= datetime('now','-7 days') ORDER BY created_at ASC
       3. Query older visible non-open events:
          SELECT id,type,status,content,created_at FROM events WHERE context_visible=1 AND created_at < datetime('now','-7 days') AND status != 'open' ORDER BY created_at ASC
-      4. Promote only stable preferences, collaboration agreements, active plans/rules, and important decisions with reasons. Follow the secretary-core memory.md rules; target under 40 KB (hard cap 50 KB), merge or prune before appending, and prefer short bullets.
-      5. After writing memory.md, set promoted source events to status='promoted' with db_execute.
-      6. Never change status='open' events; keep them context_visible=1.
-      7. Then hide old non-open context without deleting history:
-         UPDATE events SET context_visible=0 WHERE context_visible=1 AND created_at < datetime('now','-7 days') AND status != 'open'
-         UPDATE messages SET context_visible=0 WHERE context_visible=1 AND created_at < datetime('now','-7 days')
-      8. context_visible=0 is reversible. Never DELETE historical rows.
-      9. Do not call send_message, create events, or write a maintenance report. Always finish with exactly NO_ACTION.
+      4. Reconcile existing memory before adding anything:
+         - Merge duplicate or overlapping bullets into one concise canonical entry.
+         - Merge dated status/review/event snapshots by topic. Keep only the latest actionable state, durable thesis or lesson, decision evidence, trigger/invalidation, and next action; drop chronology and superseded details.
+         - Remove entries explicitly superseded, invalidated, or completed with no lasting lesson. Remove transient status updates and implementation detail that no longer affects a current decision.
+         - Preserve active unresolved plans, stable preferences, constraints, collaboration agreements, and important decisions with their reasons. Age alone is never evidence that an entry is obsolete.
+         - When entries conflict, prefer the latest explicit user statement. If recency or intent is uncertain, keep the existing information and do not guess.
+      5. Use memory_str_replace for every merge, rewrite, and deletion. Use memory_insert only for genuinely new durable knowledge, never to append a duplicate. Check each tool result and recover from exact-match errors before continuing.
+      6. Follow the secretary-core memory.md rules. Promote only source facts that are stable, reusable across future conversations, and actually represented in the resulting memory.md. Prefer short bullets and preserve the existing section structure.
+      7. Use the character count reported by memory_view, not bytes. Treat its configured consolidation threshold as the trigger and its hard cap as absolute. Merge redundancy below the threshold too; at/above it, compact to at least 20% below threshold before inserting.
+      8. Update source event status only after review:
+         - Set an event to status='promoted' only when its durable content is present in memory.md.
+         - Set an older status='logged' event to status='resolved' only when it is confirmed obsolete, duplicate, transient, or has no remaining durable/actionable value.
+         - Never bulk-update unseen events and never change status='open' events.
+      9. Never DELETE historical rows or change context visibility.
+      10. Do not call send_message, create events, or write a maintenance report. Always finish with exactly NO_ACTION.
+    protected: true
+  context_maintenance:
+    cron: 30 4 * * 0
+    enabled: true
+    handler: builtin
+    task: context_maintenance
     protected: true
   system_review:
     cron: 30 17 * * 0
     enabled: true
-    prompt: |-
-      Weekly low-noise system health review. Run the five read-only SQL checks below.
-      SQLite timestamps are UTC; for Asia/Shanghai, date('now','+8 hours') is local_today. Never report, infer, or count a date later than local_today.
-
-      1. Scheduled-run counts for the seven local days ending at local_today:
-         WITH RECURSIVE days(day) AS (
-           SELECT date('now','+8 hours','-6 days')
-           UNION ALL
-           SELECT date(day,'+1 day') FROM days WHERE day < date('now','+8 hours')
-         )
-         SELECT days.day, COUNT(a.id) AS scheduled_runs
-         FROM days
-         LEFT JOIN agent_events a
-           ON date(a.created_at,'+8 hours') = days.day
-          AND a.origin='scheduled'
-          AND a.type='run_started'
-          AND a.subject NOT LIKE 'System behavior review%'
-         GROUP BY days.day ORDER BY days.day ASC
-      2. Scheduled failures in the last seven days:
-         SELECT created_at,subject,payload_json FROM agent_events
-         WHERE origin='scheduled' AND type='run_failed' AND created_at >= datetime('now','-7 days')
-         ORDER BY created_at DESC
-      3. Proactive-message counts for the same seven local days:
-         WITH RECURSIVE days(day) AS (
-           SELECT date('now','+8 hours','-6 days')
-           UNION ALL
-           SELECT date(day,'+1 day') FROM days WHERE day < date('now','+8 hours')
-         )
-         SELECT days.day, COUNT(a.id) AS sent_count
-         FROM days
-         LEFT JOIN agent_events a
-           ON date(a.created_at,'+8 hours') = days.day
-          AND a.type='send_message'
-         GROUP BY days.day ORDER BY days.day ASC
-      4. Open items older than seven days:
-         SELECT id,type,status,content,created_at FROM events
-         WHERE status='open' AND created_at < datetime('now','-7 days')
-         ORDER BY created_at ASC
-      5. Failed subagent stages in the last 30 days:
-         SELECT created_at,run_id,subject,payload_json FROM agent_events
-         WHERE type='subagent_step_finished'
-           AND payload_json LIKE '%"status": "failed"%'
-           AND created_at >= datetime('now','-30 days')
-         ORDER BY created_at DESC
-
-      Decision rules:
-      - Query 1 must return exactly seven rows. Rows with scheduled_runs=0 are missing days. Never invent dates outside those returned rows.
-      - Any row from query 2 is an anomaly.
-      - Query 3 is supporting context only: sent_count=0 alone is not an anomaly and must never trigger a warning.
-      - Query 4 is an anomaly; report at most the five oldest items.
-      - Query 5 is an anomaly; report at most the five most recent failures.
-      - If anomalies exist, call send_message once with only the affected groups: Scheduled Tasks / Message Delivery / Open Items / Subagent.
-      - If no anomalies exist, do not call send_message or mutation tools.
-      - Do not write to memory.md, create events, or clean data. Always finish with NO_ACTION.
+    handler: builtin
+    task: system_health_review
     protected: true
 
 # Timezone
