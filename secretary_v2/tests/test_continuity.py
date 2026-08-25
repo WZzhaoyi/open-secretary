@@ -1226,31 +1226,49 @@ def test_default_schedule_prompts_follow_memory_events_design():
         assert "create a new event" not in normalized
         assert "db_execute to create" not in normalized
     assert "memory_view" in consolidation_prompt
+    assert consolidation_prompt.count("memory_view") == 2
     assert "secretary-core" in consolidation_prompt
     assert "memory.md rules" in consolidation_prompt
-    assert "character count reported by memory_view" in consolidation_prompt
     assert "configured consolidation threshold" in consolidation_prompt
-    assert "hard cap as absolute" in consolidation_prompt
-    assert "short bullets" in consolidation_prompt
     assert "Merge duplicate or overlapping bullets" in consolidation_prompt
-    assert "Remove entries explicitly superseded" in consolidation_prompt
     assert "Age alone is never evidence" in consolidation_prompt
     assert "prefer the latest explicit user statement" in consolidation_prompt
     assert "memory_str_replace" in consolidation_prompt
     assert "memory_insert only for genuinely new" in consolidation_prompt
     assert "status='promoted' only when" in consolidation_prompt
-    assert "status='logged' event to status='resolved'" in consolidation_prompt
-    assert "Never bulk-update unseen events" in consolidation_prompt
-    assert "never change status='open' events" in consolidation_prompt
-    assert "status != 'open'" in consolidation_prompt
+    assert "status='resolved' only when" in consolidation_prompt
+    assert "Never update unseen or status='open' events" in consolidation_prompt
+    assert "status='logged'" in consolidation_prompt
+    assert "type IN ('note','response')" in consolidation_prompt
+    assert "source_channel" in consolidation_prompt
     assert "context_visible=1" in consolidation_prompt
     assert "datetime('now','-7 days')" in consolidation_prompt
+    assert "LIMIT 30" in consolidation_prompt
+    assert "LIMIT 20" in consolidation_prompt
+    assert "Select at most 12 exact IDs" in consolidation_prompt
+    assert "Never inspect more than 12 full event bodies" in consolidation_prompt
+    assert "weekly rollups" in consolidation_prompt
+    assert "daily automated narration" in consolidation_prompt
+    assert "Plan all writes before acting" in consolidation_prompt
+    assert "at most 6 successful edits and 8 attempts" in consolidation_prompt
+    assert "at most two exact-ID batches" in consolidation_prompt
+    assert (
+        "context_maintenance archives old resolved/promoted rows"
+        in consolidation_prompt
+    )
+    assert consolidation_prompt.index(
+        "SELECT id,type,source_channel"
+    ) < consolidation_prompt.index("Plan all writes before acting")
+    assert consolidation_prompt.index(
+        "Plan all writes before acting"
+    ) < consolidation_prompt.index("memory_str_replace")
+    assert "SELECT id,type,status,content,created_at" not in consolidation_prompt
     assert "UPDATE events SET context_visible=0" not in consolidation_prompt
     assert "UPDATE messages SET context_visible=0" not in consolidation_prompt
-    assert "Never DELETE historical rows" in consolidation_prompt
+    assert "Never DELETE history" in consolidation_prompt
     assert "do not call send_message" in consolidation_prompt.lower()
     assert "NO_ACTION" in consolidation_prompt
-    assert len(consolidation_prompt) < 3000
+    assert len(consolidation_prompt) < 2600
 
     context_task = schedules["context_maintenance"]
     assert context_task.handler == "builtin"

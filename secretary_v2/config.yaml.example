@@ -229,27 +229,16 @@ schedules:
     cron: 0 4 * * 0
     enabled: true
     prompt: |-
-      Weekly silent memory lifecycle consolidation: reconcile existing memory, then promote durable knowledge.
-      1. Call memory_view to inspect the complete current memory.md with line numbers.
-      2. Query recent visible events:
-         SELECT id,type,status,content,created_at FROM events WHERE context_visible=1 AND created_at >= datetime('now','-7 days') ORDER BY created_at ASC
-      3. Query older visible non-open events:
-         SELECT id,type,status,content,created_at FROM events WHERE context_visible=1 AND created_at < datetime('now','-7 days') AND status != 'open' ORDER BY created_at ASC
-      4. Reconcile existing memory before adding anything:
-         - Merge duplicate or overlapping bullets into one concise canonical entry.
-         - Merge dated status/review/event snapshots by topic. Keep only the latest actionable state, durable thesis or lesson, decision evidence, trigger/invalidation, and next action; drop chronology and superseded details.
-         - Remove entries explicitly superseded, invalidated, or completed with no lasting lesson. Remove transient status updates and implementation detail that no longer affects a current decision.
-         - Preserve active unresolved plans, stable preferences, constraints, collaboration agreements, and important decisions with their reasons. Age alone is never evidence that an entry is obsolete.
-         - When entries conflict, prefer the latest explicit user statement. If recency or intent is uncertain, keep the existing information and do not guess.
-      5. Use memory_str_replace for every merge, rewrite, and deletion. Use memory_insert only for genuinely new durable knowledge, never to append a duplicate. Check each tool result and recover from exact-match errors before continuing.
-      6. Follow the secretary-core memory.md rules. Promote only source facts that are stable, reusable across future conversations, and actually represented in the resulting memory.md. Prefer short bullets and preserve the existing section structure.
-      7. Use the character count reported by memory_view, not bytes. Treat its configured consolidation threshold as the trigger and its hard cap as absolute. Merge redundancy below the threshold too; at/above it, compact to at least 20% below threshold before inserting.
-      8. Update source event status only after review:
-         - Set an event to status='promoted' only when its durable content is present in memory.md.
-         - Set an older status='logged' event to status='resolved' only when it is confirmed obsolete, duplicate, transient, or has no remaining durable/actionable value.
-         - Never bulk-update unseen events and never change status='open' events.
-      9. Never DELETE historical rows or change context visibility.
-      10. Do not call send_message, create events, or write a maintenance report. Always finish with exactly NO_ACTION.
+      Weekly silent memory consolidation. Process one bounded batch; leave backlog for later runs.
+      1. Call memory_view, then query candidate indexes without full bodies:
+         SELECT id,type,source_channel,COALESCE(NULLIF(summary,''),substr(content,1,240)) AS summary,created_at FROM events WHERE context_visible=1 AND status='logged' AND type IN ('note','response') AND created_at >= datetime('now','-7 days') ORDER BY created_at DESC LIMIT 30
+         SELECT id,type,source_channel,COALESCE(NULLIF(summary,''),substr(content,1,240)) AS summary,created_at FROM events WHERE context_visible=1 AND status='logged' AND type IN ('note','response') AND created_at < datetime('now','-7 days') ORDER BY created_at ASC LIMIT 20
+      2. Select at most 12 exact IDs, prioritizing latest user statements, weekly rollups, and facts that update/conflict with memory over daily automated narration. Fetch only those full bodies with one id IN (...) query. Never inspect more than 12 full event bodies.
+      3. Plan all writes before acting. Merge duplicate or overlapping bullets; keep current state, durable thesis/evidence, triggers, and next action; drop chronology. Preserve stable preferences, agreements, active plans, and decision reasons. Age alone is never evidence that an entry is obsolete. On conflict prefer the latest explicit user statement; if uncertain, keep existing text.
+      4. Follow secretary-core memory.md rules. Make at most 6 successful edits and 8 attempts, using memory_str_replace for rewrites/deletions and memory_insert only for genuinely new durable knowledge. At/above the configured consolidation threshold, compact first and skip low-priority insertions.
+      5. Call memory_view again to verify final text; re-read earlier only after an exact-match error. Never promote a source whose intended edit failed.
+      6. After verification, update at most 12 reviewed IDs in at most two exact-ID batches. Use status='promoted' only when durable content is in memory.md. Use status='resolved' only when a later reviewed event supersedes it or it is clearly transient/duplicate with no durable or actionable value. Never update unseen or status='open' events.
+      7. Never DELETE history or change context visibility; context_maintenance archives old resolved/promoted rows. Do not call send_message or create events. Stop at the limits and finish exactly NO_ACTION.
     protected: true
   context_maintenance:
     cron: 30 4 * * 0
