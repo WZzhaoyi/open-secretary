@@ -46,25 +46,18 @@ MESSAGES = {
             "{at} from `{origin}`"
         ),
         "command.status.no_run": "no completed run yet",
-        "command.status.cache_metrics": (
-            "hit/read `{cache_hit:,}`, miss `{cache_miss:,}`, "
-            "write `{cache_write:,}`, hit rate `{ratio}`"
-        ),
         "command.status.no_cache_metrics": "last run did not return cache metrics",
-        "command.status.cache_segment": (
-            "hit `{cache_hit:,}`, miss `{cache_miss:,}`, hit rate `{ratio}`"
+        "command.status.cache_last_run": (
+            "`{ratio}` (hit `{cache_hit:,}`, miss `{cache_miss:,}`, "
+            "write `{cache_write:,}`)"
         ),
-        "command.status.cache_first_only": "first request: {first}",
-        "command.status.cache_request_split": (
-            "first request: {first}; follow-ups ({follow_count}): {follow}"
+        "command.status.token_window_metrics": (
+            "input `{input_tokens:,}`, output `{output_tokens:,}`, "
+            "total `{total_tokens:,}` across `{runs}` runs"
         ),
-        "command.status.no_request_cache_metrics": "per-request metrics unavailable",
+        "command.status.no_token_window_metrics": "no samples",
         "command.status.cache_window_metrics": "`{ratio}` over `{runs}` runs",
         "command.status.no_cache_window_metrics": "no samples",
-        "command.status.cache_rolling": (
-            "24h all {all_24h}, `{channel}` {channel_24h}; "
-            "7d all {all_7d}, `{channel}` {channel_7d}"
-        ),
         "command.status.enabled": "enabled",
         "command.status.disabled": "disabled",
         "command.status.health_unknown": "unavailable",
@@ -77,9 +70,8 @@ MESSAGES = {
             "🩺 Channel health: {channel_health}\n"
             "💬 Messages (DB total / replayable in this conversation): {total_messages} / {history_count}\n"
             "🧮 Latest request context: {usage_status}\n"
-            "🧊 Last run cache total: {cache_status}\n"
-            "🧩 Last run request split: {request_cache_status}\n"
-            "📈 Rolling cache: {rolling_cache_status}\n"
+            "🔥 Tokens (24h, all channels): {token_24h_status}\n"
+            "🧊 Cache: last run {last_cache_status}; 24h all channels {cache_24h_status}\n"
             "🗜️ Compaction: threshold `{compact_threshold:,}` tokens, tail `{tail_budget:,}` tokens\n"
             "🧷 Auto compaction: `{auto_compact_status}`, minimum `{min_messages}` messages, "
             "cooldown `{cooldown_minutes}` minutes, tool output `{tool_output_chars}` chars\n"
@@ -130,25 +122,18 @@ MESSAGES = {
             "{at} 来自 `{origin}`"
         ),
         "command.status.no_run": "尚无完成的 run",
-        "command.status.cache_metrics": (
-            "hit/read `{cache_hit:,}`，miss `{cache_miss:,}`，"
-            "write `{cache_write:,}`，hit rate `{ratio}`"
-        ),
         "command.status.no_cache_metrics": "上轮未返回缓存指标",
-        "command.status.cache_segment": (
-            "hit `{cache_hit:,}`，miss `{cache_miss:,}`，hit rate `{ratio}`"
+        "command.status.cache_last_run": (
+            "`{ratio}`（命中 `{cache_hit:,}`，未命中 `{cache_miss:,}`，"
+            "写入 `{cache_write:,}`）"
         ),
-        "command.status.cache_first_only": "首请求：{first}",
-        "command.status.cache_request_split": (
-            "首请求：{first}；后续请求（{follow_count} 次）：{follow}"
+        "command.status.token_window_metrics": (
+            "输入 `{input_tokens:,}`，输出 `{output_tokens:,}`，"
+            "合计 `{total_tokens:,}`（`{runs}` 次运行）"
         ),
-        "command.status.no_request_cache_metrics": "暂无逐请求指标",
-        "command.status.cache_window_metrics": "`{ratio}`（`{runs}` 个 runs）",
+        "command.status.no_token_window_metrics": "暂无样本",
+        "command.status.cache_window_metrics": "`{ratio}`（`{runs}` 次运行）",
         "command.status.no_cache_window_metrics": "暂无样本",
-        "command.status.cache_rolling": (
-            "24h 全局 {all_24h}，`{channel}` {channel_24h}；"
-            "7d 全局 {all_7d}，`{channel}` {channel_7d}"
-        ),
         "command.status.enabled": "开启",
         "command.status.disabled": "关闭",
         "command.status.health_unknown": "暂不可用",
@@ -161,9 +146,8 @@ MESSAGES = {
             "🩺 Channel 健康：{channel_health}\n"
             "💬 历史消息（DB 总数 / 当前会话可重放）：{total_messages} / {history_count}\n"
             "🧮 最近一次请求上下文：{usage_status}\n"
-            "🧊 上轮 run 累计缓存：{cache_status}\n"
-            "🧩 上轮 run 分请求缓存：{request_cache_status}\n"
-            "📈 滚动缓存：{rolling_cache_status}\n"
+            "🔥 Token 消耗（24h，全渠道）：{token_24h_status}\n"
+            "🧊 缓存：上轮 {last_cache_status}；24h 全渠道 {cache_24h_status}\n"
             "🗜️ 压缩策略：阈值 `{compact_threshold:,}` tokens，tail `{tail_budget:,}` tokens\n"
             "🧷 自动压缩：`{auto_compact_status}`，最少 `{min_messages}` 条，"
             "冷却 `{cooldown_minutes}` 分钟，工具输出 `{tool_output_chars}` chars\n"

@@ -514,6 +514,21 @@ class Database:
             session.refresh(event)
             return event
 
+    def resolve_open_events(self, event_ids: List[int]) -> int:
+        """Resolve an exact, host-validated set of currently open events."""
+        normalized_ids = sorted({int(event_id) for event_id in event_ids})
+        if not normalized_ids:
+            return 0
+        with self.get_session() as session:
+            affected = (
+                session.query(Event)
+                .filter(Event.id.in_(normalized_ids))
+                .filter(Event.status == "open")
+                .update({Event.status: "resolved"}, synchronize_session=False)
+            )
+            session.commit()
+            return int(affected or 0)
+
     def get_events(self, limit: int = 50) -> List[Event]:
         """Get recent events."""
         with self.get_session() as session:

@@ -3738,15 +3738,16 @@ def test_usage_payload_records_per_request_cache_metrics():
 
 
 def test_telegram_status_surfaces_cache_metrics():
-    """Telegram /status should show recent cache usage when available."""
+    """Channel-independent /status should show concise cache and 24h token usage."""
     import inspect
     from channel_commands import build_status_text
 
     source = inspect.getsource(build_status_text)
     assert "command.status" in source
-    assert "command.status.cache_metrics" in source
-    assert "cache_hit_tokens" in source
-    assert "cache_write_tokens" in source
+    assert "_format_last_run_cache" in source
+    assert "_format_token_window" in source
+    assert "_format_request_cache_status" not in source
+    assert "since_7d" not in source
 
 
 def test_status_and_compact_business_logic_is_channel_independent():
@@ -3796,6 +3797,9 @@ def test_status_uses_current_session_custom_memory_and_last_request_usage(
         origin="telegram",
         payload={
             "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 110,
                 "cache_hit_tokens": 60,
                 "cache_miss_tokens": 40,
             }
@@ -3806,6 +3810,8 @@ def test_status_uses_current_session_custom_memory_and_last_request_usage(
         origin="http",
         payload={
             "usage": {
+                "input_tokens": 200,
+                "output_tokens": 20,
                 "cache_hit_tokens": 0,
                 "cache_miss_tokens": 100,
             }
@@ -3856,10 +3862,14 @@ def test_status_uses_current_session_custom_memory_and_last_request_usage(
     assert "30 /" in text
     assert "150 /" not in text
     assert f"{memory_file.stat().st_size} bytes" in text
-    assert "first request: hit `80`, miss `40`" in text
-    assert "follow-ups (1): hit `20`, miss `10`" in text
-    assert "24h all `30.0%`" in text
-    assert "`telegram` `60.0%`" in text
+    assert (
+        "Tokens (24h, all channels): input `300`, output `30`, "
+        "total `330` across `2` runs"
+    ) in text
+    assert "Cache: last run `66.7%` (hit `100`, miss `50`, write `0`)" in text
+    assert "24h all channels `30.0%` over `2` runs" in text
+    assert "first request" not in text
+    assert "7d" not in text
 
 
 @pytest.mark.asyncio

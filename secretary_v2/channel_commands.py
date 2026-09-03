@@ -61,58 +61,11 @@ def _cache_counts(metrics) -> tuple[int, int]:
     )
 
 
-def _format_request_cache_status(usage, lang: str) -> str:
-    request_metrics = usage.get("request_cache_metrics")
-    if not isinstance(request_metrics, list):
-        return t("command.status.no_request_cache_metrics", lang)
-
-    samples = []
-    for metrics in request_metrics:
-        if not isinstance(metrics, dict):
-            continue
-        hit, miss = _cache_counts(metrics)
-        if hit + miss > 0:
-            samples.append((hit, miss))
-    if not samples:
-        return t("command.status.no_request_cache_metrics", lang)
-
-    first_hit, first_miss = samples[0]
-    first_ratio = first_hit / (first_hit + first_miss)
-    first = t(
-        "command.status.cache_segment",
-        lang,
-        cache_hit=first_hit,
-        cache_miss=first_miss,
-        ratio=f"{first_ratio * 100:.1f}%",
-    )
-    if len(samples) == 1:
-        return t("command.status.cache_first_only", lang, first=first)
-
-    follow_hit = sum(hit for hit, _ in samples[1:])
-    follow_miss = sum(miss for _, miss in samples[1:])
-    follow_ratio = follow_hit / (follow_hit + follow_miss)
-    follow = t(
-        "command.status.cache_segment",
-        lang,
-        cache_hit=follow_hit,
-        cache_miss=follow_miss,
-        ratio=f"{follow_ratio * 100:.1f}%",
-    )
-    return t(
-        "command.status.cache_request_split",
-        lang,
-        first=first,
-        follow=follow,
-        follow_count=len(samples) - 1,
-    )
-
-
-def _cache_window_totals(events, *, since: datetime, origin: Optional[str] = None):
-    runs = hit = miss = 0
+def _usage_window_totals(events, *, since: datetime):
+    runs = input_tokens = output_tokens = total_tokens = 0
+    cache_runs = hit = miss = 0
     for event in events:
         if event.created_at is None or event.created_at < since:
-            continue
-        if origin is not None and event.origin != origin:
             continue
         try:
             payload = json.loads(event.payload_json or "{}")
@@ -121,17 +74,41 @@ def _cache_window_totals(events, *, since: datetime, origin: Optional[str] = Non
         usage = payload.get("usage") if isinstance(payload, dict) else None
         if not isinstance(usage, dict):
             continue
+
+        sample_input = usage.get("input_tokens")
+        sample_output = usage.get("output_tokens")
+        sample_total = usage.get("total_tokens")
+        has_tokens = any(
+            isinstance(value, (int, float))
+            for value in (sample_input, sample_output, sample_total)
+        )
+        if has_tokens:
+            normalized_input = (
+                int(sample_input) if isinstance(sample_input, (int, float)) else 0
+            )
+            normalized_output = (
+                int(sample_output) if isinstance(sample_output, (int, float)) else 0
+            )
+            normalized_total = (
+                int(sample_total)
+                if isinstance(sample_total, (int, float))
+                else normalized_input + normalized_output
+            )
+            runs += 1
+            input_tokens += normalized_input
+            output_tokens += normalized_output
+            total_tokens += normalized_total
+
         sample_hit, sample_miss = _cache_counts(usage)
-        if sample_hit + sample_miss <= 0:
-            continue
-        runs += 1
-        hit += sample_hit
-        miss += sample_miss
-    return runs, hit, miss
+        if sample_hit + sample_miss > 0:
+            cache_runs += 1
+            hit += sample_hit
+            miss += sample_miss
+    return runs, input_tokens, output_tokens, total_tokens, cache_runs, hit, miss
 
 
 def _format_cache_window(sample, lang: str) -> str:
-    runs, hit, miss = sample
+    _, _, _, _, runs, hit, miss = sample
     if runs <= 0 or hit + miss <= 0:
         return t("command.status.no_cache_window_metrics", lang)
     return t(
@@ -142,34 +119,35 @@ def _format_cache_window(sample, lang: str) -> str:
     )
 
 
-def _rolling_cache_status(db, *, channel: str, lang: str) -> str:
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    since_24h = now - timedelta(hours=24)
-    since_7d = now - timedelta(days=7)
-    events = db.get_agent_events_since(
-        since_7d,
-        event_type="run_finished",
-    )
+def _format_token_window(sample, lang: str) -> str:
+    runs, input_tokens, output_tokens, total_tokens, _, _, _ = sample
+    if runs <= 0:
+        return t("command.status.no_token_window_metrics", lang)
     return t(
-        "command.status.cache_rolling",
+        "command.status.token_window_metrics",
         lang,
-        channel=channel,
-        all_24h=_format_cache_window(
-            _cache_window_totals(events, since=since_24h),
-            lang,
-        ),
-        channel_24h=_format_cache_window(
-            _cache_window_totals(events, since=since_24h, origin=channel),
-            lang,
-        ),
-        all_7d=_format_cache_window(
-            _cache_window_totals(events, since=since_7d),
-            lang,
-        ),
-        channel_7d=_format_cache_window(
-            _cache_window_totals(events, since=since_7d, origin=channel),
-            lang,
-        ),
+        runs=runs,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _format_last_run_cache(usage, lang: str) -> str:
+    if not usage:
+        return t("command.status.no_run", lang)
+    hit, miss = _cache_counts(usage)
+    write = usage.get("cache_write_tokens") or 0
+    if hit + miss <= 0 and not write:
+        return t("command.status.no_cache_metrics", lang)
+    ratio = f"{hit / (hit + miss) * 100:.1f}%" if hit + miss > 0 else "?"
+    return t(
+        "command.status.cache_last_run",
+        lang,
+        cache_hit=hit,
+        cache_miss=miss,
+        cache_write=int(write),
+        ratio=ratio,
     )
 
 
@@ -204,21 +182,22 @@ def build_status_text(
         stats = {"total_messages": -1}
 
     try:
-        rolling_cache_status = _rolling_cache_status(
-            db,
-            channel=scope.channel,
-            lang=lang,
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        since_24h = now - timedelta(hours=24)
+        events = db.get_agent_events_since(
+            since_24h,
+            event_type="run_finished",
         )
+        usage_24h = _usage_window_totals(events, since=since_24h)
+        token_24h_status = _format_token_window(usage_24h, lang)
+        cache_24h_status = _format_cache_window(usage_24h, lang)
     except Exception as e:
-        logger.error("Failed to build rolling cache metrics: %s", e)
-        rolling_cache_status = t("command.status.read_failed", lang)
+        logger.error("Failed to build 24h usage metrics: %s", e)
+        token_24h_status = t("command.status.read_failed", lang)
+        cache_24h_status = t("command.status.read_failed", lang)
 
     usage = get_last_usage(session_key=session_key)
-    request_cache_status = (
-        _format_request_cache_status(usage, lang)
-        if usage
-        else t("command.status.no_run", lang)
-    )
+    last_cache_status = _format_last_run_cache(usage, lang)
     window = cfg.history.context_tokens
     if usage:
         request_input = usage.get("last_request_input_tokens")
@@ -248,30 +227,8 @@ def build_status_text(
         else:
             usage_status = t("command.status.no_run", lang)
 
-        cache_hit = usage.get("cache_hit_tokens")
-        cache_miss = usage.get("cache_miss_tokens")
-        cache_read = usage.get("cache_read_tokens") or 0
-        cache_write = usage.get("cache_write_tokens") or 0
-        cache_ratio = usage.get("cache_hit_ratio")
-        if cache_hit or cache_miss or cache_read or cache_write:
-            ratio = (
-                f"{cache_ratio * 100:.1f}%"
-                if isinstance(cache_ratio, (int, float))
-                else "?"
-            )
-            cache_status = t(
-                "command.status.cache_metrics",
-                lang,
-                cache_hit=int(cache_hit or 0),
-                cache_miss=int(cache_miss or 0),
-                cache_write=int(cache_write),
-                ratio=ratio,
-            )
-        else:
-            cache_status = t("command.status.no_cache_metrics", lang)
     else:
         usage_status = t("command.status.no_run", lang)
-        cache_status = t("command.status.no_run", lang)
 
     hist_cfg = cfg.history
     compact_threshold = int(hist_cfg.context_tokens * hist_cfg.compress_threshold)
@@ -290,9 +247,9 @@ def build_status_text(
         total_messages=stats.get("total_messages", "?"),
         history_count=history_count,
         usage_status=usage_status,
-        cache_status=cache_status,
-        request_cache_status=request_cache_status,
-        rolling_cache_status=rolling_cache_status,
+        token_24h_status=token_24h_status,
+        last_cache_status=last_cache_status,
+        cache_24h_status=cache_24h_status,
         compact_threshold=compact_threshold,
         tail_budget=hist_cfg.tail_token_budget,
         auto_compact_status=auto_compact_status,

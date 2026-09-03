@@ -7,9 +7,19 @@ import sys
 from pathlib import Path
 from typing import Dict, Any
 
+from agent_profiles import (
+    INTERACTIVE_PROFILE,
+    LIGHTWEIGHT_SCHEDULE_TASKS,
+    SCHEDULED_MAINTENANCE_PROFILE,
+)
 from config import get_config
 from memory import Database
-from runtime import ensure_daily_memory_backup, run_agent
+from runtime import (
+    ensure_daily_memory_backup,
+    run_agent,
+    run_scheduled_notification_agent,
+    run_webhook_agent,
+)
 from channels.base import IncomingMessage
 from channels.cli_channel import CLIChannel
 from channels.telegram_channel import TelegramChannel
@@ -269,21 +279,27 @@ class SecretaryApp:
 
             skill_content = self._collect_skill_content(message.text)
 
-            response = await run_agent(
-                user_text=message.text,
-                db=self.db,
-                agent_id=message.agent_id,
-                origin_channel=message.channel,
-                user_id=message.user_id,
-                conversation_id=message.conversation_id,
-                reply_to_id=message.reply_to_id,
-                thread_id=message.thread_id,
-                message_metadata=message.metadata,
-                skill_content=skill_content,
-                channels=self.channels,
-                scheduler=self.scheduler,
-                subagent_registry=self.subagent_registry,
-            )
+            run_kwargs = {
+                "user_text": message.text,
+                "db": self.db,
+                "agent_id": message.agent_id,
+                "user_id": message.user_id,
+                "conversation_id": message.conversation_id,
+                "reply_to_id": message.reply_to_id,
+                "thread_id": message.thread_id,
+                "message_metadata": message.metadata,
+                "skill_content": skill_content,
+                "channels": self.channels,
+                "scheduler": self.scheduler,
+                "subagent_registry": self.subagent_registry,
+            }
+            if message.channel == "http":
+                response = await run_webhook_agent(**run_kwargs)
+            else:
+                response = await run_agent(
+                    origin_channel=message.channel,
+                    **run_kwargs,
+                )
             return response
 
         except Exception:
@@ -293,18 +309,9 @@ class SecretaryApp:
     async def _handle_scheduled_message(self, message: IncomingMessage) -> str:
         """Handle scheduled task message.
 
-        Delivery contract for scheduled-origin runs: the agent MUST use the
-        send_message tool to push anything to the user. We deliberately do
-        NOT auto-forward the agent's final output as a fallback — that
-        fallback caused two failure modes in practice:
-          1. The model would emit a polite "no pending reminders" report instead of
-             NO_ACTION, and the fallback would dutifully forward the noise.
-          2. After calling send_message itself, the model would add a
-             trailing "sent" final output, and the fallback would
-             double-send it.
-        With no fallback, silence is the default; explicit tool call is the
-        only delivery path. final output exists only for NO_ACTION detection
-        (which gates message persistence in runtime.run_agent).
+        Known notification-only tasks use a structured, no-function-tools
+        profile; the host sends at most one validated message. Maintenance and
+        unknown agent tasks retain the legacy tool-driven path.
 
         Failure path is different from success: if the run itself raises,
         we push a one-line alert to default_outgoing so the user finds out
@@ -313,6 +320,38 @@ class SecretaryApp:
         hours before being noticed).
         """
         try:
+            task_id = message.metadata.get("task_id", "?") if message.metadata else "?"
+            skill_content = self._collect_skill_content(message.text)
+            if task_id in LIGHTWEIGHT_SCHEDULE_TASKS:
+                decision = await run_scheduled_notification_agent(
+                    user_text=message.text,
+                    db=self.db,
+                    task_id=task_id,
+                    agent_id=message.agent_id,
+                    message_metadata=message.metadata,
+                    skill_content=skill_content,
+                )
+                if decision.should_notify:
+                    await self._send_builtin_notification(decision.message)
+                    try:
+                        self.db.create_agent_event(
+                            "send_message",
+                            origin="scheduled",
+                            subject=self.config.channels.default_outgoing,
+                            payload={
+                                "task_id": task_id,
+                                "text_chars": len(decision.message),
+                                "preview": decision.message[:160],
+                                "host_managed": True,
+                            },
+                        )
+                    except Exception as audit_error:
+                        logger.warning(
+                            "Failed to record host-managed scheduled delivery: %s",
+                            audit_error,
+                        )
+                return "NO_ACTION"
+
             return await run_agent(
                 user_text=message.text,
                 db=self.db,
@@ -320,10 +359,15 @@ class SecretaryApp:
                 origin_channel="scheduled",
                 user_id="scheduler",
                 message_metadata=message.metadata,
-                skill_content=self._collect_skill_content(message.text),
+                skill_content=skill_content,
                 channels=self.channels,
                 scheduler=self.scheduler,
                 subagent_registry=self.subagent_registry,
+                agent_profile=(
+                    SCHEDULED_MAINTENANCE_PROFILE
+                    if task_id == "memory_consolidation"
+                    else INTERACTIVE_PROFILE
+                ),
             )
         except Exception as e:
             task_id = message.metadata.get("task_id", "?") if message.metadata else "?"

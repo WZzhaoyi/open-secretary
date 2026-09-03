@@ -1,7 +1,6 @@
 """Secretary v2 runtime - Pydantic AI Agent definition + tools."""
 
 import asyncio
-import inspect
 import ipaddress
 import json
 import logging
@@ -15,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -32,6 +31,16 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import ModelRequestContext
 
+from agent_profiles import (
+    ALWAYS_NOTIFY_SCHEDULE_TASKS,
+    INTERACTIVE_PROFILE,
+    SCHEDULED_NOTIFICATION_PROFILE,
+    WEBHOOK_PROFILE,
+    ScheduledNotificationOutput,
+    WebhookAgentOutput,
+    system_prompt_for_profile,
+    tool_allowlist_for_profile,
+)
 from compaction import (
     _count_tokens,
     _prune_tool_outputs_for_summary,
@@ -122,6 +131,7 @@ def _to_local_iso(dt: Optional[datetime], tz: Optional[ZoneInfo] = None) -> str:
 class SecretaryDeps:
     """Dependencies the agent + tools rely on at run time."""
     db: Database
+    agent_profile: str = INTERACTIVE_PROFILE
     agent_id: str = "secretary"
     origin_channel: str = "cli"
     user_id: str = "default"
@@ -185,7 +195,18 @@ def _guard_model_request_context(
     return replace(request_context, messages=guarded)
 
 
-_request_guard_hooks = Hooks(before_model_request=_guard_model_request_context)
+def _prepare_profile_tools(ctx: RunContext[SecretaryDeps], tool_defs):
+    """Expose only the function tools allowed by the host-selected profile."""
+    allowed = tool_allowlist_for_profile(ctx.deps.agent_profile)
+    if allowed is None:
+        return tool_defs
+    return [tool_def for tool_def in tool_defs if tool_def.name in allowed]
+
+
+_request_guard_hooks = Hooks(
+    before_model_request=_guard_model_request_context,
+    prepare_tools=_prepare_profile_tools,
+)
 agent = Agent(
     model=build_model(_config),
     deps_type=SecretaryDeps,
@@ -505,6 +526,23 @@ def _webhook_record_notice(deps: "SecretaryDeps") -> str:
     event_id = metadata.get("recorded_event_id")
     event_ref = f" as event id `{event_id}`" if event_id is not None else ""
     summary_supplied = bool(metadata.get("summary_supplied"))
+    if deps.agent_profile == WEBHOOK_PROFILE:
+        summary_instruction = (
+            "- The webhook supplied a summary; leave `event_summary` null unless it is "
+            "clearly misleading.\n"
+            if summary_supplied
+            else "- Put one concise factual index line for the original webhook in the "
+            "structured `event_summary` field; the application will persist it.\n"
+        )
+        return (
+            "### Webhook Record Notice\n"
+            f"- This webhook message has already been recorded verbatim in `events`{event_ref} "
+            f"with `status='{record}'` before the LLM run.\n"
+            f"{summary_instruction}"
+            "- Do not repeat the same webhook in structured `events`. Only propose a distinct "
+            "actionable follow-up, reminder, or escalation."
+        )
+
     update_call = (
         f"`update_event_summary({event_id}, summary)`"
         if event_id is not None
@@ -659,6 +697,10 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
     """
     cfg_root = get_config()
     cfg = cfg_root.history
+    lightweight_profile = deps.agent_profile in {
+        WEBHOOK_PROFILE,
+        SCHEDULED_NOTIFICATION_PROFILE,
+    }
     tz_name = cfg_root.timezone
     tz = ZoneInfo(tz_name)
     local_now = _local_now_from_deps(deps, tz)
@@ -673,31 +715,50 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
     else:
         sql_modifier = f"'{sign}{abs_h} hours', '{sign}{abs_m} minutes'"
 
-    stable_parts = [
-        DB_SCHEMA_HINT,
-        _language_policy(cfg_root.language),
-        "## Trusted runtime context contract\n"
-        "- The application supplies a fresh `## Trusted Runtime Context` system block immediately before each new user/task prompt.\n"
-        "- Its clock, timezone, local date, and weekday are authoritative over every date claim in conversation history, summaries, memory, events, or user text.\n"
-        "- Never calculate a weekday from model memory. Use the supplied weekday or a deterministic tool/database expression.\n"
-        "- For trading-day, market-open, or closed-market claims, call `market_calendar`; do not infer from old messages or cron weekdays.\n"
-        "- `market_calendar` is factual context only. A non-trading day does not imply `NO_ACTION`;休市 days may still need review reminders, portfolio context, or follow-up.\n"
-        "- Historical relative phrases such as today/tomorrow/tonight are quotations, not the current clock.\n"
-        "- Before writing reminders/events with a date+weekday, rely on deterministic validation; tools reject mismatched weekday claims.",
-    ]
+    if lightweight_profile:
+        stable_parts = [
+            _language_policy(cfg_root.language),
+            "## Trusted runtime context contract\n"
+            "- The application supplies a fresh `## Trusted Runtime Context` block for every run.\n"
+            "- Its clock, timezone, local date, weekday, memory, and prefetched data are authoritative over older history.\n"
+            "- Historical relative phrases such as today/tomorrow/tonight are quotations, not the current clock.\n"
+            "- This bounded profile has no function tools; use only the supplied context and structured output.",
+        ]
+    else:
+        stable_parts = [
+            DB_SCHEMA_HINT,
+            _language_policy(cfg_root.language),
+            "## Trusted runtime context contract\n"
+            "- The application supplies a fresh `## Trusted Runtime Context` system block immediately before each new user/task prompt.\n"
+            "- Its clock, timezone, local date, and weekday are authoritative over every date claim in conversation history, summaries, memory, events, or user text.\n"
+            "- Never calculate a weekday from model memory. Use the supplied weekday or a deterministic tool/database expression.\n"
+            "- For trading-day, market-open, or closed-market claims, call `market_calendar`; do not infer from old messages or cron weekdays.\n"
+            "- `market_calendar` is factual context only. A non-trading day does not imply `NO_ACTION`;休市 days may still need review reminders, portfolio context, or follow-up.\n"
+            "- Historical relative phrases such as today/tomorrow/tonight are quotations, not the current clock.\n"
+            "- Before writing reminders/events with a date+weekday, rely on deterministic validation; tools reject mismatched weekday claims.",
+        ]
     runtime_parts = []
     open_events_shown = 0
     open_events_total = 0
     recent_events_shown = 0
-    recent_events_limit = max(cfg.max_events, 0)
+    recent_events_limit = (
+        0
+        if deps.agent_profile == SCHEDULED_NOTIFICATION_PROFILE
+        else max(cfg.max_events, 0)
+    )
 
     memory_md = _load_memory_md()
     if memory_md:
         runtime_parts.append(f"## 长期记忆 (memory.md)\n{memory_md}")
 
     try:
-        open_events = deps.db.get_events_by_status("open", limit=OPEN_EVENTS_CONTEXT_LIMIT)
-        open_events_total = deps.db.count_events_by_status("open")
+        if deps.agent_profile == SCHEDULED_NOTIFICATION_PROFILE:
+            open_events = []
+        else:
+            open_events = deps.db.get_events_by_status(
+                "open", limit=OPEN_EVENTS_CONTEXT_LIMIT
+            )
+            open_events_total = deps.db.count_events_by_status("open")
         open_event_ids = {event.id for event in open_events}
         event_context_parts = []
         if open_events:
@@ -711,8 +772,12 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
                 for event in open_events
             )
             truncated_note = (
-                "\n注意：open_events 已截断；完整判断必须 db_query 查询 "
-                "`SELECT id,type,status,content,created_at FROM events WHERE status='open' ORDER BY created_at DESC`。"
+                (
+                    "\n注意：open_events 已截断；本 profile 不得推断未展示内容。"
+                    if lightweight_profile
+                    else "\n注意：open_events 已截断；完整判断必须 db_query 查询 "
+                    "`SELECT id,type,status,content,created_at FROM events WHERE status='open' ORDER BY created_at DESC`。"
+                )
                 if open_events_shown < open_events_total
                 else ""
             )
@@ -744,74 +809,106 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
                 "### 最近事件片段 recent_events\n"
                 f"shown {recent_events_shown} / configured {recent_events_limit}。"
                 "这里只是短期连续性片段，已排除上方展示的 open_events；不代表事件全集，"
-                "需要完整判断时必须使用 db_query 查询 events 表。\n"
-                f"{events_text}"
+                + (
+                    "本 profile 不得推断未展示内容。\n"
+                    if lightweight_profile
+                    else "需要完整判断时必须使用 db_query 查询 events 表。\n"
+                )
+                + f"{events_text}"
             )
         if event_context_parts:
             runtime_parts.append("## 事件上下文\n" + "\n\n".join(event_context_parts))
     except Exception as e:
         logger.warning(f"Failed to load recent events: {e}")
 
-    try:
-        from skills_loader import get_skills_loader
-
-        loader = get_skills_loader()
-        skill_index = loader.get_skill_index()
-        if skill_index:
-            stable_parts.append(
-                "## 可用技能索引\n"
-                "下面是可按需加载的项目/用户全局技能索引。索引只说明用途，不等于技能已加载。"
-                "当用户请求与某个技能相关，或某个技能明显能提高完成质量时，"
-                "先调用 `load_skill(name)` 读取完整技能说明，再继续执行。\n"
-                f"{skill_index}"
-            )
-
-        auto_skill_parts = []
-        max_size = cfg_root.skills.max_size
-        for skill_name in loader.get_auto_loaded_skills():
-            content = loader.get_skill_content(skill_name)
-            if not content:
-                continue
-            encoded = content.encode("utf-8", errors="replace")
-            if len(encoded) > max_size:
-                content = encoded[:max_size].decode("utf-8", errors="replace")
-                content += f"\n\n... (truncated to {max_size} bytes)"
-            auto_skill_parts.append(f"# Skill: {skill_name}\n\n{content}")
-        if auto_skill_parts:
-            stable_parts.append("## 自动加载技能\n" + "\n\n".join(auto_skill_parts))
-    except Exception as e:
-        logger.warning(f"Failed to build skill index: {e}")
-
-    registry = getattr(deps, "subagent_registry", None)
-    if registry is not None:
+    if not lightweight_profile:
         try:
-            catalog = registry.agent_catalog()
-        except Exception as e:
-            logger.warning(f"Failed to build subagent catalog: {e}")
-            catalog = []
-        if catalog:
-            catalog_lines = []
-            for agent_def in catalog:
-                req = ", ".join(agent_def["required_inputs"]) or "无"
-                catalog_lines.append(
-                    f"- `{agent_def['name']}` (kind: {agent_def['kind']}) — "
-                    f"{agent_def['description']} | 必填输入: {req}"
+            from skills_loader import get_skills_loader
+
+            loader = get_skills_loader()
+            skill_index = loader.get_skill_index()
+            if skill_index:
+                stable_parts.append(
+                    "## 可用技能索引\n"
+                    "下面是可按需加载的项目/用户全局技能索引。索引只说明用途，不等于技能已加载。"
+                    "当用户请求与某个技能相关，或某个技能明显能提高完成质量时，"
+                    "先调用 `load_skill(name)` 读取完整技能说明，再继续执行。\n"
+                    f"{skill_index}"
                 )
-            stable_parts.append(
-                "## 可用后台子任务 (subagents)\n"
-                "用 `start_subagent(agent_name, inputs)` 启动后台任务；inputs 必须包含对应的必填输入。"
-                "查询/取消/续跑用 `get_subagent_status` / `cancel_subagent` / `resume_subagent`，按 run id 操作。\n"
-                + "\n".join(catalog_lines)
-            )
+
+            auto_skill_parts = []
+            max_size = cfg_root.skills.max_size
+            for skill_name in loader.get_auto_loaded_skills():
+                content = loader.get_skill_content(skill_name)
+                if not content:
+                    continue
+                encoded = content.encode("utf-8", errors="replace")
+                if len(encoded) > max_size:
+                    content = encoded[:max_size].decode("utf-8", errors="replace")
+                    content += f"\n\n... (truncated to {max_size} bytes)"
+                auto_skill_parts.append(f"# Skill: {skill_name}\n\n{content}")
+            if auto_skill_parts:
+                stable_parts.append("## 自动加载技能\n" + "\n\n".join(auto_skill_parts))
+        except Exception as e:
+            logger.warning(f"Failed to build skill index: {e}")
+
+        registry = getattr(deps, "subagent_registry", None)
+        if registry is not None:
+            try:
+                catalog = registry.agent_catalog()
+            except Exception as e:
+                logger.warning(f"Failed to build subagent catalog: {e}")
+                catalog = []
+            if catalog:
+                catalog_lines = []
+                for agent_def in catalog:
+                    req = ", ".join(agent_def["required_inputs"]) or "无"
+                    catalog_lines.append(
+                        f"- `{agent_def['name']}` (kind: {agent_def['kind']}) — "
+                        f"{agent_def['description']} | 必填输入: {req}"
+                    )
+                stable_parts.append(
+                    "## 可用后台子任务 (subagents)\n"
+                    "用 `start_subagent(agent_name, inputs)` 启动后台任务；inputs 必须包含对应的必填输入。"
+                    "查询/取消/续跑用 `get_subagent_status` / `cancel_subagent` / `resume_subagent`，按 run id 操作。\n"
+                    + "\n".join(catalog_lines)
+                )
 
     if deps.skill_content:
         runtime_parts.append(f"## 已加载技能\n{deps.skill_content}")
+
+    if deps.agent_profile == SCHEDULED_NOTIFICATION_PROFILE:
+        metadata = deps.message_metadata or {}
+        task_id = str(metadata.get("task_id") or "unknown")
+        snapshot = str(metadata.get("scheduled_snapshot") or "{}")
+        runtime_parts.append(
+            "### Lightweight Scheduled Notification Contract\n"
+            f"- task_id: `{task_id}`\n"
+            "- This profile replaces the generic scheduled send_message/NO_ACTION contract.\n"
+            "- Do not call tools. Return `ScheduledNotificationOutput`; the application "
+            "will send `message` at most once.\n"
+            "- Set `should_notify=false` and an empty message when the task finds nothing "
+            "worth sending.\n"
+            "- `review_reminder` and `morning_trend_scan` are always-notify tasks.\n"
+            "- Only `pending_response_check` may populate `resolve_event_ids`, using IDs "
+            "from `resolvable_event_ids` below.\n\n"
+            "## Prefetched Scheduled Data\n"
+            f"{snapshot}"
+        )
 
     record_notice = _webhook_record_notice(deps)
     if record_notice:
         runtime_parts.append(record_notice)
 
     if deps.origin_channel == "http":
+        structured_line = (
+            "- Return the user-visible reply and any bounded host actions through the "
+            "required structured output. Do not call function tools.\n"
+            if deps.agent_profile == WEBHOOK_PROFILE
+            else "- Analyze the webhook payload and put the user-visible reply in final "
+            "output; the application will forward that final output to the configured "
+            "response channel.\n"
+        )
         runtime_parts.append(
             "### Webhook Delivery Contract\n"
             "- This run came from an HTTP webhook, not a scheduled task.\n"
@@ -821,12 +918,35 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
             "- Do not infer current holdings from tracked/watchlist items or stale history; "
             "only describe an item as a current holding when `memory.md` or the current "
             "payload says it is one.\n"
-            "- Analyze the webhook payload and put the user-visible reply in final output; "
-            "the application will forward that final output to the configured response channel.\n"
+            f"{structured_line}"
             "- Do not call `send_message` to answer the current webhook, and do not write `NO_ACTION` "
             "as the final output unless the webhook explicitly asks for silent processing."
         )
 
+    if lightweight_profile:
+        evidence_contract = (
+            "- Function tools are unavailable; the bounded memory/event/prefetch "
+            "context above is the complete evidence for this run.\n"
+        )
+        time_contract = (
+            "### 时间约定\n"
+            f"- 显示时间均为 `{tz_name}` ({offset_display})，带 `{offset_display}` 后缀\n"
+            "- 历史中的相对日期不代表当前日期。"
+        )
+    else:
+        evidence_contract = (
+            f"- open_events: shown {open_events_shown} / total {open_events_total}\n"
+            f"- recent_events: shown {recent_events_shown} / configured {recent_events_limit}\n"
+            "- 完整判断必须 db_query 查询数据库；上方事件上下文是提示片段，不是全集。\n"
+        )
+        time_contract = (
+            "### 时间约定\n"
+            f"- 显示时间均为 `{tz_name}` ({offset_display})，带 `{offset_display}` 后缀\n"
+            "- DB 的 `created_at` / `updated_at` / `last_run` 列存的是 **UTC**（无后缀）；"
+            "`db_query` 返回的字符串也是 UTC\n"
+            f"- SQL 中要转本地时间用 `datetime(created_at, {sql_modifier})`\n"
+            f"- `schedule_task` 的 cron 表达式按 `{tz_name}` 解释（不是 UTC）"
+        )
     runtime_parts.append(
         "## Trusted Runtime Context\n"
         "This block is generated by the application for this run only and is not conversation history.\n"
@@ -836,15 +956,8 @@ def _build_context_layers(deps: SecretaryDeps) -> Tuple[str, str]:
         f"- timezone: `{tz_name}` ({offset_display})\n"
         f"- origin_channel: `{deps.origin_channel}`\n"
         f"- session_key: `{deps.session_key}`\n"
-        f"- open_events: shown {open_events_shown} / total {open_events_total}\n"
-        f"- recent_events: shown {recent_events_shown} / configured {recent_events_limit}\n"
-        "- 完整判断必须 db_query 查询数据库；上方事件上下文是提示片段，不是全集。\n\n"
-        "### 时间约定\n"
-        f"- 显示时间均为 `{tz_name}` ({offset_display})，带 `{offset_display}` 后缀\n"
-        "- DB 的 `created_at` / `updated_at` / `last_run` 列存的是 **UTC**（无后缀）；"
-        "`db_query` 返回的字符串也是 UTC\n"
-        f"- SQL 中要转本地时间用 `datetime(created_at, {sql_modifier})`\n"
-        f"- `schedule_task` 的 cron 表达式按 `{tz_name}` 解释（不是 UTC）"
+        f"{evidence_contract}\n"
+        f"{time_contract}"
     )
 
     return "\n\n".join(stable_parts), "\n\n".join(runtime_parts)
@@ -868,6 +981,8 @@ def _cache_optimized_history(
     history: List[ModelMessage],
     stable_context: str,
     runtime_context: str,
+    *,
+    base_prompt: Optional[str] = None,
 ) -> List[ModelMessage]:
     """Assemble `stable prefix + history + volatile runtime tail`.
 
@@ -904,7 +1019,8 @@ def _cache_optimized_history(
                 )
             )
 
-    base_prompt = _config.system_prompt or SECRETARY_PERSONA
+    if base_prompt is None:
+        base_prompt = _config.system_prompt or SECRETARY_PERSONA
     prefix = ModelRequest(
         parts=[
             SystemPromptPart(content=base_prompt),
@@ -2275,6 +2391,106 @@ def get_last_usage(session_key: Optional[str] = None) -> Optional[Dict[str, Any]
     return _last_usage
 
 
+def _build_scheduled_notification_snapshot(
+    db: Database,
+    task_id: str,
+) -> Tuple[str, set[int]]:
+    """Prefetch bounded data for a no-function-tools scheduled run."""
+    cfg = get_config()
+    tz = ZoneInfo(cfg.timezone)
+    local_now = datetime.now(tz)
+    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    local_end = local_start + timedelta(days=1)
+    utc_start = local_start.astimezone(timezone.utc).replace(tzinfo=None)
+    utc_end = local_end.astimezone(timezone.utc).replace(tzinfo=None)
+
+    event_columns = (
+        "id,type,status,summary,substr(content,1,600) AS content,"
+        "created_at,source_channel"
+    )
+    payload: Dict[str, Any] = {
+        "task_id": task_id,
+        "generated_at": local_now.isoformat(timespec="seconds"),
+    }
+    if task_id != "pending_response_check":
+        payload["open_events"] = db.execute_query(
+            f"SELECT {event_columns} FROM events "
+            "WHERE context_visible=1 AND status='open' "
+            "ORDER BY created_at ASC LIMIT 50"
+        )
+    resolvable_ids: set[int] = set()
+
+    if task_id in {"morning_briefing", "review_reminder"}:
+        payload["today_events"] = db.execute_query(
+            f"SELECT {event_columns} FROM events "
+            "WHERE context_visible=1 AND created_at>=? AND created_at<? "
+            "ORDER BY created_at ASC LIMIT 80",
+            [utc_start, utc_end],
+        )
+    elif task_id == "pending_response_check":
+        candidates = db.execute_query(
+            f"SELECT {event_columns} FROM events "
+            "WHERE context_visible=1 AND status='open' "
+            "AND type IN ('remind','check','triggered') "
+            "AND source_channel='scheduled' "
+            "ORDER BY created_at ASC LIMIT 50"
+        )
+        payload["pending_candidates"] = candidates
+        resolvable_ids = {
+            int(row["id"])
+            for row in candidates
+            if isinstance(row.get("id"), (int, float))
+        }
+        if candidates:
+            oldest = min(row["created_at"] for row in candidates)
+            payload["events_since_oldest_candidate"] = db.execute_query(
+                "SELECT id,type,status,summary,substr(content,1,500) AS content,"
+                "created_at,source_channel FROM events "
+                "WHERE context_visible=1 AND created_at>=? "
+                "ORDER BY created_at DESC LIMIT 120",
+                [oldest],
+            )
+        else:
+            payload["events_since_oldest_candidate"] = []
+        payload["resolvable_event_ids"] = sorted(resolvable_ids)
+    elif task_id == "stale_check":
+        payload["recent_progress"] = db.execute_query(
+            f"SELECT {event_columns} FROM events "
+            "WHERE context_visible=1 AND status!='resolved' "
+            "ORDER BY created_at DESC LIMIT 80"
+        )
+    elif task_id == "morning_trend_scan":
+        statuses = []
+        service = get_market_calendar_service()
+        for market in cfg.market_calendar.markets:
+            try:
+                status = service.day_status(market, local_now.date())
+                statuses.append(
+                    {
+                        "market": status.market,
+                        "date": status.date.isoformat(),
+                        "is_trading_day": status.is_trading_day,
+                        "is_half_trading_day": status.is_half_trading_day,
+                        "next_trading_day": (
+                            status.next_trading_day.isoformat()
+                            if status.next_trading_day
+                            else None
+                        ),
+                        "source": status.source,
+                        "degraded": status.degraded,
+                        "error": status.error,
+                    }
+                )
+            except Exception as e:
+                statuses.append({"market": market, "error": str(e)})
+        payload["market_calendar"] = statuses
+
+    return (
+        json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":")),
+        resolvable_ids,
+    )
+
+
 def _is_transient_llm_error(exc: BaseException) -> bool:
     """True if the error is worth retrying — network, timeout, 5xx, rate limit."""
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
@@ -2323,6 +2539,12 @@ async def run_agent(
     channels: Optional[Dict[str, Any]] = None,
     scheduler: Optional[Any] = None,
     subagent_registry: Optional[Any] = None,
+    agent_profile: str = INTERACTIVE_PROFILE,
+    output_type: Any = None,
+    output_to_text: Optional[Callable[[Any, SecretaryDeps], str]] = None,
+    history_token_budget: Optional[int] = None,
+    replay_history: bool = True,
+    persist_history: bool = True,
 ) -> str:
     """Serialize a full read/run/write cycle within one conversation."""
     from session_locks import get_session_lock
@@ -2350,6 +2572,12 @@ async def run_agent(
             channels=channels,
             scheduler=scheduler,
             subagent_registry=subagent_registry,
+            agent_profile=agent_profile,
+            output_type=output_type,
+            output_to_text=output_to_text,
+            history_token_budget=history_token_budget,
+            replay_history=replay_history,
+            persist_history=persist_history,
         )
 
 
@@ -2367,6 +2595,12 @@ async def _run_agent_unlocked(
     channels: Optional[Dict[str, Any]] = None,
     scheduler: Optional[Any] = None,
     subagent_registry: Optional[Any] = None,
+    agent_profile: str = INTERACTIVE_PROFILE,
+    output_type: Any = None,
+    output_to_text: Optional[Callable[[Any, SecretaryDeps], str]] = None,
+    history_token_budget: Optional[int] = None,
+    replay_history: bool = True,
+    persist_history: bool = True,
 ) -> str:
     """Run the agent, threading prior conversation in via message_history.
 
@@ -2387,6 +2621,7 @@ async def _run_agent_unlocked(
     )
     deps = SecretaryDeps(
         db=db,
+        agent_profile=agent_profile,
         agent_id=agent_id,
         origin_channel=origin_channel,
         user_id=user_id,
@@ -2417,6 +2652,7 @@ async def _run_agent_unlocked(
             "conversation_id": conversation_id,
             "reply_to_id": reply_to_id,
             "thread_id": thread_id,
+            "agent_profile": agent_profile,
         },
     )
 
@@ -2425,38 +2661,44 @@ async def _run_agent_unlocked(
         origin_channel,
         now=datetime.fromisoformat(deps.current_time),
     )
-    persisted_history = db.load_pydantic_messages(
-        session_key=session_key,
-        include_legacy=False,
-        created_after=history_created_after,
-        loaded_row_ids=loaded_history_row_ids,
-    )
+    persisted_history = []
+    if replay_history:
+        persisted_history = db.load_pydantic_messages(
+            token_budget=history_token_budget,
+            session_key=session_key,
+            include_legacy=False,
+            created_after=history_created_after,
+            loaded_row_ids=loaded_history_row_ids,
+        )
     if (
-        not persisted_history
+        replay_history
+        and not persisted_history
         and origin_channel != "self_test"
         and history_created_after is None
     ):
         loaded_history_row_ids = []
         persisted_history = db.load_pydantic_messages(
+            token_budget=history_token_budget,
             session_key=session_key,
             loaded_row_ids=loaded_history_row_ids,
         )
     pre_run_compact_outcome = None
-    try:
-        pre_run_compact_outcome = await maybe_auto_persist_compact(
-            db,
-            history=persisted_history,
-            session_key=session_key,
-            loaded_row_ids=loaded_history_row_ids,
-        )
-        if (
-            pre_run_compact_outcome
-            and pre_run_compact_outcome.changed
-            and not pre_run_compact_outcome.failed
-        ):
-            persisted_history = pre_run_compact_outcome.compacted
-    except Exception as e:
-        logger.error(f"[run_agent] pre-run compaction failed: {e}")
+    if replay_history and history_token_budget is None:
+        try:
+            pre_run_compact_outcome = await maybe_auto_persist_compact(
+                db,
+                history=persisted_history,
+                session_key=session_key,
+                loaded_row_ids=loaded_history_row_ids,
+            )
+            if (
+                pre_run_compact_outcome
+                and pre_run_compact_outcome.changed
+                and not pre_run_compact_outcome.failed
+            ):
+                persisted_history = pre_run_compact_outcome.compacted
+        except Exception as e:
+            logger.error(f"[run_agent] pre-run compaction failed: {e}")
 
     replay_history = persisted_history
     stable_context, runtime_context = _build_context_layers(deps)
@@ -2464,6 +2706,10 @@ async def _run_agent_unlocked(
         replay_history,
         stable_context=stable_context,
         runtime_context=runtime_context,
+        base_prompt=system_prompt_for_profile(
+            agent_profile,
+            _config.system_prompt or SECRETARY_PERSONA,
+        ),
     )
     logger.debug(
         "[run_agent] loaded %s persisted messages; assembled %s messages with cache-stable prefix and runtime tail",
@@ -2478,11 +2724,13 @@ async def _run_agent_unlocked(
         last_exc: Optional[BaseException] = None
         for attempt in range(1, _LLM_MAX_ATTEMPTS + 1):
             try:
-                return await agent.run(
-                    prompt,
-                    deps=deps,
-                    message_history=message_history,
-                )
+                run_kwargs: Dict[str, Any] = {
+                    "deps": deps,
+                    "message_history": message_history,
+                }
+                if output_type is not None:
+                    run_kwargs["output_type"] = output_type
+                return await agent.run(prompt, **run_kwargs)
             except Exception as e:
                 last_exc = e
                 is_content_filter = isinstance(e, ContentFilterError)
@@ -2581,10 +2829,15 @@ async def _run_agent_unlocked(
     usage_payload: Dict[str, Any] = {}
     try:
         # pydantic-ai 1.89 exposes AgentRunResult.usage as a method; newer 1.x
-        # makes it a property whose deprecation shim warns when called.
-        # Inspect the class so both installs stay warning-free.
-        usage_attr = inspect.getattr_static(type(result), "usage", None)
-        usage = result.usage if isinstance(usage_attr, property) else result.usage()
+        # returns a callable compatibility object that is already the usage
+        # value and warns if called. Check the value shape rather than the
+        # descriptor type so both installs stay warning-free.
+        usage_value = result.usage
+        usage = (
+            usage_value
+            if hasattr(usage_value, "input_tokens")
+            else usage_value()
+        )
         last_request_usage = _last_response_usage(result)
         request_usages = _response_usages(_result_new_messages(result))
         global _last_usage, _last_usage_by_session
@@ -2611,7 +2864,23 @@ async def _run_agent_unlocked(
     except Exception as e:
         logger.debug(f"[run_agent] usage unavailable: {e}")
 
-    response = response_override or str(result.output)
+    if response_override is not None:
+        response = response_override
+    elif output_to_text is not None:
+        try:
+            response = output_to_text(result.output, deps)
+        except Exception as e:
+            _record_agent_event(
+                db,
+                "run_failed",
+                origin=origin_channel,
+                run_id=run_id,
+                subject=type(e).__name__,
+                payload={"error": str(e), "stage": "structured_output_apply"},
+            )
+            raise
+    else:
+        response = str(result.output)
     _record_agent_event(
         db,
         "run_finished",
@@ -2621,6 +2890,7 @@ async def _run_agent_unlocked(
         payload={
             "response_chars": len(response),
             "no_action": "NO_ACTION" in response.strip().upper(),
+            "agent_profile": agent_profile,
             "usage": usage_payload,
         },
     )
@@ -2651,7 +2921,7 @@ async def _run_agent_unlocked(
         return response
 
     try:
-        if persist_msgs:
+        if persist_history and persist_msgs:
             db.save_pydantic_messages(
                 persist_msgs,
                 agent_id=agent_id,
@@ -2688,3 +2958,221 @@ async def _run_agent_unlocked(
             )
 
     return response
+
+
+async def run_webhook_agent(
+    user_text: str,
+    db: Database,
+    *,
+    message_metadata: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> str:
+    """Run a webhook as one structured model decision plus host-side writes."""
+    metadata = dict(message_metadata or {})
+
+    def _apply_output(raw_output: Any, deps: SecretaryDeps) -> str:
+        if not isinstance(raw_output, WebhookAgentOutput):
+            raise TypeError(
+                "webhook profile returned an invalid structured output: "
+                f"{type(raw_output).__name__}"
+            )
+
+        event_id = metadata.get("recorded_event_id")
+        summary = (raw_output.event_summary or "").strip()
+        if (
+            isinstance(event_id, int)
+            and summary
+        ):
+            updated = db.update_event_summary(event_id, summary)
+            if updated is not None:
+                _record_agent_event(
+                    db,
+                    "webhook_summary_updated",
+                    origin="http",
+                    run_id=deps.run_id,
+                    subject=str(event_id),
+                    payload={"summary_chars": len(summary), "host_managed": True},
+                )
+
+        created_event_ids = []
+        for action in raw_output.events:
+            content = action.content.strip()
+            # The channel has already recorded the original payload when record
+            # was requested.  Exact duplicates are never valid follow-up actions.
+            if not content or content == (user_text or "").strip():
+                continue
+            local_year = _local_now_from_deps(deps, _local_tz()).year
+            temporal_errors = _temporal_validation_errors(
+                content,
+                default_year=local_year,
+            )
+            if temporal_errors:
+                _record_agent_event(
+                    db,
+                    "webhook_action_rejected",
+                    origin="http",
+                    run_id=deps.run_id,
+                    subject=action.event_type,
+                    payload={
+                        "reason": "temporal_validation_failed",
+                        "errors": temporal_errors,
+                    },
+                )
+                continue
+            event = db.create_event(
+                action.event_type,
+                content,
+                status=action.status,
+                summary=action.summary,
+                source_channel="http",
+                session_key=deps.session_key,
+                source_message_id=deps.reply_to_id,
+                metadata={
+                    "webhook_run_id": metadata.get("webhook_run_id"),
+                    "structured_action": True,
+                    "agent_id": deps.agent_id,
+                    "conversation_id": deps.conversation_id,
+                    "thread_id": deps.thread_id,
+                    "sender_id": deps.user_id,
+                    "reply_to_id": deps.reply_to_id,
+                },
+            )
+            created_event_ids.append(event.id)
+        if created_event_ids:
+            _record_agent_event(
+                db,
+                "webhook_actions_applied",
+                origin="http",
+                run_id=deps.run_id,
+                subject=str(len(created_event_ids)),
+                payload={"event_ids": created_event_ids, "host_managed": True},
+            )
+        return raw_output.reply.strip()
+
+    history_budget = max(0, get_config().history.tail_token_budget)
+    recorded_ingest = str(metadata.get("record") or "").strip().lower() in {
+        "logged",
+        "open",
+    }
+    return await run_agent(
+        user_text,
+        db,
+        origin_channel="http",
+        message_metadata=metadata,
+        agent_profile=WEBHOOK_PROFILE,
+        output_type=WebhookAgentOutput,
+        output_to_text=_apply_output,
+        history_token_budget=(
+            history_budget if history_budget > 0 and not recorded_ingest else None
+        ),
+        replay_history=history_budget > 0 and not recorded_ingest,
+        persist_history=not recorded_ingest,
+        **kwargs,
+    )
+
+
+async def run_scheduled_notification_agent(
+    user_text: str,
+    db: Database,
+    *,
+    task_id: str,
+    message_metadata: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> ScheduledNotificationOutput:
+    """Run a known notification schedule without function-tool round trips."""
+    snapshot, resolvable_ids = _build_scheduled_notification_snapshot(db, task_id)
+    metadata = dict(message_metadata or {})
+    metadata.update(
+        {
+            "task_id": task_id,
+            "scheduled_snapshot": snapshot,
+        }
+    )
+    captured: Dict[str, ScheduledNotificationOutput] = {}
+
+    def _apply_output(raw_output: Any, deps: SecretaryDeps) -> str:
+        if not isinstance(raw_output, ScheduledNotificationOutput):
+            raise TypeError(
+                "scheduled notification profile returned an invalid structured output: "
+                f"{type(raw_output).__name__}"
+            )
+        if task_id in ALWAYS_NOTIFY_SCHEDULE_TASKS and not raw_output.should_notify:
+            language = (get_config().language or "auto").strip().lower()
+            fallback_messages = {
+                "review_reminder": (
+                    "📋 Daily review: revisit today's important progress, unfinished items, and next actions."
+                    if language == "en"
+                    else "📋 今日复盘：请回顾今天的重要进展、未完成事项和下一步。"
+                ),
+                "morning_trend_scan": (
+                    "Review the morning market trend against current positions and trading rules."
+                    if language == "en"
+                    else "请结合当前持仓和交易规则复盘早盘市场趋势。"
+                ),
+            }
+            raw_output = raw_output.model_copy(
+                update={
+                    "should_notify": True,
+                    "message": fallback_messages[task_id],
+                }
+            )
+            _record_agent_event(
+                db,
+                "scheduled_notification_fallback",
+                origin="scheduled",
+                run_id=deps.run_id,
+                subject=task_id,
+                payload={"reason": "always_notify_profile_returned_false"},
+            )
+
+        requested_ids = set(raw_output.resolve_event_ids)
+        valid_ids = (
+            sorted(requested_ids & resolvable_ids)
+            if task_id == "pending_response_check"
+            else []
+        )
+        ignored_ids = sorted(requested_ids - set(valid_ids))
+        if ignored_ids:
+            logger.warning(
+                "Ignoring unapproved scheduled resolve_event_ids task=%s ids=%s",
+                task_id,
+                ignored_ids,
+            )
+        if valid_ids:
+            affected = db.resolve_open_events(valid_ids)
+            _record_agent_event(
+                db,
+                "scheduled_events_resolved",
+                origin="scheduled",
+                run_id=deps.run_id,
+                subject=task_id,
+                payload={
+                    "event_ids": valid_ids,
+                    "rows_affected": affected,
+                    "host_managed": True,
+                },
+            )
+
+        captured["output"] = raw_output.model_copy(
+            update={"resolve_event_ids": valid_ids}
+        )
+        # Keep scheduled decision trajectories out of conversational history.
+        return "NO_ACTION"
+
+    await run_agent(
+        user_text,
+        db,
+        origin_channel="scheduled",
+        user_id="scheduler",
+        message_metadata=metadata,
+        agent_profile=SCHEDULED_NOTIFICATION_PROFILE,
+        output_type=ScheduledNotificationOutput,
+        output_to_text=_apply_output,
+        replay_history=False,
+        persist_history=False,
+        **kwargs,
+    )
+    decision = captured.get("output")
+    if decision is None:
+        raise RuntimeError("scheduled notification output was not captured")
+    return decision
